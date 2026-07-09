@@ -21,16 +21,23 @@ import {
   SIDEBAR_NAV_AREA,
   type SidebarNavContribution,
   STATUSBAR_AREAS,
+  useQuery,
   useValue
 } from '@hermes/plugin-sdk'
 
-import { $board, bindApi, startBoardPoll } from './api'
+import { $boardSlug, bindApi, boardKey, fetchBoard } from './api'
 import { KanbanBoardPage } from './board'
 
 // Live "N running / ready" pill — one glance at fleet activity from anywhere,
-// clicks through to the board. Hidden when nothing is in flight (or unloaded).
+// clicks through to the board. Shares the board query (one cache, one poll with
+// the page); hidden when nothing is in flight (or unloaded).
 function KanbanCount() {
-  const board = useValue($board)
+  const slug = useValue($boardSlug)
+  const { data: board } = useQuery({
+    queryFn: () => fetchBoard(false),
+    queryKey: boardKey(slug, false),
+    refetchInterval: 8_000
+  })
 
   if (!board) {
     return null
@@ -64,8 +71,7 @@ const plugin: HermesPlugin = {
   name: 'Kanban',
   defaultEnabled: false,
   register(ctx) {
-    bindApi(ctx.rest)
-    startBoardPoll()
+    bindApi(ctx.rest, ctx.storage)
 
     ctx.registerMany([
       {
