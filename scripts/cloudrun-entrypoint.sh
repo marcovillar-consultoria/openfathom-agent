@@ -26,6 +26,17 @@
 #                   in gateway/platforms/api_server.py, not a preference of ours
 #   HERMES_TASK     prompt to run in job mode (required when HERMES_MODE=job)
 #   HERMES_JOB_OUTPUT  where to write the job's stdout (default $HERMES_HOME/job-output.txt)
+#   HERMES_INFERENCE_PROVIDER / HERMES_INFERENCE_MODEL  optional, job mode only --
+#                   passed through as `hermes -z`'s own --provider/--model flags,
+#                   NOT left as bare env vars. A real OF-04 execution failed with
+#                   "No inference provider configured" despite both env vars being
+#                   set: hermes_cli/oneshot.py's _run_agent() only reads
+#                   HERMES_INFERENCE_MODEL/PROVIDER to feed detect_provider_for_model()
+#                   as an auto-detection HINT, and that detection silently failed
+#                   for gemini-2.5-flash + vertex, falling through to auth.py's
+#                   resolve_provider("auto") -- which has no knowledge of either env
+#                   var at all. The CLI flags reach run_oneshot(model=, provider=)
+#                   directly (hermes_cli/main.py), skipping that ambiguity entirely.
 #   PORT            injected by Cloud Run; only consulted in service mode
 set -euo pipefail
 
@@ -85,7 +96,10 @@ case "${HERMES_MODE:-service}" in
     # the old hardcoded default (2026-07-12) -- fixed here, not asserted fixed.
     out="${HERMES_JOB_OUTPUT:-${HERMES_HOME:-/opt/data}/job-output.txt}"
     mkdir -p "$(dirname "$out")"
-    hermes -z "${HERMES_TASK}" | tee "$out"
+    hermes_z_args=()
+    [[ -n "${HERMES_INFERENCE_PROVIDER:-}" ]] && hermes_z_args+=(--provider "${HERMES_INFERENCE_PROVIDER}")
+    [[ -n "${HERMES_INFERENCE_MODEL:-}" ]] && hermes_z_args+=(--model "${HERMES_INFERENCE_MODEL}")
+    hermes -z "${HERMES_TASK}" "${hermes_z_args[@]}" | tee "$out"
     ;;
   *)
     echo "ERROR: HERMES_MODE must be 'service' or 'job' (got '${HERMES_MODE:-}')" >&2
