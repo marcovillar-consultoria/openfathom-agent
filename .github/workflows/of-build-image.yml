@@ -1,0 +1,71 @@
+name: of-build-image
+
+# OpenFathom delta — allowed by ADR-002. Builds the Cloud Run image on every
+# push to `cloudrun` and pushes it to Artifact Registry, tagged
+# v<hermes-upstream>-of-<git-sha-short> per ADR-002's branch model.
+#
+# Filename is `of-build-image.yml`, not the `build-image.yml` ADR-002 lists
+# verbatim -- same `of-` namespacing reasoning as of-upstream-sync.yml, so a
+# same-named upstream workflow can never collide with ours during rebase.
+#
+# Two-stage build on purpose (see Dockerfile.cloudrun's header comment):
+# stage 1 builds the REAL upstream Dockerfile as-is (s6-overlay, Node,
+# Playwright, uv) so this workflow never re-implements or drifts from it;
+# stage 2 layers Dockerfile.cloudrun (just the entrypoint) on top.
+#
+# NOT YET WIRED: WIF binding for this repo's OIDC identity
+# (github-actions-agent-build@openfathom-prod.iam.gserviceaccount.com,
+# scoped to roles/artifactregistry.writer only -- openfathom-agent is
+# PUBLIC, so it deliberately does NOT get the roles/editor CI identity
+# openfathom-infra uses) does not exist in openfathom-infra yet. This
+# workflow will fail auth until that Terraform change lands and applies.
+# See docs/BACKLOG.md (openfathom-meta), OF-03.
+
+on:
+  push:
+    branches: [cloudrun]
+
+permissions:
+  contents: read
+  id-token: write # required for WIF
+
+env:
+  REGION: us-central1
+  PROJECT_ID: openfathom-prod
+  REPOSITORY: openfathom-images
+  IMAGE: of-agent
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Compute image tag
+        id: tag
+        run: |
+          hermes_version=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
+          sha_short=$(git rev-parse --short=8 HEAD)
+          echo "tag=v${hermes_version}-of-${sha_short}" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to GCP (WIF, no long-lived key)
+        uses: google-github-actions/auth@140bb5113ffb6b65a7e9b937a81fa96cf5064462 # v2.1.11
+        with:
+          workload_identity_provider: projects/628518239919/locations/global/workloadIdentityPools/github/providers/github-actions
+          service_account: github-actions-agent-build@openfathom-prod.iam.gserviceaccount.com
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+      - name: Build base image (real upstream Dockerfile, unmodified)
+        run: docker build -t of-agent:base .
+
+      - name: Build Cloud Run image (packaging layer only)
+        run: docker build -f Dockerfile.cloudrun -t of-agent:cloudrun --build-arg BASE_IMAGE=of-agent:base .
+
+      - name: Tag and push
+        run: |
+          image_uri="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/${IMAGE}:${{ steps.tag.outputs.tag }}"
+          docker tag of-agent:cloudrun "$image_uri"
+          docker push "$image_uri"
+          echo "Pushed $image_uri"

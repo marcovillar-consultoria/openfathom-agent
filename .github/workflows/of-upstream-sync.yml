@@ -1,0 +1,103 @@
+name: of-upstream-sync
+
+# OpenFathom delta — allowed by ADR-002. Weekly sync of the `cloudrun` branch
+# onto NousResearch/hermes-agent:main, so fork divergence stays bounded (the
+# whole reason ADR-002 chose "fork + weekly sync" over vendoring or a submodule).
+#
+# Filename is `of-upstream-sync.yml`, not the `upstream-sync.yml` ADR-002 lists
+# verbatim -- this repo's own .github/workflows/ already carries upstream's own
+# workflow files, and an `of-` prefix means a future upstream file with the same
+# short name can never collide during the weekly rebase. Same reasoning as the
+# `of-` prefix on every container/image/port this fork adds locally.
+#
+# Also deviates from ADR-002's literal wording on the success path: the ADR says
+# "rebase succeeds -> push and tag the new image" (direct push to `cloudrun`).
+# This opens a PR into `cloudrun` instead. PLAN.md's OF-03 task text already
+# says "abre PR se o rebase for bem-sucedido" — a rebase that applies cleanly
+# can still be semantically wrong (upstream renaming something
+# cloudrun-entrypoint.sh depends on), and a force-push straight to the branch
+# of-build-image.yml builds from would skip the one human look that would catch
+# that. Both deviations are flagged in docs/BACKLOG.md (openfathom-meta, ENG-32)
+# for an ADR-002 wording correction — real ADR/implementation mismatches, not
+# silent choices.
+
+on:
+  schedule:
+    - cron: '0 3 * * 1' # Monday 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "openfathom-bot"
+          git config user.email "openfathom-bot@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch upstream main
+
+      - name: Fast-forward main onto upstream
+        run: |
+          git checkout main
+          git merge --ff-only upstream/main
+          git push origin main
+
+      - name: Attempt cloudrun rebase
+        id: rebase
+        run: |
+          branch="sync/upstream-$(date -u +%Y%m%d)"
+          git checkout -b "$branch" cloudrun
+          if git rebase main; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            git rebase --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Push sync branch and open PR
+        if: steps.rebase.outputs.conflict == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git push origin "${{ steps.rebase.outputs.branch }}"
+          gh pr create \
+            --base cloudrun \
+            --head "${{ steps.rebase.outputs.branch }}" \
+            --title "sync: rebase cloudrun onto upstream main ($(date -u +%Y-%m-%d))" \
+            --body "Automated weekly sync (ADR-002). The rebase applied without conflicts — review the upstream diff before merging. Merging into \`cloudrun\` triggers \`of-build-image.yml\`."
+
+      - name: Open conflict issue
+        if: steps.rebase.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat > /tmp/issue-body.md <<'EOF'
+          The weekly rebase of `cloudrun` onto `upstream/main` failed with a conflict and was aborted. Resolve manually:
+
+          ```
+          git fetch upstream main
+          git checkout cloudrun
+          git rebase main
+          # fix conflicts
+          git push --force-with-lease
+          ```
+
+          See ADR-002 (openfathom-meta) for the fork-scope rule this branch must keep obeying while resolving.
+          EOF
+          gh issue create \
+            --title "upstream-sync: rebase conflict ($(date -u +%Y-%m-%d))" \
+            --body-file /tmp/issue-body.md
