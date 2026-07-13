@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1.7
+#
+# OpenFathom delta — allowed by ADR-002.
+#
+# This does NOT reinvent the upstream build (s6-overlay, Node, Playwright, uv --
+# see the real `Dockerfile` in this repo's root). Reinventing it in a slim
+# python:3.11 image, as an earlier draft of openfathom-meta's
+# guides/cloud-run-deployment.md assumed before this repo was ever cloned
+# locally, would silently drop the real build's system deps and produce an
+# image where `hermes` does not run. Instead: build the upstream Dockerfile
+# first (tag it BASE_IMAGE), then layer packaging on top -- same posture
+# ADR-002 already committed to ("empacotamento sem divergir no core").
+#
+#   docker build -t of-agent:base .
+#   docker build -f Dockerfile.cloudrun -t of-agent:cloudrun .
+#
+# ENTRYPOINT is intentionally NOT redeclared here -- it stays `["/init",
+# "/opt/hermes/docker/main-wrapper.sh"]`, inherited from BASE_IMAGE.
+# docker-compose.yml's own warning applies: bypassing /init skips the
+# stage2-hook.sh UID/GID remap and venv seed, which cloudrun-entrypoint.sh
+# still needs even for a single Cloud Run Job invocation.
+ARG BASE_IMAGE=of-agent:base
+FROM ${BASE_IMAGE}
+
+COPY scripts/cloudrun-entrypoint.sh /opt/hermes/scripts/cloudrun-entrypoint.sh
+RUN chmod +x /opt/hermes/scripts/cloudrun-entrypoint.sh
+
+# Cloud Run Service injects $PORT at runtime (see cloudrun-entrypoint.sh);
+# 8080 is only the documented default for local `docker run -p`.
+EXPOSE 8080
+
+# main-wrapper.sh's routing (docker/main-wrapper.sh): first arg is an
+# executable -> exec it directly. Passing our script as CMD (rather than
+# `hermes <args>`) is what lets it choose between `hermes gateway run` and
+# `hermes -z` at runtime via HERMES_MODE, instead of being fixed at build time.
+CMD ["/opt/hermes/scripts/cloudrun-entrypoint.sh"]
