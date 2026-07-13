@@ -1,0 +1,35 @@
+# OpenFathom delta — allowed by ADR-002.
+#
+# Local smoke-test harness for the two modes cloudrun-entrypoint.sh implements.
+# Cloud Run itself ignores this file (it deploys the image directly — see
+# .github/workflows/of-build-image.yml and openfathom-meta/docs/guides/cloud-run-deployment.md).
+# Container names and the host port are prefixed `of-`/`OF_` on purpose, so this
+# doesn't collide with other projects' local Docker state on the same machine.
+#
+# Usage:
+#   docker build -t of-agent:base .
+#   docker build -f Dockerfile.cloudrun -t of-agent:dev .
+#   GEMINI_API_KEY=... docker compose -f docker-compose.cloudrun.yml up of-agent-service
+#   GEMINI_API_KEY=... HERMES_TASK="..." docker compose -f docker-compose.cloudrun.yml run --rm of-agent-job
+services:
+  of-agent-service:
+    image: of-agent:dev
+    container_name: of-agent-service
+    environment:
+      - HERMES_MODE=service
+      - GEMINI_API_KEY=${GEMINI_API_KEY:?set GEMINI_API_KEY to smoke-test service mode}
+    ports:
+      - "${OF_PORT:-8180}:8080"
+
+  of-agent-job:
+    image: of-agent:dev
+    container_name: of-agent-job
+    environment:
+      - HERMES_MODE=job
+      - HERMES_TASK=${HERMES_TASK:?set HERMES_TASK to smoke-test job mode}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:?set GEMINI_API_KEY to smoke-test job mode}
+    volumes:
+      - of-agent-job-data:/data/hermes
+
+volumes:
+  of-agent-job-data:
