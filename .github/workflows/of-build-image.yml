@@ -13,16 +13,20 @@ name: of-build-image
 # Playwright, uv) so this workflow never re-implements or drifts from it;
 # stage 2 layers Dockerfile.cloudrun (just the entrypoint) on top.
 #
-# NOT YET WIRED: WIF binding for this repo's OIDC identity
-# (github-actions-agent-build@openfathom-prod.iam.gserviceaccount.com,
-# scoped to roles/artifactregistry.writer only -- openfathom-agent is
-# PUBLIC, so it deliberately does NOT get the roles/editor CI identity
-# openfathom-infra uses) does not exist in openfathom-infra yet. This
-# workflow will fail auth until that Terraform change lands and applies.
-# See docs/BACKLOG.md (openfathom-meta), OF-03.
+# WIF wired (2026-07-13, ENG-32 in docs/BACKLOG.md, openfathom-meta): the
+# github-actions-agent-build@openfathom-prod service account and its bindings
+# exist in openfathom-infra, and this workflow has built and pushed a real
+# image (v0.18.2-of-02a0c57f).
+#
+# Also runs on `pull_request` into `cloudrun` (added by ADR-035): the
+# validate-scope job enforces the ADR-002 file allow-list on every PR, not
+# just via review discipline -- the mitigation ADR-002's Consequences section
+# always named but never wired into CI until now.
 
 on:
   push:
+    branches: [cloudrun]
+  pull_request:
     branches: [cloudrun]
 
 permissions:
@@ -36,7 +40,19 @@ env:
   IMAGE: of-agent
 
 jobs:
+  validate-scope:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      - name: Validate fork scope (ADR-002, amended by ADR-035)
+        run: python3 scripts/validate-fork-scope.py
+
   build:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
