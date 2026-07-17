@@ -14,9 +14,15 @@ This is a **minimal fork** of [`NousResearch/hermes-agent`](https://github.com/N
 
 ## Set your git author email before committing here
 
+Two places, and the `git config` half alone is NOT enough — see the merge-commit trap below.
+
 ```bash
 git config --local user.email "<id>+<username>@users.noreply.github.com"   # your GitHub noreply
 ```
+
+Then, on **github.com → Settings → Emails → check "Keep my email addresses private."** This makes GitHub use your `...@users.noreply.github.com` as the author of everything the **web UI** creates — most importantly **merge commits from the green Merge button**, which `git config --local` cannot touch because that button runs on GitHub's servers, not your machine. Without this, every merge is authored with your account's public email and lands right back in `merge-base..HEAD`.
+
+**Found the hard way (2026-07-17):** the merge commit of PR #7 — the very PR that fixed the author email — was itself authored `marco@marcovillar.com` by the Merge button, and re-red the check on PR #8. The `git config` fix is per-clone and covers only commits you make locally; the Settings fix is per-account and covers the merges. You need both.
 
 **Per clone. It is not versioned, so a fresh clone loses it — and nothing warns you until CI is red.**
 
