@@ -26,17 +26,42 @@
 #                   in gateway/platforms/api_server.py, not a preference of ours
 #   HERMES_TASK     prompt to run in job mode (required when HERMES_MODE=job)
 #   HERMES_JOB_OUTPUT  where to write the job's stdout (default $HERMES_HOME/job-output.txt)
-#   HERMES_INFERENCE_PROVIDER / HERMES_INFERENCE_MODEL  optional, job mode only --
-#                   passed through as `hermes -z`'s own --provider/--model flags,
-#                   NOT left as bare env vars. A real OF-04 execution failed with
-#                   "No inference provider configured" despite both env vars being
-#                   set: hermes_cli/oneshot.py's _run_agent() only reads
-#                   HERMES_INFERENCE_MODEL/PROVIDER to feed detect_provider_for_model()
-#                   as an auto-detection HINT, and that detection silently failed
-#                   for gemini-2.5-flash + vertex, falling through to auth.py's
-#                   resolve_provider("auto") -- which has no knowledge of either env
-#                   var at all. The CLI flags reach run_oneshot(model=, provider=)
-#                   directly (hermes_cli/main.py), skipping that ambiguity entirely.
+#   HERMES_INFERENCE_PROVIDER / HERMES_INFERENCE_MODEL  honored in BOTH modes, but
+#                   through two different mechanisms, because the two modes resolve the
+#                   provider by different code paths. Neither mode can leave them as
+#                   bare env vars.
+#
+#                   job mode -- passed as `hermes -z`'s own --provider/--model flags. A
+#                   real OF-04 execution failed with "No inference provider configured"
+#                   despite both env vars being set: hermes_cli/oneshot.py's
+#                   _run_agent() only reads HERMES_INFERENCE_MODEL/PROVIDER to feed
+#                   detect_provider_for_model() as an auto-detection HINT, and that
+#                   detection silently failed for gemini-2.5-flash + vertex, falling
+#                   through to auth.py's resolve_provider("auto") -- which has no
+#                   knowledge of either env var at all. The CLI flags reach
+#                   run_oneshot(model=, provider=) directly (hermes_cli/main.py).
+#
+#                   service mode -- `hermes gateway run` takes no such flags, so they
+#                   are written into config.yaml via `hermes config set` below, before
+#                   the gateway starts. Reading the env vars is not enough here either,
+#                   for a subtler reason, measured on the real deployed config rather
+#                   than assumed: runtime_provider.py's resolve_requested_provider()
+#                   reads, in order, (1) an explicit arg, (2) config.yaml
+#                   model.provider, (3) $HERMES_INFERENCE_PROVIDER, (4) "auto". The
+#                   config.yaml that cont-init's schema migration writes ships
+#                   `provider: "auto"` -- a NON-EMPTY string, so step 2 returns it and
+#                   step 3 is never reached. The env var is shadowed by a default
+#                   nobody chose. That is precisely how the deployed gateway answered
+#                   "No inference provider configured" on the OF-09 end-to-end test
+#                   while the Job, using CLI flags (step 1), reached Vertex fine from
+#                   this same image. HERMES_INFERENCE_MODEL is worse still: outside
+#                   oneshot.py nothing reads it, so config.yaml model.default is the
+#                   only model input the gateway has.
+#   HERMES_TIMEZONE  optional, service mode -- IANA name (e.g. America/Sao_Paulo)
+#                   written to config.yaml `timezone`. hermes_time.py validates it with
+#                   ZoneInfo and falls back to server-local when empty or invalid. This
+#                   key steers hermes's own time handling only; set the container's TZ
+#                   env var alongside it for everything else.
 #   PORT            injected by Cloud Run; only consulted in service mode
 set -euo pipefail
 
@@ -68,6 +93,27 @@ case "${HERMES_MODE:-service}" in
     export API_SERVER_ENABLED=true
     export API_SERVER_HOST="0.0.0.0"
     export API_SERVER_PORT="${PORT:-8080}"
+    # Translate the env-var contract into config.yaml, which is the only input the
+    # gateway path actually honors (see the header). Written here, after cont-init's
+    # schema migration has already produced config.yaml, and before `hermes gateway
+    # run` reads it. Each call costs one CLI start (~1s) and lands on the cold-start
+    # path -- the reason this only writes keys that were explicitly asked for instead
+    # of setting defaults unconditionally.
+    #
+    # `hermes config set` failing must be loud: a silently unset provider is exactly
+    # the failure this block exists to prevent, and it would resurface as the same
+    # "No inference provider configured" that cost the OF-09 end-to-end test. `set -e`
+    # already aborts on a non-zero exit; these run before the exec so a failure kills
+    # the container instead of serving a gateway that cannot answer.
+    if [[ -n "${HERMES_INFERENCE_PROVIDER:-}" ]]; then
+      hermes config set model.provider "${HERMES_INFERENCE_PROVIDER}"
+    fi
+    if [[ -n "${HERMES_INFERENCE_MODEL:-}" ]]; then
+      hermes config set model.default "${HERMES_INFERENCE_MODEL}"
+    fi
+    if [[ -n "${HERMES_TIMEZONE:-}" ]]; then
+      hermes config set timezone "${HERMES_TIMEZONE}"
+    fi
     exec hermes gateway run
     ;;
   job)
