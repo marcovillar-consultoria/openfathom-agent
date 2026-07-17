@@ -105,6 +105,20 @@ of_metadata_token() {
 of_state_restore() {
   local tok code tarball="/tmp/of-state-restore.tar.gz"
   tok="$(of_metadata_token)" || { echo "[of-state] WARN: no metadata token; starting with empty state" >&2; return 0; }
+
+  # Record the generation we are about to read, for the compare-and-swap in
+  # of_state_snapshot(). A metadata GET (no alt=media) is the documented way to
+  # obtain it; `x-goog-generation` on the alt=media download is documented only for
+  # the XML API and was NOT confirmed for this JSON endpoint, so we do not rely on
+  # it. 404 -> no live version -> generation 0, which GCS defines as "only proceed
+  # if no live object exists".
+  of_state_generation="$(curl -sS --max-time 30 \
+    -H "Authorization: Bearer ${tok}" \
+    "https://storage.googleapis.com/storage/v1/b/${HERMES_STATE_BUCKET}/o/${HERMES_STATE_OBJECT}" 2>/dev/null \
+    | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("generation") or 0)
+except Exception: print(0)' 2>/dev/null || echo 0)"
+
   code="$(curl -sS -o "$tarball" -w '%{http_code}' --max-time 60 \
     -H "Authorization: Bearer ${tok}" \
     "https://storage.googleapis.com/storage/v1/b/${HERMES_STATE_BUCKET}/o/${HERMES_STATE_OBJECT}?alt=media" || echo 000)"
@@ -155,12 +169,48 @@ PY
   tar czf "$tarball" -C "$stage" . || { echo "[of-state] ERROR: tar failed; SNAPSHOT LOST" >&2; return 0; }
   [[ -s "$tarball" ]] || { echo "[of-state] WARN: nothing to snapshot" >&2; return 0; }
   tok="$(of_metadata_token)" || { echo "[of-state] ERROR: no metadata token; SNAPSHOT LOST" >&2; return 0; }
+
+  # Compare-and-swap, and this is not belt-and-braces -- it fixes a real, MEASURED
+  # data-destruction path (execution/of-09.md section 11). Cloud Run brings the new
+  # revision up BEFORE draining the old one: on 2026-07-17 revision 00012 restored
+  # at 13:29:36 (bucket still empty) while 00011 wrote its snapshot at 13:30:03, 27s
+  # later. The incoming revision therefore boots from stale-or-absent state and, on
+  # ITS shutdown, would overwrite the outgoing revision's good snapshot with its own
+  # emptier one. That is silent loss of the user's real conversation.
+  #
+  # ifGenerationMatch turns that into a refusal: we write only if the object is
+  # still at the generation we restored from (0 = "no live version existed"). GCS
+  # answers 412 when it moved, which is exactly the case where writing would
+  # destroy. We then park the snapshot in a conflict object instead of dropping it
+  # -- neither side is lost, and the log says so.
+  #
+  # This does NOT fix the ordering (the incoming revision still starts stale); it
+  # fixes the destruction. The ordering has no fix from in here: hermes holds the
+  # SQLite connection open for the process lifetime, so re-restoring underneath a
+  # running gateway is the documented corruption path, and restarting it would cost
+  # a ~21s outage plus dropped requests. At min=0 -- the ADR-039 target -- the
+  # overlap does not arise at all: the instance dies whole, then a later request
+  # cold-starts and restores.
+  local url="https://storage.googleapis.com/upload/storage/v1/b/${HERMES_STATE_BUCKET}/o?uploadType=media&name=${HERMES_STATE_OBJECT}&ifGenerationMatch=${of_state_generation:-0}"
   code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 60 -X POST \
     -H "Authorization: Bearer ${tok}" -H "Content-Type: application/gzip" \
-    --data-binary "@${tarball}" \
-    "https://storage.googleapis.com/upload/storage/v1/b/${HERMES_STATE_BUCKET}/o?uploadType=media&name=${HERMES_STATE_OBJECT}" || echo 000)"
-  if [[ "$code" == "200" ]]; then
-    echo "[of-state] snapshot uploaded to gs://${HERMES_STATE_BUCKET}/${HERMES_STATE_OBJECT} ($(stat -c%s "$tarball") bytes)"
+    --data-binary "@${tarball}" "$url" || echo 000)"
+
+  if [[ "$code" == "412" ]]; then
+    local conflict="${HERMES_STATE_OBJECT%.tar.gz}.conflict-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+    echo "[of-state] WARN: snapshot NOT written -- gs://${HERMES_STATE_BUCKET}/${HERMES_STATE_OBJECT} changed since this instance restored (generation ${of_state_generation:-0})." >&2
+    echo "[of-state] WARN: another revision wrote a newer snapshot; overwriting it would destroy it. Parking this one at ${conflict} instead." >&2
+    code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 60 -X POST \
+      -H "Authorization: Bearer ${tok}" -H "Content-Type: application/gzip" \
+      --data-binary "@${tarball}" \
+      "https://storage.googleapis.com/upload/storage/v1/b/${HERMES_STATE_BUCKET}/o?uploadType=media&name=${conflict}" || echo 000)"
+    if [[ "$code" == "200" ]]; then
+      echo "[of-state] conflict snapshot parked at gs://${HERMES_STATE_BUCKET}/${conflict} -- BOTH states survive; a human decides which wins" >&2
+    else
+      echo "[of-state] ERROR: conflict snapshot upload failed (HTTP ${code}); THIS SESSION IS LOST" >&2
+    fi
+  elif [[ "$code" == "200" ]]; then
+    echo "[of-state] snapshot uploaded to gs://${HERMES_STATE_BUCKET}/${HERMES_STATE_OBJECT} ($(stat -c%s "$tarball") bytes, generation matched ${of_state_generation:-0})"
   else
     echo "[of-state] ERROR: snapshot upload failed (HTTP ${code}); THIS SESSION IS LOST" >&2
   fi
@@ -216,6 +266,39 @@ case "${HERMES_MODE:-service}" in
     if [[ -n "${HERMES_TIMEZONE:-}" ]]; then
       hermes config set timezone "${HERMES_TIMEZONE}"
     fi
+
+    # ENG-49. Unconditional, not env-gated, because there is no deployment of this
+    # image where leaking the model's private reasoning to the user is wanted.
+    #
+    # The chain, measured end to end against the real Vertex endpoint (2026-07-17),
+    # not inferred: the migrated config.yaml ships `agent.reasoning_effort: "medium"`
+    # -> plugins/model-providers/vertex/VertexProfile.build_extra_body() feeds it to
+    # agent/transports/chat_completions.py's _build_gemini_thinking_config(), which
+    # returns {"includeThoughts": True} for any effort other than "none" -> Gemini
+    # then returns its thought summary, and the OpenAI-compat surface has nowhere to
+    # put it but `content`. The gateway stores that content verbatim in state.db, so
+    # the reasoning is not merely displayed once -- it becomes conversation history
+    # and is replayed as context on every subsequent turn.
+    #
+    # Proven with a controlled experiment on the same request: with
+    # include_thoughts=true the content came back '<think>\nAlright, so I'm
+    # thinking, "The user wants..."'; with false, content was None. One field, whole
+    # defect.
+    #
+    # Why config and not code: the leak lives in agent/ and plugins/, which ADR-002
+    # puts outside this fork's 7 files. This is the only lever we have -- and it
+    # happens to be the intended one, not a workaround: `none` is a documented value
+    # of this key.
+    #
+    # Do not trust the key's own comment in config.yaml ("Reasoning effort level
+    # (OpenRouter and Nous Portal)"). It is wrong by omission -- VertexProfile reads
+    # the same key, which is exactly why this cause was dismissed on the first pass.
+    #
+    # Gemini still thinks internally (the reasoning_tokens are still billed); what
+    # this turns off is returning the thoughts. Suppressing the thinking itself
+    # would be thinkingBudget, a different knob, and would trade answer quality for
+    # tokens -- not this item's call to make.
+    hermes config set agent.reasoning_effort none
 
     # ENG-45. Without a bucket configured this whole block is skipped and the old
     # `exec hermes gateway run` semantics are kept exactly -- that is the contract
