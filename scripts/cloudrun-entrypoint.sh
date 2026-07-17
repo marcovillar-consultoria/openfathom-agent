@@ -63,7 +63,109 @@
 #                   key steers hermes's own time handling only; set the container's TZ
 #                   env var alongside it for everything else.
 #   PORT            injected by Cloud Run; only consulted in service mode
+#   HERMES_STATE_BUCKET  optional, service mode -- GCS bucket holding the state
+#                   snapshot (ENG-45). Empty (default) disables persistence entirely
+#                   and keeps the pre-ENG-45 behavior: state lives on the container's
+#                   writable layer and dies with the instance.
+#   HERMES_STATE_OBJECT  optional -- object name inside that bucket. Default
+#                   gateway-state.tar.gz. Must not contain `/` (it goes into a URL
+#                   path segment unescaped).
 set -euo pipefail
+
+# --- State persistence (ENG-45) ---------------------------------------------
+# Why a snapshot to a single object instead of the GCS FUSE volume mount that
+# ADR-003 specifies for Track A: openfathom-meta ADR-041. The short version,
+# researched against the primary docs before writing this (not assumed):
+# gcsfuse re-uploads the FULL object on every fsync, and SQLite's `state.db` and
+# `state.db-wal` are two independent GCS objects with no atomicity across them --
+# so a kill between their uploads pairs mismatched generations, which is the
+# textbook SQLite corruption vector. That failure is SILENT, so "mount it and
+# watch" cannot absolve it. Snapshotting instead keeps SQLite on a real POSIX
+# filesystem (WAL exactly as designed) and ships ONE self-contained object, which
+# GCS writes atomically.
+#
+# Deliberately NOT restored: config.yaml. cont-init's schema migration writes a
+# fresh one every boot and the block below then sets our keys on it; restoring an
+# old config.yaml would shadow that migration on the next image bump. Config is
+# declared by Terraform here, not user state.
+#
+# No gcloud/gsutil/google-cloud-storage in this image (checked: uv.lock has
+# google-auth but not google-cloud-storage; the Dockerfile installs neither CLI).
+# curl + the metadata server is the whole dependency.
+of_metadata_token() {
+  curl -fsS --retry 2 --max-time 10 \
+    -H "Metadata-Flavor: Google" \
+    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])'
+}
+
+# Restore is best-effort BY DESIGN: a gateway that boots empty is degraded, but a
+# gateway that refuses to boot is down (Dogma 2). HTTP 404 is the first-boot case
+# and is not an error.
+of_state_restore() {
+  local tok code tarball="/tmp/of-state-restore.tar.gz"
+  tok="$(of_metadata_token)" || { echo "[of-state] WARN: no metadata token; starting with empty state" >&2; return 0; }
+  code="$(curl -sS -o "$tarball" -w '%{http_code}' --max-time 60 \
+    -H "Authorization: Bearer ${tok}" \
+    "https://storage.googleapis.com/storage/v1/b/${HERMES_STATE_BUCKET}/o/${HERMES_STATE_OBJECT}?alt=media" || echo 000)"
+  case "$code" in
+    200) ;;
+    404) echo "[of-state] no snapshot yet (first boot) -- starting with empty state"; rm -f "$tarball"; return 0 ;;
+    *)   echo "[of-state] WARN: restore failed (HTTP ${code}); starting with empty state" >&2; rm -f "$tarball"; return 0 ;;
+  esac
+  if tar xzf "$tarball" -C "${HERMES_HOME:-/opt/data}" 2>/dev/null; then
+    echo "[of-state] restored snapshot from gs://${HERMES_STATE_BUCKET}/${HERMES_STATE_OBJECT}"
+  else
+    echo "[of-state] WARN: snapshot present but did not extract; starting with empty state" >&2
+  fi
+  rm -f "$tarball"
+}
+
+# Runs after `hermes` has exited, so every *.db is closed and WAL-checkpointed and
+# a plain tar of it is consistent. `VACUUM INTO` is still used for the .db files:
+# it is the one documented way to get a consistent single-file copy even if hermes
+# did NOT exit cleanly, and it costs milliseconds at this size.
+#
+# Excludes are caches and logs -- re-derivable, and `.cache/uv` alone is 209
+# objects. `skills/` is excluded because the image re-syncs bundled skills into it
+# on every boot anyway.
+of_state_snapshot() {
+  local home="${HERMES_HOME:-/opt/data}" stage="/tmp/of-state-stage" tarball="/tmp/of-state-snap.tar.gz" tok code
+  rm -rf "$stage" "$tarball"; mkdir -p "$stage"
+  # Consistent copy of each SQLite DB, live-writer-safe.
+  local db
+  for db in "$home"/*.db; do
+    [[ -e "$db" ]] || continue
+    python3 - "$db" "$stage/$(basename "$db")" <<'PY' || echo "[of-state] WARN: VACUUM INTO failed for $db" >&2
+import sqlite3, sys
+src, dst = sys.argv[1], sys.argv[2]
+con = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+try:
+    con.execute("VACUUM INTO ?", (dst,))
+finally:
+    con.close()
+PY
+  done
+  # Everything else that is real state, copied into the same staging dir so the
+  # tar below is a plain `-C "$stage" .` -- no generated -C arguments to get wrong.
+  local p
+  for p in memories plans pairing cron hooks SOUL.md .skills_prompt_snapshot.json; do
+    [[ -e "$home/$p" ]] && cp -a "$home/$p" "$stage/$p"
+  done
+  tar czf "$tarball" -C "$stage" . || { echo "[of-state] ERROR: tar failed; SNAPSHOT LOST" >&2; return 0; }
+  [[ -s "$tarball" ]] || { echo "[of-state] WARN: nothing to snapshot" >&2; return 0; }
+  tok="$(of_metadata_token)" || { echo "[of-state] ERROR: no metadata token; SNAPSHOT LOST" >&2; return 0; }
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 60 -X POST \
+    -H "Authorization: Bearer ${tok}" -H "Content-Type: application/gzip" \
+    --data-binary "@${tarball}" \
+    "https://storage.googleapis.com/upload/storage/v1/b/${HERMES_STATE_BUCKET}/o?uploadType=media&name=${HERMES_STATE_OBJECT}" || echo 000)"
+  if [[ "$code" == "200" ]]; then
+    echo "[of-state] snapshot uploaded to gs://${HERMES_STATE_BUCKET}/${HERMES_STATE_OBJECT} ($(stat -c%s "$tarball") bytes)"
+  else
+    echo "[of-state] ERROR: snapshot upload failed (HTTP ${code}); THIS SESSION IS LOST" >&2
+  fi
+  rm -rf "$stage" "$tarball"
+}
 
 case "${HERMES_MODE:-service}" in
   service)
@@ -114,7 +216,51 @@ case "${HERMES_MODE:-service}" in
     if [[ -n "${HERMES_TIMEZONE:-}" ]]; then
       hermes config set timezone "${HERMES_TIMEZONE}"
     fi
-    exec hermes gateway run
+
+    # ENG-45. Without a bucket configured this whole block is skipped and the old
+    # `exec hermes gateway run` semantics are kept exactly -- that is the contract
+    # the OF-05/OF-09 placeholder stages relied on, and it stays valid.
+    if [[ -z "${HERMES_STATE_BUCKET:-}" ]]; then
+      exec hermes gateway run
+    fi
+
+    HERMES_STATE_OBJECT="${HERMES_STATE_OBJECT:-gateway-state.tar.gz}"
+    of_state_restore
+
+    # We can no longer `exec`: something has to outlive `hermes` to take the
+    # snapshot after it exits. So `hermes` runs in the background and this shell
+    # stays as the container's CMD, waiting on it.
+    #
+    # This only works because S6_CMD_RECEIVE_SIGNALS=1 is set in the Cloud Run env
+    # (openfathom-infra cloud_run_service). Read s6-overlay's own rc.init: it runs
+    # the CMD with `$arg0 "$@" &` and records /run/s6/cmdpid ONLY when that var is
+    # >0; the SIGTERM handler (skel/CMDSIG) then forwards to that pid. With the var
+    # unset there is no cmdpid, so CMDSIG falls through to the plain halt and this
+    # shell is never signalled directly -- it would only be caught by the nuke at
+    # the END of s6's shutdown, racing s6's own kill gracetime instead of running
+    # first. Measured (2026-07-17): `hermes` DOES get SIGTERM today via that nuke
+    # path ("Shutdown context: signal=SIGTERM ... parent_name=rc.init" in the real
+    # production log) -- so this var is not what makes SIGTERM arrive, it is what
+    # makes it arrive HERE, FIRST, and with the full 10s Cloud Run grace period
+    # ("During this period, the instance is allocated CPU and billed" -- container
+    # runtime contract; true even under request-based billing).
+    hermes gateway run &
+    of_gateway_pid=$!
+
+    of_on_term() {
+      trap - TERM INT
+      kill -TERM "${of_gateway_pid}" 2>/dev/null || true
+      wait "${of_gateway_pid}" 2>/dev/null || true
+      of_state_snapshot
+      exit 0
+    }
+    trap of_on_term TERM INT
+
+    # Two waits: the first is interrupted by the trap (bash runs the handler and
+    # `wait` returns >128); the second reaps `hermes` on the normal-exit path, where
+    # no signal ever arrives and the gateway simply died on its own.
+    wait "${of_gateway_pid}" || true
+    of_state_snapshot
     ;;
   job)
     if [[ -z "${HERMES_TASK:-}" ]]; then
