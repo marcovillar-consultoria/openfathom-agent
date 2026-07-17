@@ -231,19 +231,28 @@ case "${HERMES_MODE:-service}" in
     # snapshot after it exits. So `hermes` runs in the background and this shell
     # stays as the container's CMD, waiting on it.
     #
-    # This only works because S6_CMD_RECEIVE_SIGNALS=1 is set in the Cloud Run env
-    # (openfathom-infra cloud_run_service). Read s6-overlay's own rc.init: it runs
-    # the CMD with `$arg0 "$@" &` and records /run/s6/cmdpid ONLY when that var is
-    # >0; the SIGTERM handler (skel/CMDSIG) then forwards to that pid. With the var
-    # unset there is no cmdpid, so CMDSIG falls through to the plain halt and this
-    # shell is never signalled directly -- it would only be caught by the nuke at
-    # the END of s6's shutdown, racing s6's own kill gracetime instead of running
-    # first. Measured (2026-07-17): `hermes` DOES get SIGTERM today via that nuke
-    # path ("Shutdown context: signal=SIGTERM ... parent_name=rc.init" in the real
-    # production log) -- so this var is not what makes SIGTERM arrive, it is what
-    # makes it arrive HERE, FIRST, and with the full 10s Cloud Run grace period
+    # This needs S6_CMD_RECEIVE_SIGNALS=1 in the Cloud Run env (openfathom-infra
+    # cloud_run_service) -- and the reason is NOT the one first written here, which
+    # a mutant against this very image disproved (2026-07-17).
+    #
+    # The claim was "without it the SIGTERM never reaches this shell and the
+    # snapshot never runs". FALSE: running the real image with `docker stop` (which
+    # sends SIGTERM to PID 1 exactly like Cloud Run), the snapshot ran and uploaded
+    # WITHOUT the var. s6's shutdown nukes every remaining process with SIGTERM at
+    # the end of its sequence, and this trap fires from that.
+    #
+    # What is true, and is why the var stays -- measured by re-running the same
+    # mutant with a 5s upload instead of an instant stub: WITHOUT the var the
+    # snapshot is SIGKILLed mid-upload and lost (s6's own S6_KILL_GRACETIME, ~3s,
+    # starts the moment the nuke fires). WITH it, s6's rc.init runs this CMD as
+    # `$arg0 "$@" &`, records /run/s6/cmdpid, and skel/CMDSIG forwards SIGTERM here
+    # FIRST -- before the halt sequence -- so the snapshot owns Cloud Run's full 10s
     # ("During this period, the instance is allocated CPU and billed" -- container
     # runtime contract; true even under request-based billing).
+    #
+    # So: the var does not make the signal arrive. It buys the ~7 extra seconds
+    # that make the difference between a snapshot and a truncated one. An instant
+    # stub cannot see that; only a realistic upload can.
     hermes gateway run &
     of_gateway_pid=$!
 
