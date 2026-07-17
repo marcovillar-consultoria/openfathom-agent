@@ -300,6 +300,35 @@ case "${HERMES_MODE:-service}" in
     # tokens -- not this item's call to make.
     hermes config set agent.reasoning_effort none
 
+    # openfathom-meta ADR-043 / ENG-51: scope host-execution tools OUT of the
+    # always-on gateway. The inventory (references/gateway-tool-surface.md) measured
+    # that `terminal`, `process` and `execute_code` run UNSANDBOXED as the host user
+    # here -- a live RCE vector now that web_search brings untrusted web content into
+    # the agent. Per ADR-043 the gateway only ORCHESTRATES; code execution moves to the
+    # dev machine (Claude Code). Disabling the `terminal` toolset drops terminal+process;
+    # `code_execution` drops execute_code (toolset membership measured in the fork).
+    #
+    # Two levers were rejected, both measured, not assumed:
+    #   - `hermes config set agent.disabled_toolsets ...` coerces only bool/int/float
+    #     (config.py set_config_value), so it stores a STRING, but the consumer
+    #     (tools_config.py) iterates a LIST -- it would silently misbehave.
+    #   - `hermes tools disable` writes per-platform platform_toolsets and defaults to
+    #     the `cli` platform, missing the gateway entirely.
+    # So set the GLOBAL agent.disabled_toolsets directly, reusing hermes's own config
+    # machinery. Verified end to end INSIDE this image (2026-07-17): write lands a real
+    # YAML list, preserves agent.reasoning_effort, and _get_platform_tools resolves both
+    # toolsets as absent for the telegram platform.
+    python3 - <<'PYEOF'
+from hermes_cli.config import get_config_path, fast_safe_load, ensure_hermes_home, _set_nested
+from utils import atomic_yaml_write
+p = get_config_path()
+cfg = (fast_safe_load(open(p)) or {}) if p.exists() else {}
+_set_nested(cfg, "agent.disabled_toolsets", ["terminal", "code_execution"])
+ensure_hermes_home()
+atomic_yaml_write(p, cfg, sort_keys=False)
+print(f"✓ Set agent.disabled_toolsets = [terminal, code_execution] in {p}")
+PYEOF
+
     # ENG-45. Without a bucket configured this whole block is skipped and the old
     # `exec hermes gateway run` semantics are kept exactly -- that is the contract
     # the OF-05/OF-09 placeholder stages relied on, and it stays valid.
