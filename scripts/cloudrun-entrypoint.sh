@@ -62,6 +62,11 @@
 #                   ZoneInfo and falls back to server-local when empty or invalid. This
 #                   key steers hermes's own time handling only; set the container's TZ
 #                   env var alongside it for everything else.
+#   HERMES_SOUL     optional, service mode -- the declared agent identity (ENG-47),
+#                   written verbatim over $HERMES_HOME/SOUL.md at boot (of_write_soul),
+#                   AFTER any snapshot restore. Versioned in openfathom-infra; this is
+#                   the only lever for the agent's spoken language (display.language does
+#                   not accept pt-BR). Empty (default) keeps the image's default SOUL.md.
 #   PORT            injected by Cloud Run; only consulted in service mode
 #   HERMES_STATE_BUCKET  optional, service mode -- GCS bucket holding the state
 #                   snapshot (ENG-45). Empty (default) disables persistence entirely
@@ -160,10 +165,21 @@ finally:
     con.close()
 PY
   done
-  # Everything else that is real state, copied into the same staging dir so the
-  # tar below is a plain `-C "$stage" .` -- no generated -C arguments to get wrong.
+  # Everything else that is real MUTABLE state, copied into the same staging dir so
+  # the tar below is a plain `-C "$stage" .` -- no generated -C arguments to get wrong.
+  #
+  # Deliberately NOT snapshotted (declared config or cache -- reconciled from the
+  # image/env at boot, so snapshotting them only risks a stale copy shadowing the
+  # canonical one, the exact drift SOUL.md had):
+  #   - SOUL.md              -> declared at boot from $HERMES_SOUL (of_write_soul)
+  #   - hooks/               -> author-time behavior code; Hermes treats it as image
+  #                             content (backup.py _QUICK_STATE_FILES omits it), same
+  #                             class as skills/, which is already re-synced each boot
+  #   - .skills_prompt_snapshot.json -> pure cache keyed on skill mtimes; skills/ is
+  #                             re-synced every boot so the manifest never matches and
+  #                             it is discarded and rebuilt regardless
   local p
-  for p in memories plans pairing cron hooks SOUL.md .skills_prompt_snapshot.json; do
+  for p in memories plans pairing cron; do
     [[ -e "$home/$p" ]] && cp -a "$home/$p" "$stage/$p"
   done
   tar czf "$tarball" -C "$stage" . || { echo "[of-state] ERROR: tar failed; SNAPSHOT LOST" >&2; return 0; }
@@ -217,6 +233,25 @@ PY
   rm -rf "$stage" "$tarball"
 }
 
+# ENG-47 (openfathom-meta BACKLOG). Declared-config-wins, reconciled at boot: the
+# agent identity is versioned in openfathom-infra as the HERMES_SOUL env var, and
+# written over $HERMES_HOME/SOUL.md every boot -- overwriting whatever the snapshot
+# restored. SOUL.md is therefore EXCLUDED from the snapshot (of_state_snapshot above),
+# so the declared copy is the single source of truth and cannot drift.
+#
+# This MUST run AFTER of_state_restore (an old snapshot still carries a SOUL.md that
+# restore would extract), and before `hermes gateway run` reads it. SOUL.md is the
+# ONLY lever for the agent's spoken language: display.language does not accept pt/pt-BR
+# (config.py supports en/zh/ja/de/es/fr/tr/uk only) and localizes just static UI
+# strings, not agent output. The pt-BR requirement lives here.
+of_write_soul() {
+  [[ -n "${HERMES_SOUL:-}" ]] || return 0
+  local home="${HERMES_HOME:-/opt/data}"
+  mkdir -p "$home"
+  printf '%s\n' "${HERMES_SOUL}" > "$home/SOUL.md"
+  echo "[of-soul] wrote declared SOUL.md (${#HERMES_SOUL} chars) to $home/SOUL.md"
+}
+
 case "${HERMES_MODE:-service}" in
   service)
     # Same command docker-compose.yml already runs today (`gateway: command:
@@ -265,6 +300,23 @@ case "${HERMES_MODE:-service}" in
     fi
     if [[ -n "${HERMES_TIMEZONE:-}" ]]; then
       hermes config set timezone "${HERMES_TIMEZONE}"
+    fi
+
+    # ENG-46 (openfathom-meta BACKLOG). The auxiliary client -- context compression,
+    # conversation-title generation -- has no working provider on the deployed gateway:
+    # its `auto` resolution falls through to the hardcoded OpenRouter aggregator and
+    # errors on credit EVERY turn, silently. It does NOT share the main agent's
+    # resolve_runtime_provider(); it reads auxiliary.<task>.provider/model directly
+    # (agent/auxiliary_client.py:_resolve_task_provider_model), and its own vertex
+    # default is gemini-3-flash-preview, so the model MUST be pinned explicitly to get
+    # flash. Point both tasks at the same Vertex/ADC path the main agent uses. These
+    # are scalar keys two levels deep -- `hermes config set` writes them fine (unlike
+    # the LIST at agent.disabled_toolsets below, which needs the python heredoc).
+    if [[ -n "${HERMES_INFERENCE_PROVIDER:-}" ]]; then
+      hermes config set auxiliary.compression.provider      "${HERMES_INFERENCE_PROVIDER}"
+      hermes config set auxiliary.compression.model         google/gemini-2.5-flash
+      hermes config set auxiliary.title_generation.provider "${HERMES_INFERENCE_PROVIDER}"
+      hermes config set auxiliary.title_generation.model    google/gemini-2.5-flash
     fi
 
     # ENG-49. Unconditional, not env-gated, because there is no deployment of this
@@ -333,11 +385,13 @@ PYEOF
     # `exec hermes gateway run` semantics are kept exactly -- that is the contract
     # the OF-05/OF-09 placeholder stages relied on, and it stays valid.
     if [[ -z "${HERMES_STATE_BUCKET:-}" ]]; then
+      of_write_soul
       exec hermes gateway run
     fi
 
     HERMES_STATE_OBJECT="${HERMES_STATE_OBJECT:-gateway-state.tar.gz}"
     of_state_restore
+    of_write_soul
 
     # We can no longer `exec`: something has to outlive `hermes` to take the
     # snapshot after it exits. So `hermes` runs in the background and this shell
