@@ -373,16 +373,37 @@ case "${HERMES_MODE:-service}" in
     # machinery. Verified end to end INSIDE this image (2026-07-17): write lands a real
     # YAML list, preserves agent.reasoning_effort, and _get_platform_tools resolves both
     # toolsets as absent for the telegram platform.
+    #
+    # ENG-57: also drop the GENERATION toolsets `image_gen`, `video_gen`, `tts`. Two
+    # reasons: (1) cost -- their tool schemas ride in the per-turn prompt for a feature
+    # the Tech Lead does not want; dropping them shrinks input tokens. (2) honesty -- with
+    # them in the toolset the model advertised "gera imagens/áudio", a capability the
+    # headless gateway lacks; removing them kills the over-claim at the source, cleaner
+    # than a SOUL instruction. This does NOT touch voice INPUT: transcription is the
+    # gateway's stt_enabled auto-enrich pipeline (gateway/run.py), not a toolset, so it is
+    # unaffected -- only audio/image/video GENERATION goes away.
     python3 - <<'PYEOF'
 from hermes_cli.config import get_config_path, fast_safe_load, ensure_hermes_home, _set_nested
 from utils import atomic_yaml_write
 p = get_config_path()
 cfg = (fast_safe_load(open(p)) or {}) if p.exists() else {}
-_set_nested(cfg, "agent.disabled_toolsets", ["terminal", "code_execution"])
+_set_nested(cfg, "agent.disabled_toolsets", ["terminal", "code_execution", "image_gen", "video_gen", "tts"])
 ensure_hermes_home()
 atomic_yaml_write(p, cfg, sort_keys=False)
-print(f"✓ Set agent.disabled_toolsets = [terminal, code_execution] in {p}")
+print(f"✓ Set agent.disabled_toolsets = [terminal, code_execution, image_gen, video_gen, tts] in {p}")
 PYEOF
+
+    # ENG-57: pin speech-to-text to Groq (free tier, uses the already-installed openai
+    # SDK) so incoming Telegram voice notes are transcribed reliably. STT is ON by default
+    # (gateway stt_enabled=True), but the default `local` faster-whisper is NOT in this
+    # image -- it lazy-installs a ~150 MB model onto the ephemeral fs on every cold start.
+    # Groq needs no local package. Gated on GROQ_API_KEY: without the secret it falls back
+    # to the (lazy) local default instead of a broken groq provider. The OpenRouter key
+    # cannot drive STT -- OpenRouter is chat-only, no transcription endpoint. This is voice
+    # INPUT only; audio OUTPUT (tts) is disabled with the generation toolsets above.
+    if [[ -n "${GROQ_API_KEY:-}" ]]; then
+      hermes config set stt.provider groq
+    fi
 
     # ENG-45. Without a bucket configured this whole block is skipped and the old
     # `exec hermes gateway run` semantics are kept exactly -- that is the contract
