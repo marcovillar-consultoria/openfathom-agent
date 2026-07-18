@@ -302,21 +302,24 @@ case "${HERMES_MODE:-service}" in
       hermes config set timezone "${HERMES_TIMEZONE}"
     fi
 
-    # ENG-46 (openfathom-meta BACKLOG). The auxiliary client -- context compression,
-    # conversation-title generation -- has no working provider on the deployed gateway:
-    # its `auto` resolution falls through to the hardcoded OpenRouter aggregator and
-    # errors on credit EVERY turn, silently. It does NOT share the main agent's
-    # resolve_runtime_provider(); it reads auxiliary.<task>.provider/model directly
-    # (agent/auxiliary_client.py:_resolve_task_provider_model), and its own vertex
-    # default is gemini-3-flash-preview, so the model MUST be pinned explicitly to get
-    # flash. Point both tasks at the same Vertex/ADC path the main agent uses. These
-    # are scalar keys two levels deep -- `hermes config set` writes them fine (unlike
-    # the LIST at agent.disabled_toolsets below, which needs the python heredoc).
+    # ENG-46 / ENG-56 (openfathom-meta BACKLOG). The auxiliary client -- context
+    # compression, conversation-title generation -- had NO working provider while the
+    # gateway ran on Vertex: `vertex` has auth_type=vertex, which the aux router skips,
+    # so resolve_provider_client returned (None, None) and every aux turn failed
+    # silently. Switching the provider to OpenRouter fixes it: `openrouter` is an
+    # api_key provider with a first-class resolution branch (agent/auxiliary_client.py
+    # _try_openrouter), so the aux resolves to a real client off OPENROUTER_API_KEY. The
+    # aux does NOT share the main agent's resolve_runtime_provider(); it reads
+    # auxiliary.<task>.provider/model directly, and the model MUST be pinned to a valid
+    # aggregator slug -- a bare `google/gemini-2.5-flash` here would silently bill Gemini
+    # through OpenRouter instead of running Haiku. These are scalar keys two levels deep
+    # -- `hermes config set` writes them fine (unlike the LIST at agent.disabled_toolsets
+    # below, which needs the python heredoc).
     if [[ -n "${HERMES_INFERENCE_PROVIDER:-}" ]]; then
       hermes config set auxiliary.compression.provider      "${HERMES_INFERENCE_PROVIDER}"
-      hermes config set auxiliary.compression.model         google/gemini-2.5-flash
+      hermes config set auxiliary.compression.model         anthropic/claude-haiku-4.5
       hermes config set auxiliary.title_generation.provider "${HERMES_INFERENCE_PROVIDER}"
-      hermes config set auxiliary.title_generation.model    google/gemini-2.5-flash
+      hermes config set auxiliary.title_generation.model    anthropic/claude-haiku-4.5
     fi
 
     # ENG-49. Unconditional, not env-gated, because there is no deployment of this
