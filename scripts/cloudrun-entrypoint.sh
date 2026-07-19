@@ -25,6 +25,11 @@
 #   API_SERVER_KEY  required in service mode -- see the block below, this is enforced
 #                   in gateway/platforms/api_server.py, not a preference of ours
 #   HERMES_TASK     prompt to run in job mode (required when HERMES_MODE=job)
+#   HERMES_SKILLS_OBJECT  service mode only, OPT-IN. Object name of the OpenFathom skills
+#                   tarball inside HERMES_STATE_BUCKET. Unset -> the block is skipped
+#                   entirely and behaviour is exactly what it was before OF-08. The Job
+#                   is unaffected either way: it gcsfuse-mounts its own $HERMES_HOME and
+#                   already sees the skills through that mount.
 #   HERMES_JOB_OUTPUT  where to write the job's stdout (default $HERMES_HOME/job-output.txt)
 #   HERMES_INFERENCE_PROVIDER / HERMES_INFERENCE_MODEL  honored in BOTH modes, but
 #                   through two different mechanisms, because the two modes resolve the
@@ -102,6 +107,45 @@ of_metadata_token() {
     -H "Metadata-Flavor: Google" \
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])'
+}
+
+# OF-08. Fetch the OpenFathom skills tarball and extract it into $1. Returns non-zero
+# (and says why) if the directory would not end up with at least one SKILL.md -- the
+# caller uses that to decide whether to point skills.external_dirs at it. Reuses
+# of_metadata_token + the JSON API exactly like of_state_restore: still no gcloud, no
+# gsutil, no google-cloud-storage in this image.
+#
+# Unlike the state snapshot, a 404 here is NOT a normal first boot -- the object is
+# published deliberately, so its absence means the publish step was skipped.
+of_skills_fetch() {
+  local dest="$1" tok code tarball="/tmp/of-skills.tar.gz"
+  tok="$(of_metadata_token)" || { echo "[of-skills] WARN: no metadata token" >&2; return 1; }
+
+  code="$(curl -sS -o "$tarball" -w '%{http_code}' --max-time 60 \
+    -H "Authorization: Bearer ${tok}" \
+    "https://storage.googleapis.com/storage/v1/b/${HERMES_STATE_BUCKET}/o/${HERMES_SKILLS_OBJECT}?alt=media" || echo 000)"
+  if [[ "$code" != "200" ]]; then
+    echo "[of-skills] WARN: fetch of gs://${HERMES_STATE_BUCKET}/${HERMES_SKILLS_OBJECT} failed (HTTP ${code})" >&2
+    rm -f "$tarball"; return 1
+  fi
+
+  # Replace wholesale: a stale skill left behind by a previous boot would keep being
+  # advertised to the model after it was deleted upstream.
+  rm -rf "$dest"; mkdir -p "$dest"
+  if ! tar xzf "$tarball" -C "$dest" 2>/dev/null; then
+    echo "[of-skills] WARN: tarball present but did not extract" >&2
+    rm -f "$tarball"; return 1
+  fi
+  rm -f "$tarball"
+
+  local n
+  n="$(find "$dest" -name SKILL.md -type f 2>/dev/null | wc -l)"
+  if [[ "$n" -eq 0 ]]; then
+    echo "[of-skills] WARN: extracted tarball contains no SKILL.md -- refusing to point external_dirs at an empty tree" >&2
+    return 1
+  fi
+  echo "[of-skills] loaded ${n} skill(s) from gs://${HERMES_STATE_BUCKET}/${HERMES_SKILLS_OBJECT}"
+  return 0
 }
 
 # Restore is best-effort BY DESIGN: a gateway that boots empty is degraded, but a
@@ -403,6 +447,53 @@ PYEOF
     # INPUT only; audio OUTPUT (tts) is disabled with the generation toolsets above.
     if [[ -n "${GROQ_API_KEY:-}" ]]; then
       hermes config set stt.provider groq
+    fi
+
+    # openfathom-meta OF-08: make the OpenFathom skills (openfathom-skills repo) reachable
+    # by the SERVICE. They were not, and nobody noticed for five days.
+    #
+    # The chain, measured 2026-07-18, not assumed: skills reach $HERMES_HOME/skills only
+    # via upstream's tools/skills_sync.py (docker/stage2-hook.sh), which syncs from the
+    # image's own skills/ directory. ADR-002 keeps our repo at 7 files, so our skills are
+    # NOT in the image. The Job sees them only because it gcsfuse-mounts a bucket at its
+    # $HERMES_HOME; the Service has no such mount, and of_state_snapshot deliberately
+    # tars only `memories plans pairing cron` -- so anything dropped into
+    # $HERMES_HOME/skills on a Service instance dies with the revision.
+    #
+    # skills.external_dirs is upstream's supported answer (agent/skill_utils.py
+    # get_external_skills_dirs; external dirs are READ-ONLY, and skill creation still
+    # writes to the local dir). We populate one from a tarball in the bucket the gateway
+    # ALREADY reads -- no new bucket, no new IAM binding, no new credential, and no copy
+    # of the private skills repo inside this public fork.
+    #
+    # Extract INSIDE $HERMES_HOME, not /opt: this script runs after s6-setuidgid has
+    # dropped to the `hermes` user, so /opt is not ours to write. $HERMES_HOME is (state
+    # restore already extracts there) and it is not swept by the snapshot.
+    #
+    # FAIL LOUD, BOOT ANYWAY. get_external_skills_dirs() silently DROPS a path that does
+    # not exist -- fail-open: a typo yields a bot with no skills, no error, no signal.
+    # So the config key is written only after the directory is confirmed non-empty, and a
+    # failed fetch screams. Boot still proceeds (Dogma 2: a degraded gateway beats a
+    # gateway that is down) -- unlike of_state_restore, though, absence here is never the
+    # normal first-boot case: if HERMES_SKILLS_OBJECT is set, missing skills are a defect.
+    if [[ -n "${HERMES_SKILLS_OBJECT:-}" && -n "${HERMES_STATE_BUCKET:-}" ]]; then
+      of_skills_dir="${HERMES_HOME:-/opt/data}/openfathom-skills"
+      if of_skills_fetch "$of_skills_dir"; then
+        python3 - "$of_skills_dir" <<'PYEOF'
+import sys
+from hermes_cli.config import get_config_path, fast_safe_load, ensure_hermes_home, _set_nested
+from utils import atomic_yaml_write
+p = get_config_path()
+cfg = (fast_safe_load(open(p)) or {}) if p.exists() else {}
+_set_nested(cfg, "skills.external_dirs", [sys.argv[1]])
+ensure_hermes_home()
+atomic_yaml_write(p, cfg, sort_keys=False)
+print(f"✓ Set skills.external_dirs = [{sys.argv[1]}] in {p}")
+PYEOF
+      else
+        echo "[of-skills] ERROR: HERMES_SKILLS_OBJECT is set but no skills were loaded --" \
+             "the gateway is starting WITHOUT the OpenFathom skills" >&2
+      fi
     fi
 
     # ENG-45. Without a bucket configured this whole block is skipped and the old
