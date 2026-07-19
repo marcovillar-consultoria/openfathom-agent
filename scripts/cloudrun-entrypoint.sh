@@ -437,6 +437,46 @@ atomic_yaml_write(p, cfg, sort_keys=False)
 print(f"✓ Set agent.disabled_toolsets = [terminal, code_execution, image_gen, video_gen, tts] in {p}")
 PYEOF
 
+    # openfathom-meta ENG-52 / OF-15, ADR-043 Desenho 2. The GitHub MCP client that lets
+    # the (thin, exec-less) gateway CREATE the issue a local daemon later picks up and
+    # runs `claude -p` against -- the gateway never opens the PR itself, so the token is
+    # scoped to Issues: Read and write only (openfathom-meta execution/of-15.md has the
+    # full trail).
+    #
+    # Verified locally before writing this (not assumed): `hermes mcp add github --url
+    # https://api.githubcopilot.com/mcp/ --auth header` writes exactly this shape --
+    # `headers.Authorization: "Bearer ${VAR}"` as a LITERAL placeholder string, never the
+    # raw secret -- and tools/mcp_tool.py's _interpolate_env_vars() resolves ${VAR} from
+    # os.environ at CONNECT time (its own docstring: "resolved from os.environ (which
+    # includes ~/.hermes/.env loaded at startup)"). A plain container env var satisfies
+    # that lookup exactly like ~/.hermes/.env does locally -- confirmed against the real
+    # server (47 tools discovered, a real issue created and closed) before this line was
+    # written.
+    #
+    # Gated on MCP_GITHUB_API_KEY like every other optional secret-backed block here:
+    # empty (default) skips this entirely and the gateway has no GitHub MCP server, same
+    # as before this line existed. `mcp_servers` is its own top-level key -- untouched by
+    # (and not touching) agent.disabled_toolsets above, which stays the actual RCE
+    # mitigation. This block does not undo ENG-51: the gateway still never runs `terminal`
+    # or `code_execution`; it only gains one more MCP tool call surface, same class as the
+    # `web_search`/`browser_*` tools it already has.
+    if [[ -n "${MCP_GITHUB_API_KEY:-}" ]]; then
+      python3 - <<'PYEOF'
+from hermes_cli.config import get_config_path, fast_safe_load, ensure_hermes_home, _set_nested
+from utils import atomic_yaml_write
+p = get_config_path()
+cfg = (fast_safe_load(open(p)) or {}) if p.exists() else {}
+_set_nested(cfg, "mcp_servers.github", {
+    "url": "https://api.githubcopilot.com/mcp/",
+    "headers": {"Authorization": "Bearer ${MCP_GITHUB_API_KEY}"},
+    "enabled": True,
+})
+ensure_hermes_home()
+atomic_yaml_write(p, cfg, sort_keys=False)
+print(f"✓ Set mcp_servers.github (url + enabled) in {p}")
+PYEOF
+    fi
+
     # ENG-57: pin speech-to-text to Groq (free tier, uses the already-installed openai
     # SDK) so incoming Telegram voice notes are transcribed reliably. STT is ON by default
     # (gateway stt_enabled=True), but the default `local` faster-whisper is NOT in this
