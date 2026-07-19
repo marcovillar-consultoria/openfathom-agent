@@ -20,6 +20,19 @@ name: of-upstream-sync
 # that. Both deviations are flagged in docs/BACKLOG.md (openfathom-meta, ENG-32)
 # for an ADR-002 wording correction — real ADR/implementation mismatches, not
 # silent choices.
+#
+# TWO PRECONDITIONS THIS FILE CANNOT ENFORCE, both of which fail silently -- no
+# red run, no alert, just nothing happening (ENG-62, measured 2026-07-18):
+#
+#   1. `cloudrun` must be this repo's DEFAULT BRANCH. GitHub only fires `schedule`
+#      from the default branch, and this workflow lives only on `cloudrun` (ADR-002
+#      forbids us touching `main`, which mirrors upstream).
+#   2. This workflow must be EXPLICITLY ENABLED. "When a public repository is
+#      forked, scheduled workflows are disabled by default" -- GitHub Docs. Check
+#      with `gh workflow list`, enable with `gh workflow enable of-upstream-sync.yml`.
+#
+# Also: in a public repo, GitHub auto-disables scheduled workflows after 60 days
+# with no repository activity. A quiet quarter turns this off again, silently.
 
 on:
   schedule:
@@ -49,18 +62,24 @@ jobs:
           git remote add upstream https://github.com/NousResearch/hermes-agent.git
           git fetch upstream main
 
-      - name: Fast-forward main onto upstream
-        run: |
-          git checkout main
-          git merge --ff-only upstream/main
-          git push origin main
-
+      # No `main` fast-forward step here, deliberately. This fork's `main` carries
+      # one commit of ours (99d57df, the OF-01 bootstrap of README.openfathom.md,
+      # which ADR-002 lists as in-scope), so it has diverged from upstream and
+      # `git merge --ff-only upstream/main` ABORTS -- the sync would have died at
+      # that step every single time it fired. Measured 2026-07-18 (ENG-62): the
+      # merge-base of origin/main and upstream/main is not origin/main.
+      #
+      # The sync never needed our `main`: what it rebases onto is upstream's tree,
+      # and `upstream/main` names that directly. Dropping the step also drops a
+      # `git push origin main` from a workflow that runs unattended on a public
+      # fork -- less surface, same outcome. Our `main` simply stays frozen at the
+      # OF-01 bootstrap; nothing reads it once `cloudrun` is the default branch.
       - name: Attempt cloudrun rebase
         id: rebase
         run: |
           branch="sync/upstream-$(date -u +%Y%m%d)"
           git checkout -b "$branch" cloudrun
-          if git rebase main; then
+          if git rebase upstream/main; then
             echo "conflict=false" >> "$GITHUB_OUTPUT"
           else
             git rebase --abort
@@ -91,7 +110,7 @@ jobs:
           ```
           git fetch upstream main
           git checkout cloudrun
-          git rebase main
+          git rebase upstream/main
           # fix conflicts
           git push --force-with-lease
           ```
