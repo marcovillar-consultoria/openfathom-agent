@@ -182,6 +182,173 @@ except Exception: print(0)' 2>/dev/null || echo 0)"
     echo "[of-state] WARN: snapshot present but did not extract; starting with empty state" >&2
   fi
   rm -f "$tarball"
+
+  # openfathom-meta ADR-049. Carry the state epoch forward. Deliberately NOT in the
+  # `local` list above -- same reason of_state_generation is not: of_state_snapshot reads
+  # it at shutdown, hours later, so it has to survive this function's return. Making it
+  # local would silently degrade the reset guard to "always 0", which is the failure this
+  # variable exists to prevent.
+  #
+  # Absent or unreadable -> 0. Everything written before this ADR has no .state_epoch, so
+  # 0 is what they all get, comparisons are `>=`, and nothing needs migrating.
+  of_state_epoch="$(cat "${HERMES_HOME:-/opt/data}/.state_epoch" 2>/dev/null | tr -cd '0-9')"
+  of_state_epoch="${of_state_epoch:-0}"
+  echo "[of-state] state epoch ${of_state_epoch}"
+}
+
+# openfathom-meta ADR-049. Read `.state_epoch` out of a state tarball WITHOUT unpacking
+# it. Prints an integer; absent, unreadable or non-numeric all print 0, because every
+# tarball written before ADR-049 lacks the file and must compare as "oldest".
+of_state_tarball_epoch() {
+  python3 - "$1" <<'PY' 2>/dev/null || echo 0
+import sys, tarfile, os
+try:
+    with tarfile.open(sys.argv[1]) as t:
+        m = next((x for x in t.getmembers()
+                  if os.path.basename(x.name) == ".state_epoch" and x.isfile()), None)
+        if m is None:
+            print(0); raise SystemExit(0)
+        raw = t.extractfile(m).read().decode("utf-8", "replace").strip()
+    print(int(raw) if raw.isdigit() else 0)
+except Exception:
+    print(0)
+PY
+}
+
+# openfathom-meta ADR-049. Exit 0 iff the messages in tarball $1 (MINE) are a superset of
+# those in tarball $2 (THEIRS) -- i.e. promoting mine over theirs destroys nothing.
+#
+# The key is (session_id, role, timestamp, sha1(content)) and NEVER the `id` column. `id`
+# is an autoincrement primary key assigned per-database, so two states that diverged
+# reuse the same ids for different messages; comparing on it would report bogus overlap.
+# Measured 2026-07-20 on four real snapshots from production.
+#
+# FAIL CLOSED, and the reason is specific rather than generic caution: if THEIRS has no
+# state.db, its message set is empty, and "mine is a superset of nothing" is trivially
+# true -- which would promote right over a deliberately emptied state. That is exactly
+# the curated tarball the reset runbook uploads. The epoch guard already refuses that
+# case; this is the second, independent lock on the same door.
+of_state_messages_superset() {
+  python3 - "$1" "$2" <<'PY'
+import sys, tarfile, sqlite3, hashlib, os, tempfile
+
+def keys(path):
+    """Message identity set, or None when the tarball carries no state.db."""
+    with tarfile.open(path) as t:
+        m = next((x for x in t.getmembers()
+                  if os.path.basename(x.name) == "state.db" and x.isfile()), None)
+        if m is None:
+            return None
+        # extractfile + explicit write: never t.extract(), which would honour whatever
+        # path the archive claims.
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as fh:
+            fh.write(t.extractfile(m).read())
+            tmp = fh.name
+    try:
+        con = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True)
+        try:
+            return {
+                (s, r, ts, hashlib.sha1((c or "").encode()).hexdigest())
+                for s, r, c, ts in con.execute(
+                    "select session_id, role, content, timestamp from messages")
+            }
+        finally:
+            con.close()
+    finally:
+        os.unlink(tmp)
+
+try:
+    mine, theirs = keys(sys.argv[1]), keys(sys.argv[2])
+except Exception as e:
+    print(f"comparison failed: {e}", file=sys.stderr)
+    raise SystemExit(2)
+
+if theirs is None:
+    print("the live snapshot has no state.db -- refusing to call that a subset", file=sys.stderr)
+    raise SystemExit(3)
+if mine is None:
+    print("this instance has no state.db to promote", file=sys.stderr)
+    raise SystemExit(4)
+
+missing = theirs - mine
+if missing:
+    print(f"{len(missing)} message(s) exist only in the live snapshot", file=sys.stderr)
+    raise SystemExit(1)
+print(f"superset confirmed: {len(mine)} mine vs {len(theirs)} live, {len(mine - theirs)} added")
+PY
+}
+
+# openfathom-meta ADR-049. Called ONLY after a 412 and ONLY after the conflict has been
+# safely parked. Tries to turn "refused, parked for a human" into "written", for the case
+# the measurement showed to be the common one: the outgoing instance holding strictly MORE
+# than the live object and being refused anyway.
+#
+# WHY THE ORDER IS THE SAFETY ARGUMENT. Parking happens first, unconditionally. Every way
+# this function can die -- SIGKILL mid-download, a broken tarball, a network fault -- ends
+# with the state parked exactly as it is today. It can improve on the current behaviour;
+# it cannot regress below it. That is what makes doing network work inside Cloud Run's
+# ~10s shutdown budget defensible here, when the same work on the happy path would not be.
+#
+# THREE GUARDS, all of which must pass:
+#   1. the live object still EXISTS -- a 404 means someone deleted it on purpose
+#   2. our epoch >= its epoch      -- a newer epoch means a deliberate reset, never override
+#   3. its messages ⊆ ours         -- promoting must not drop anything
+of_state_try_promote() {
+  local mine="$1" conflict="$2" tok="$3"
+  local live="/tmp/of-state-live.tar.gz" code gen live_epoch
+
+  code="$(curl -sS -o "$live" -w '%{http_code}' --max-time 20 \
+    -H "Authorization: Bearer ${tok}" \
+    "https://storage.googleapis.com/storage/v1/b/${HERMES_STATE_BUCKET}/o/${HERMES_STATE_OBJECT}?alt=media" || echo 000)"
+  if [[ "$code" != "200" ]]; then
+    rm -f "$live"
+    echo "[of-state] not promoting: live snapshot unreadable (HTTP ${code}). A 404 here means it was deleted deliberately; the conflict stays parked." >&2
+    return 0
+  fi
+
+  live_epoch="$(of_state_tarball_epoch "$live")"
+  if [[ "${of_state_epoch:-0}" -lt "$live_epoch" ]]; then
+    rm -f "$live"
+    echo "[of-state] not promoting: live epoch ${live_epoch} is newer than ours (${of_state_epoch:-0}) -- a deliberate reset happened. The conflict stays parked." >&2
+    return 0
+  fi
+
+  if ! of_state_messages_superset "$mine" "$live"; then
+    rm -f "$live"
+    echo "[of-state] not promoting: this state is NOT a superset of the live one -- genuine divergence. The conflict stays parked for a human." >&2
+    return 0
+  fi
+  rm -f "$live"
+
+  # Re-read the generation we just downloaded, so the promoting write is itself a CAS.
+  # Without this a third writer landing in between would be clobbered -- which is the
+  # very defect this whole mechanism exists to prevent.
+  gen="$(curl -sS --max-time 20 -H "Authorization: Bearer ${tok}" \
+    "https://storage.googleapis.com/storage/v1/b/${HERMES_STATE_BUCKET}/o/${HERMES_STATE_OBJECT}" 2>/dev/null \
+    | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("generation") or 0)
+except Exception: print(0)' 2>/dev/null || echo 0)"
+  [[ -n "$gen" && "$gen" != "0" ]] || { echo "[of-state] not promoting: could not re-read the live generation. Conflict stays parked." >&2; return 0; }
+
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 -X POST \
+    -H "Authorization: Bearer ${tok}" -H "Content-Type: application/gzip" \
+    --data-binary "@${mine}" \
+    "https://storage.googleapis.com/upload/storage/v1/b/${HERMES_STATE_BUCKET}/o?uploadType=media&name=${HERMES_STATE_OBJECT}&ifGenerationMatch=${gen}" || echo 000)"
+  if [[ "$code" != "200" ]]; then
+    echo "[of-state] not promoting: promoting write failed (HTTP ${code}). The conflict stays parked -- nothing lost." >&2
+    return 0
+  fi
+  echo "[of-state] PROMOTED this state to gs://${HERMES_STATE_BUCKET}/${HERMES_STATE_OBJECT} -- it contained everything the live snapshot had, plus more"
+
+  # Only now, and only on a confirmed 200: the parked conflict is byte-identical in
+  # content to what is now canonical, so it is redundant by construction.
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 -X DELETE \
+    -H "Authorization: Bearer ${tok}" \
+    "https://storage.googleapis.com/storage/v1/b/${HERMES_STATE_BUCKET}/o/${conflict}" || echo 000)"
+  case "$code" in
+    200|204) echo "[of-state] removed the now-redundant ${conflict}" ;;
+    *)       echo "[of-state] WARN: could not remove the redundant ${conflict} (HTTP ${code}); harmless, it is a duplicate of the canonical object" >&2 ;;
+  esac
 }
 
 # Runs after `hermes` has exited, so every *.db is closed and WAL-checkpointed and
@@ -226,6 +393,12 @@ PY
   for p in memories plans pairing cron; do
     [[ -e "$home/$p" ]] && cp -a "$home/$p" "$stage/$p"
   done
+  # openfathom-meta ADR-049. Carry the epoch we booted with into the tarball we write.
+  # A deliberate wipe bumps this (see the reset runbook); an instance still holding the
+  # older epoch is then refused promotion, which is the only reason deleting on purpose
+  # can survive at all -- an empty state is a subset of every state, so the superset rule
+  # alone would resurrect it.
+  printf '%s\n' "${of_state_epoch:-0}" > "$stage/.state_epoch"
   tar czf "$tarball" -C "$stage" . || { echo "[of-state] ERROR: tar failed; SNAPSHOT LOST" >&2; return 0; }
   [[ -s "$tarball" ]] || { echo "[of-state] WARN: nothing to snapshot" >&2; return 0; }
   tok="$(of_metadata_token)" || { echo "[of-state] ERROR: no metadata token; SNAPSHOT LOST" >&2; return 0; }
@@ -265,7 +438,13 @@ PY
       --data-binary "@${tarball}" \
       "https://storage.googleapis.com/upload/storage/v1/b/${HERMES_STATE_BUCKET}/o?uploadType=media&name=${conflict}" || echo 000)"
     if [[ "$code" == "200" ]]; then
-      echo "[of-state] conflict snapshot parked at gs://${HERMES_STATE_BUCKET}/${conflict} -- BOTH states survive; a human decides which wins" >&2
+      echo "[of-state] conflict snapshot parked at gs://${HERMES_STATE_BUCKET}/${conflict} -- BOTH states survive" >&2
+      # openfathom-meta ADR-049. The state is safe on the line above; everything past this
+      # point can only improve on it. Measured on 2026-07-20, the common case here is not
+      # divergence at all -- it is this instance holding strictly MORE than the live object
+      # and being refused anyway, because "the generation moved" is only a proxy for "I
+      # would destroy something". of_state_try_promote checks the real question.
+      of_state_try_promote "$tarball" "$conflict" "$tok"
     else
       echo "[of-state] ERROR: conflict snapshot upload failed (HTTP ${code}); THIS SESSION IS LOST" >&2
     fi
