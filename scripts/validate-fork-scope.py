@@ -22,6 +22,9 @@ ALLOWED_FILES = frozenset(
         ".github/workflows/of-build-image.yml",
         "README.openfathom.md",
         "scripts/validate-fork-scope.py",
+        # Added by ADR-050. The entrypoint grew to 740 lines of production-only edge cases
+        # with no versioned test; the harness that proved ADR-048 died with its session.
+        "scripts/test-cloudrun-entrypoint.sh",
     }
 )
 
