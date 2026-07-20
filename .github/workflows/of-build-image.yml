@@ -48,11 +48,24 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Validate fork scope (ADR-002, amended by ADR-035)
+      - name: Validate fork scope (ADR-002, amended by ADR-035 and ADR-050)
         run: python3 scripts/validate-fork-scope.py
+
+  # openfathom-meta ADR-050. No `if:` -- this runs on PRs AND on pushes, and `build`
+  # depends on it, so a broken entrypoint cannot become an image. The entrypoint decides
+  # whether the user's conversation is written or parked; before this job the only proof
+  # it worked was a scratch harness that died with the session that wrote it.
+  test-entrypoint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Test cloudrun-entrypoint state logic (ADR-049)
+        run: bash scripts/test-cloudrun-entrypoint.sh
 
   build:
     if: github.event_name == 'push'
+    needs: test-entrypoint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
