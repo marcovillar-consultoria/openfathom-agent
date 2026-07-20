@@ -277,6 +277,109 @@ PY
   rm -rf "$stage" "$tarball"
 }
 
+# openfathom-meta ADR-048, decision 2. Deposit the skills the AGENT wrote this session
+# into an inbox prefix, so a human can review them before any of them ever reaches the
+# catalog. Dogma 5 asks WHO VOUCHES, and today nobody does: the agent is nudged to write
+# skills (`creation_nudge_interval: 15`), writes them to $HERMES_HOME/skills, and the
+# snapshot deliberately skips that directory -- so they evaporate on the next deploy,
+# unreviewed and unread. That is the dogma being satisfied BY ACCIDENT.
+#
+# The rejected fix was adding `skills` to of_state_snapshot's list. One word, and wrong:
+# it would restore UNREVIEWED machine-written content into the live catalog on every
+# boot, turning an accidental pass into a designed bypass -- worse, because it would then
+# LOOK compliant. ADR-048 records the reasoning.
+#
+# WHY THIS IS AN UPLOAD AND NOT A REDIRECT. Preferred design was to point skill creation
+# at a separate directory. Measured 2026-07-20, upstream does not allow it:
+# tools/skill_manager_tool.py::_resolve_skill_dir writes to _skills_dir(), which is
+# get_hermes_home()/"skills", with no env or config override. `skills.external_dirs`
+# extends READS only (agent/skill_utils.py::get_all_skills_dirs). Redirecting the write
+# would mean patching upstream, which ADR-002 forbids. So the separation happens at
+# shutdown instead, from out here.
+#
+# THE DISCRIMINATOR. $HERMES_HOME/skills holds 72 skills from the image plus whatever the
+# agent wrote, in the same tree. `.bundled_manifest` (upstream tools/skills_sync.py, v2
+# format `name:hash` per line) is upstream's own record of which ones came from the image,
+# rewritten by every sync -- so it is correct no matter when sync ran, which a boot-time
+# listing would not be (sync runs twice: docker/stage2-hook.sh, then again inside
+# `hermes gateway run`). Validated against the real artifact in BOTH directions, not just
+# the convenient one: `apple-notes` is in it, `arch-brainstorm` is not.
+#
+# Bundled skills nest one level under a category (skills/apple/apple-notes/), while the
+# manifest keys are flat basenames -- so the match is on the SKILL DIRECTORY NAME, not on
+# the path. That is safe from collisions because upstream's _create_skill refuses a name
+# that already exists in any skills dir.
+#
+# NOTE this sweeps `service` mode only, and that is what makes the manifest sufficient:
+# on the Service our own OpenFathom skills live in $HERMES_HOME/openfathom-skills (read
+# via external_dirs), NOT in skills/, so they are never candidates. On the JOB they DO
+# land in skills/ via the gcsfuse mount and are absent from the manifest -- they would be
+# swept as if the agent had written them. The Job never calls this.
+#
+# FAIL CLOSED. No manifest means no way to tell a machine-written skill from one of the
+# 72 that shipped in the image. Uploading all 72 into a review queue would train the
+# reviewer to ignore the queue, which is the failure this whole mechanism exists to
+# prevent. So: refuse, and say so.
+of_skills_inbox_deposit() {
+  local home="${HERMES_HOME:-/opt/data}" skills manifest stage tarball tok code obj n
+  skills="$home/skills"
+  manifest="$skills/.bundled_manifest"
+  [[ -d "$skills" ]] || return 0
+
+  if [[ ! -s "$manifest" ]]; then
+    echo "[of-inbox] ERROR: $manifest missing or empty -- cannot tell agent-written skills" \
+         "from the image's own. Refusing to deposit rather than flooding the review queue." >&2
+    return 0
+  fi
+
+  stage="/tmp/of-inbox-stage"; tarball="/tmp/of-inbox.tar.gz"
+  rm -rf "$stage" "$tarball"; mkdir -p "$stage"
+
+  local skill_md dir name
+  while IFS= read -r skill_md; do
+    dir="$(dirname "$skill_md")"
+    # A SKILL.md sitting at the ROOT of skills/ would make name="skills" and stage the
+    # WHOLE tree -- the 72 bundled ones included. Not a shape upstream produces, but the
+    # blast radius is exactly what this function exists to avoid, so it is cheaper to
+    # refuse it than to reason about whether it can happen.
+    [[ "$dir" == "$skills" ]] && { echo "[of-inbox] WARN: ignoring a SKILL.md at the root of $skills" >&2; continue; }
+    name="$(basename "$dir")"
+    grep -q "^${name}:" "$manifest" && continue
+    cp -a "$dir" "$stage/$name" 2>/dev/null || echo "[of-inbox] WARN: could not stage $dir" >&2
+  done < <(find "$skills" -name SKILL.md -type f 2>/dev/null)
+
+  n="$(find "$stage" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
+  if [[ "$n" -eq 0 ]]; then
+    echo "[of-inbox] no agent-written skills this session -- nothing to deposit"
+    rm -rf "$stage"; return 0
+  fi
+
+  tar czf "$tarball" -C "$stage" . || { echo "[of-inbox] ERROR: tar failed; ${n} skill(s) LOST" >&2; rm -rf "$stage"; return 0; }
+  tok="$(of_metadata_token)" || { echo "[of-inbox] ERROR: no metadata token; ${n} skill(s) LOST" >&2; rm -rf "$stage" "$tarball"; return 0; }
+
+  # Unique name per deposit, so no compare-and-swap is needed here (unlike the state
+  # snapshot, which has exactly one live object two revisions race over). Two overlapping
+  # revisions each deposit their own; neither can clobber the other.
+  #
+  # The prefix is OUTSIDE the restore path BY CONSTRUCTION, not by convention:
+  # of_skills_fetch reads only $HERMES_SKILLS_OBJECT and of_state_restore reads only
+  # $HERMES_STATE_OBJECT. Nothing in this script -- or in the image -- ever reads
+  # skills-inbox/. It reaches the catalog only through the openfathom-skills repo, which
+  # is where the human review happens.
+  obj="skills-inbox/${K_REVISION:-unknown}-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 -X POST \
+    -H "Authorization: Bearer ${tok}" -H "Content-Type: application/gzip" \
+    --data-binary "@${tarball}" \
+    "https://storage.googleapis.com/upload/storage/v1/b/${HERMES_STATE_BUCKET}/o?uploadType=media&name=${obj//\//%2F}" || echo 000)"
+
+  if [[ "$code" == "200" ]]; then
+    echo "[of-inbox] deposited ${n} agent-written skill(s) at gs://${HERMES_STATE_BUCKET}/${obj} -- AWAITING HUMAN REVIEW (Dogma 5); they are NOT in the catalog"
+  else
+    echo "[of-inbox] ERROR: deposit failed (HTTP ${code}); ${n} agent-written skill(s) LOST" >&2
+  fi
+  rm -rf "$stage" "$tarball"
+}
+
 # ENG-47 (openfathom-meta BACKLOG). Declared-config-wins, reconciled at boot: the
 # agent identity is versioned in openfathom-infra as the HERMES_SOUL env var, and
 # written over $HERMES_HOME/SOUL.md every boot -- overwriting whatever the snapshot
@@ -582,6 +685,12 @@ PYEOF
       kill -TERM "${of_gateway_pid}" 2>/dev/null || true
       wait "${of_gateway_pid}" 2>/dev/null || true
       of_state_snapshot
+      # AFTER the snapshot, deliberately, and the ordering is the whole safety argument.
+      # Cloud Run allocates ~10s of shutdown and the snapshot is sized to own it (see the
+      # S6_CMD_RECEIVE_SIGNALS reasoning below). If the budget runs out, SIGKILL lands on
+      # THIS call, not on the conversation state -- a lost skill deposit costs one
+      # session's unreviewed drafts, a lost snapshot costs the user's real conversation.
+      of_skills_inbox_deposit
       exit 0
     }
     trap of_on_term TERM INT
@@ -591,6 +700,7 @@ PYEOF
     # no signal ever arrives and the gateway simply died on its own.
     wait "${of_gateway_pid}" || true
     of_state_snapshot
+    of_skills_inbox_deposit
     ;;
   job)
     if [[ -z "${HERMES_TASK:-}" ]]; then
