@@ -110,19 +110,23 @@ jobs:
           fi
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
 
-      - name: Push sync branch and open PR
+      # PUSH ONLY -- the PR is opened by a human, deliberately (openfathom-meta ENG-62,
+      # measured 2026-07-20). The App token pushes the branch (INCLUDING the upstream
+      # `ci.yml` change -- the fourth blocker, now proven fixed), but `gh pr create` from
+      # inside Actions is refused with `Resource not accessible by integration`: the ORG
+      # policy "Allow GitHub Actions to create and approve pull requests" is OFF, and a
+      # repo cannot override it (PUT returns 409). Turning it ON is org-wide and bundles
+      # PR *approval* by automation -- a posture the program declined for a once-a-week
+      # convenience, since the 1588-commit sync PR needs a real human review anyway. So the
+      # workflow stops at the push and prints the compare link; the human clicks it. The
+      # one manual step lands exactly where the human was already going to read the diff.
+      - name: Push sync branch
         if: steps.rebase.outputs.conflict == 'false'
-        env:
-          # App token, not GITHUB_TOKEN: this step both pushes the workflow-file change
-          # (needs the App's Workflows permission) and opens the PR (needs Pull requests).
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           git push origin "${{ steps.rebase.outputs.branch }}"
-          gh pr create \
-            --base cloudrun \
-            --head "${{ steps.rebase.outputs.branch }}" \
-            --title "sync: rebase cloudrun onto upstream main ($(date -u +%Y-%m-%d))" \
-            --body "Automated weekly sync (ADR-002). The rebase applied without conflicts — review the upstream diff before merging. Merging into \`cloudrun\` triggers \`of-build-image.yml\`."
+          echo "::notice title=Sync branch pushed::Open the PR (base cloudrun): https://github.com/${{ github.repository }}/compare/cloudrun...${{ steps.rebase.outputs.branch }}?expand=1"
+          echo "Sync branch pushed. Open the PR here (base cloudrun):"
+          echo "  https://github.com/${{ github.repository }}/compare/cloudrun...${{ steps.rebase.outputs.branch }}?expand=1"
 
       - name: Open conflict issue
         if: steps.rebase.outputs.conflict == 'true'
