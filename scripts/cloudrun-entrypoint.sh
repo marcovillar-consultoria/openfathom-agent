@@ -338,6 +338,11 @@ of_skills_inbox_deposit() {
   local skill_md dir name
   while IFS= read -r skill_md; do
     dir="$(dirname "$skill_md")"
+    # A SKILL.md sitting at the ROOT of skills/ would make name="skills" and stage the
+    # WHOLE tree -- the 72 bundled ones included. Not a shape upstream produces, but the
+    # blast radius is exactly what this function exists to avoid, so it is cheaper to
+    # refuse it than to reason about whether it can happen.
+    [[ "$dir" == "$skills" ]] && { echo "[of-inbox] WARN: ignoring a SKILL.md at the root of $skills" >&2; continue; }
     name="$(basename "$dir")"
     grep -q "^${name}:" "$manifest" && continue
     cp -a "$dir" "$stage/$name" 2>/dev/null || echo "[of-inbox] WARN: could not stage $dir" >&2
