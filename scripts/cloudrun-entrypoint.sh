@@ -766,6 +766,20 @@ PYEOF
     # mitigation. This block does not undo ENG-51: the gateway still never runs `terminal`
     # or `code_execution`; it only gains one more MCP tool call surface, same class as the
     # `web_search`/`browser_*` tools it already has.
+    # TEMPORARILY DISABLED (2026-07-20) -- `enabled: False`, not removed. GitHub's hosted
+    # MCP ships `issue_write` with `issue_fields[].value` typed as
+    # `["string", "number", "boolean"]` (a multi-type array). Anthropic's tool-schema
+    # validator rejects an array-valued `type` ("JSON schema is invalid ... draft 2020-12"),
+    # so once the GitHub MCP tools are offered, EVERY Claude-backed turn 400s with
+    # `tools.57.custom.input_schema: JSON schema is invalid` -- measured in production, the
+    # gateway was down for tool-use. The bug is in hermes core (`_normalize_mcp_input_schema`
+    # applies only the nullable-union sanitizer, not the multi-type-array one), which
+    # ADR-002 forbids us to patch in this fork; the fix went upstream as
+    # NousResearch/hermes-agent#68241 and returns via the weekly sync.
+    #
+    # Config, secret and IAM stay fully wired -- flipping `enabled` back to True re-enables
+    # everything with no other change -- so this is a pause, not a teardown of the OF-15
+    # work. Re-enable once the upstream fix lands in our image.
     if [[ -n "${MCP_GITHUB_API_KEY:-}" ]]; then
       python3 - <<'PYEOF'
 from hermes_cli.config import get_config_path, fast_safe_load, ensure_hermes_home, _set_nested
@@ -775,11 +789,11 @@ cfg = (fast_safe_load(open(p)) or {}) if p.exists() else {}
 _set_nested(cfg, "mcp_servers.github", {
     "url": "https://api.githubcopilot.com/mcp/",
     "headers": {"Authorization": "Bearer ${MCP_GITHUB_API_KEY}"},
-    "enabled": True,
+    "enabled": False,  # bridge: see comment above (upstream#68241). Flip to True on sync.
 })
 ensure_hermes_home()
 atomic_yaml_write(p, cfg, sort_keys=False)
-print(f"✓ Set mcp_servers.github (url + enabled) in {p}")
+print(f"✓ Set mcp_servers.github (url present, DISABLED pending upstream#68241) in {p}")
 PYEOF
     fi
 
