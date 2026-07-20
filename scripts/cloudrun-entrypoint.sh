@@ -191,9 +191,33 @@ except Exception: print(0)' 2>/dev/null || echo 0)"
   #
   # Absent or unreadable -> 0. Everything written before this ADR has no .state_epoch, so
   # 0 is what they all get, comparisons are `>=`, and nothing needs migrating.
-  of_state_epoch="$(cat "${HERMES_HOME:-/opt/data}/.state_epoch" 2>/dev/null | tr -cd '0-9')"
-  of_state_epoch="${of_state_epoch:-0}"
+  of_state_epoch="$(of_state_read_local_epoch)"
   echo "[of-state] state epoch ${of_state_epoch}"
+}
+
+# openfathom-meta ADR-049. Read the epoch of the state that was just restored onto disk.
+# Always prints an integer; absent, empty, unreadable or non-numeric all print 0.
+#
+# THIS FUNCTION EXISTS BECAUSE ITS FIRST VERSION TOOK PRODUCTION DOWN (2026-07-20).
+# It was one inline line inside of_state_restore:
+#
+#     of_state_epoch="$(cat "$home/.state_epoch" 2>/dev/null | tr -cd '0-9')"
+#
+# Under `set -euo pipefail` (line 83) that is a landmine, and it detonates on the ONLY
+# input that existed at the time: no snapshot written before ADR-049 carries the file, so
+# `cat` exits 1, `pipefail` promotes the pipeline's failure, the assignment inherits it,
+# and `set -e` kills the shell -- between "restored snapshot" and this line. Revision
+# 00033-lcr never listened on PORT and Cloud Run refused to give it traffic.
+#
+# `< file` instead of `cat file |` removes the pipeline entirely, the `[[ -r ]]` guard
+# removes the failing command, and being a named function makes it testable -- which the
+# inline version was not, and is exactly why the test suite passed while this was broken.
+of_state_read_local_epoch() {
+  local f="${HERMES_HOME:-/opt/data}/.state_epoch" v=""
+  if [[ -r "$f" ]]; then
+    v="$(tr -cd '0-9' < "$f")" || v=""
+  fi
+  printf '%s' "${v:-0}"
 }
 
 # openfathom-meta ADR-049. Read `.state_epoch` out of a state tarball WITHOUT unpacking

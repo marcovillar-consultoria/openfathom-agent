@@ -38,7 +38,7 @@ extract_fns() { # extract_fns <dest> [sed-mutation]
   local dest="$1" mutation="${2:-}"
   : > "$dest"
   local fn
-  for fn in of_state_tarball_epoch of_state_messages_superset of_state_try_promote; do
+  for fn in of_state_read_local_epoch of_state_tarball_epoch of_state_messages_superset of_state_try_promote; do
     awk -v f="$fn" '$0 ~ "^"f"\\(\\) \\{" {p=1} p {print} p && /^\}$/ {exit}' "$ENTRYPOINT" >> "$dest"
     echo >> "$dest"
   done
@@ -182,6 +182,39 @@ check "reads the epoch"     "7"   "$(of_state_tarball_epoch "$WORK/e1.tar.gz")"
 check "absent epoch  -> 0"  "0"   "$(of_state_tarball_epoch "$WORK/e2.tar.gz")"
 check "garbage file  -> 0"  "0"   "$(of_state_tarball_epoch /dev/null)"
 
+echo "== case 7: reading the local epoch must SURVIVE \`set -e\` when the file is absent =="
+# THE REGRESSION THIS FILE FAILED TO CATCH THE FIRST TIME. The inline version of this read
+# was `cat file 2>/dev/null | tr -cd '0-9'`; with no file, under `set -euo pipefail`, the
+# whole boot died between "restored snapshot" and the next line. Production revision
+# 00033-lcr never listened on PORT. The suite was green because the read lived inside
+# of_state_restore, which the harness did not extract -- the untested line is the one that
+# broke. Every case below runs with `-e` ON, because that is the condition that kills.
+EPOCH_HOME="$WORK/epoch-home"; rm -rf "$EPOCH_HOME"; mkdir -p "$EPOCH_HOME"
+read_epoch() { ( set -euo pipefail; HERMES_HOME="$EPOCH_HOME" of_state_read_local_epoch ); }
+
+check "absent file  -> 0, no abort" "0"  "$(read_epoch; echo)"
+
+# Status captured on its OWN line, never as an `if`/`&&`/`||` condition. Bash disables
+# `set -e` for any command being used as a test -- and that suppression reaches INSIDE
+# nested subshells. The first version of this assertion was
+#   ( set -euo pipefail; ... ) && ok ... || bad ...
+# which passed unconditionally, proving nothing, while testing for a `set -e` abort.
+run_epoch_under_e() {
+  ( set -euo pipefail; HERMES_HOME="$EPOCH_HOME" of_state_read_local_epoch >/dev/null 2>&1 )
+  printf '%s' "$?"
+}
+check "absent file does not abort under set -e (00033-lcr)" "0" "$(run_epoch_under_e)"
+
+printf '12\n' > "$EPOCH_HOME/.state_epoch"
+check "reads a real epoch"          "12" "$(read_epoch)"
+: > "$EPOCH_HOME/.state_epoch"
+check "empty file   -> 0"           "0"  "$(read_epoch)"
+printf 'garbage\n' > "$EPOCH_HOME/.state_epoch"
+check "non-numeric  -> 0"           "0"  "$(read_epoch)"
+printf ' 4 2 \n' > "$EPOCH_HOME/.state_epoch"
+check "strips noise -> digits only" "42" "$(read_epoch)"
+rm -f "$EPOCH_HOME/.state_epoch"
+
 echo "== structural: promotion is wired AFTER the conflict is parked =="
 # The ordering is the entire safety argument -- any interruption must leave the state
 # parked exactly as before. A unit test cannot observe ordering inside of_state_snapshot,
@@ -257,6 +290,36 @@ setup_missing_db() {
 mutant "empty-live guard removed (subset-of-nothing)" \
   's|^            return None$|            return set()|' \
   setup_missing_db "yes" "return set()"
+
+# The regression mutant: restore the exact line that took production down, and prove the
+# suite now refuses it. Without this, "we fixed it" rests on my word.
+echo "== MUTANT: the 00033-lcr line, restored =="
+# The mutation must be an ASSIGNMENT, exactly as the original was. A first attempt wrote
+# `printf "%s" "$(cat ... | tr ...)"` and the mutant SURVIVED -- because a command
+# substitution inside an argument does not trip `set -e`: printf itself succeeds. Only a
+# plain assignment inherits the substitution's exit status. Getting this wrong would have
+# shipped a regression test that could never fail.
+extract_fns "$WORK/regress.sh" \
+  's|^  local f="${HERMES_HOME:-/opt/data}/.state_epoch" v=""$|  of_state_epoch="$(cat "${HERMES_HOME:-/opt/data}/.state_epoch" 2>/dev/null \| tr -cd "0-9")"; printf "%s" "${of_state_epoch:-0}"; return|'
+if grep -q 'cat "${HERMES_HOME' "$WORK/regress.sh"; then
+  ( # shellcheck disable=SC1090
+    source "$WORK/regress.sh"
+    rm -f "$EPOCH_HOME/.state_epoch"
+    # Same trap as above: the status must be captured on its own line. Wrapping this in
+    # `if ( ... )` suppresses `set -e` inside the subshell and the mutant survives every
+    # time -- which is exactly what happened on the first attempt.
+    ( set -euo pipefail; HERMES_HOME="$EPOCH_HOME" of_state_read_local_epoch >/dev/null 2>&1 )
+    rc=$?
+    [[ "$rc" -eq 0 ]] && echo SURVIVED > "$WORK/regress.verdict" || echo KILLED > "$WORK/regress.verdict"
+  )
+  if [[ "$(cat "$WORK/regress.verdict")" == "KILLED" ]]; then
+    ok "the original inline read still dies under set -e -- the guard is real"
+  else
+    bad "the original inline read no longer fails: this test proves nothing"
+  fi
+else
+  bad "regression mutation did not apply"
+fi
 
 echo
 echo "passed: $pass   failed: $fail"
