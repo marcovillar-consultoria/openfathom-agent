@@ -39,6 +39,11 @@ on:
     - cron: '0 3 * * 1' # Monday 03:00 UTC
   workflow_dispatch:
 
+# `permissions:` here governs the default GITHUB_TOKEN. It still matters for the
+# conflict path (`gh issue create`, which needs `issues: write`) -- the App does NOT
+# carry the Issues permission, and github-actions[bot] is a visible bot, so ENG-74's
+# "indistinguishable from a human" concern does not apply to that path. The push+PR
+# path does NOT use GITHUB_TOKEN; it uses the App installation token minted below.
 permissions:
   contents: write
   issues: write
@@ -48,9 +53,27 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
+      # openfathom-meta ADR-051. The FOURTH blocker ENG-62 found: GITHUB_TOKEN cannot
+      # push a change to a file under `.github/workflows/`, and every upstream sync
+      # touches one (`ci.yml`). `workflows` is not a valid `permissions:` scope -- it is a
+      # platform restriction, not config. A GitHub App WITH the `Workflows` repository
+      # permission can push workflow files; this mints a ~1h installation token from the
+      # `openfathom-fork-sync` App (App ID in SYNC_APP_ID, private key in
+      # SYNC_APP_PRIVATE_KEY). The token is a non-personal bot identity (closes half of
+      # ENG-74) and expires on its own (no PAT-style silent-expiry failure).
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          app-id: ${{ secrets.SYNC_APP_ID }}
+          private-key: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
+          # Check out with the App token so `git push` below authenticates as the App and
+          # is allowed to push the `ci.yml` change. Without this, checkout wires the
+          # default GITHUB_TOKEN into git and the push dies exactly as ENG-62 measured.
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Configure git identity
         run: |
@@ -90,7 +113,9 @@ jobs:
       - name: Push sync branch and open PR
         if: steps.rebase.outputs.conflict == 'false'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # App token, not GITHUB_TOKEN: this step both pushes the workflow-file change
+          # (needs the App's Workflows permission) and opens the PR (needs Pull requests).
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           git push origin "${{ steps.rebase.outputs.branch }}"
           gh pr create \
