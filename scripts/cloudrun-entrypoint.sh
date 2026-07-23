@@ -897,34 +897,46 @@ PYEOF
       fi
     fi
 
-    # ADR-052. The Sonda's create_delegation_task tool ships as a user plugin delivered
-    # here, the same out-of-band contract as the skills tarball (the CI does not write the
-    # object). Two config writes, both deliberate: plugins.enabled opts the plugin in
-    # (Hermes scans $HERMES_HOME/plugins/ but loads only enabled ones), and approvals.mode
-    # is pinned to `manual` so the tool's request_tool_approval gate actually prompts --
-    # the gate bypasses under `off`, and trusting the default to stay `manual` is the kind
-    # of silent assumption this repo pays for. Neither reopens exec on the gateway
-    # (ADR-043 holds): the tool files one issue, it is not a shell.
+    # ADR-052 (+ its follow-up). The Sonda's tools ship as user plugins delivered here, the
+    # same out-of-band contract as the skills tarball (the CI does not write the object). Two
+    # config writes, both deliberate: plugins.enabled opts EVERY delivered plugin in --
+    # enumerating the delivered dir rather than a hardcoded name means adding a plugin needs
+    # only a re-published tarball, no fork change, and the tarball is Tech-Lead-published so
+    # its contents are vouched-for. And approvals.mode is pinned to `manual` so an
+    # approval-gated tool's request_tool_approval actually prompts -- the gate bypasses under
+    # `off`, and trusting the default to stay `manual` is the kind of silent assumption this
+    # repo pays for. Neither reopens exec on the gateway (ADR-043 holds): a delivered tool
+    # files an issue or reads a clock, it is not a shell.
     if [[ -n "${HERMES_PLUGINS_OBJECT:-}" && -n "${HERMES_STATE_BUCKET:-}" ]]; then
       of_plugins_dir="${HERMES_HOME:-/opt/data}/plugins"
       if of_plugins_fetch "$of_plugins_dir"; then
-        python3 - <<'PYEOF'
+        python3 - "$of_plugins_dir" <<'PYEOF'
+import os
+import sys
 from hermes_cli.config import get_config_path, fast_safe_load, ensure_hermes_home, _set_nested
 from utils import atomic_yaml_write
+plugins_dir = sys.argv[1]
 p = get_config_path()
 cfg = (fast_safe_load(open(p)) or {}) if p.exists() else {}
+# Every delivered plugin is a subdir carrying a plugin.yaml. Enable each -- no hardcoded list.
+delivered = sorted(
+    name
+    for name in os.listdir(plugins_dir)
+    if os.path.isfile(os.path.join(plugins_dir, name, "plugin.yaml"))
+)
 enabled = (cfg.get("plugins") or {}).get("enabled") or []
-if "delegation-tasks" not in enabled:
-    enabled = [*enabled, "delegation-tasks"]
+for name in delivered:
+    if name not in enabled:
+        enabled = [*enabled, name]
 _set_nested(cfg, "plugins.enabled", enabled)
 _set_nested(cfg, "approvals.mode", "manual")
 ensure_hermes_home()
 atomic_yaml_write(p, cfg, sort_keys=False)
-print(f"✓ Enabled plugin delegation-tasks and set approvals.mode = manual in {p}")
+print(f"✓ Enabled plugin(s) {delivered} and set approvals.mode = manual in {p}")
 PYEOF
       else
         echo "[of-plugins] ERROR: HERMES_PLUGINS_OBJECT is set but no plugin was loaded --" \
-             "the gateway is starting WITHOUT the delegation tool" >&2
+             "the gateway is starting WITHOUT the delivered plugins" >&2
       fi
     fi
 
