@@ -321,6 +321,76 @@ else
   bad "regression mutation did not apply"
 fi
 
+# ---------------------------------------------------------------------------
+# of_plugins_fetch (ADR-052) -- same fail-loud contract as of_skills_fetch: it
+# must REFUSE a tarball that would leave $HERMES_HOME/plugins/ without a plugin.yaml,
+# so the caller never enables a plugin that is not on disk (the of-skills SKILL.md
+# guard, one level over). Extracted from the shipped script; curl/of_metadata_token
+# are already stubbed at the top.
+# ---------------------------------------------------------------------------
+echo "== case: of_plugins_fetch =="
+PLUG_FN="$WORK/plug.sh"
+awk '/^of_plugins_fetch\(\) \{/{p=1} p{print} p&&/^\}$/{exit}' "$ENTRYPOINT" > "$PLUG_FN"
+grep -q "of_plugins_fetch() {" "$PLUG_FN" || { echo "FATAL: of_plugins_fetch extraction failed" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$PLUG_FN"
+export HERMES_PLUGINS_OBJECT="plugins.tar.gz"
+
+mk_plugin_tarball() { # <out> -- a tarball Hermes would load: delegation-tasks/plugin.yaml
+  local out="$1" d; d="$(mktemp -d -p "$WORK")"
+  mkdir -p "$d/delegation-tasks"
+  printf 'name: delegation-tasks\n' > "$d/delegation-tasks/plugin.yaml"
+  tar czf "$out" -C "$d" .
+}
+mk_no_manifest_tarball() { # <out> -- non-empty, but no plugin.yaml anywhere
+  local out="$1" d; d="$(mktemp -d -p "$WORK")"
+  printf 'x\n' > "$d/readme.txt"
+  tar czf "$out" -C "$d" .
+}
+
+PLUG_OK="$WORK/plug-ok.tar.gz"; mk_plugin_tarball "$PLUG_OK"
+PLUG_NO="$WORK/plug-no.tar.gz"; mk_no_manifest_tarball "$PLUG_NO"
+PDIR="$WORK/plugdest"
+
+reset_stub; LIVE="$PLUG_OK"
+of_plugins_fetch "$PDIR" >/dev/null 2>&1; rc=$?
+check "valid plugin tarball -> fetch ok"       "0"   "$rc"
+check "plugin.yaml landed in dest"             "yes" "$([[ -f "$PDIR/delegation-tasks/plugin.yaml" ]] && echo yes || echo no)"
+
+reset_stub; LIVE="$PLUG_NO"
+of_plugins_fetch "$PDIR" >/dev/null 2>&1; rc=$?
+check "tarball with no plugin.yaml -> refuses" "1"   "$rc"
+
+reset_stub; LIVE=""   # HTTP 404 from the stub
+of_plugins_fetch "$PDIR" >/dev/null 2>&1; rc=$?
+check "404 -> refuses (publish step skipped)"  "1"   "$rc"
+
+echo "== structural: the plugin is enabled ONLY after a successful fetch =="
+# A failed fetch must not leave plugins.enabled pointing at a plugin not on disk. Assert
+# on the source that the enable write sits after the of_plugins_fetch guard.
+fetch_guard="$(grep -n 'if of_plugins_fetch "\$of_plugins_dir"; then' "$ENTRYPOINT" | head -1 | cut -d: -f1)"
+enable_write="$(grep -n '_set_nested(cfg, "plugins.enabled"' "$ENTRYPOINT" | head -1 | cut -d: -f1)"
+if [[ -n "$fetch_guard" && -n "$enable_write" && "$enable_write" -gt "$fetch_guard" ]]; then
+  ok "plugins.enabled write (line $enable_write) is inside the of_plugins_fetch guard (line $fetch_guard)"
+else
+  bad "plugin enable is not provably after the fetch guard (guard=$fetch_guard enable=$enable_write)"
+fi
+check "approvals.mode pinned to manual (the gate bypasses under off)" \
+  "1" "$(grep -c '_set_nested(cfg, "approvals.mode", "manual")' "$ENTRYPOINT")"
+
+echo "== MUTANT: of_plugins_fetch without the plugin.yaml guard =="
+awk '/^of_plugins_fetch\(\) \{/{p=1} p{print} p&&/^\}$/{exit}' "$ENTRYPOINT" \
+  | sed 's|if \[\[ "$n" -eq 0 \]\]; then|if false; then|' > "$WORK/plug-mut.sh"
+if grep -q "if false; then" "$WORK/plug-mut.sh"; then
+  reset_stub; LIVE="$PLUG_NO"
+  # Guarded version refused PLUG_NO with rc 1 above; with the guard gone it accepts the
+  # manifest-less tarball (rc 0) -- the fail-open the guard exists to stop.
+  mrc="$( source "$WORK/plug-mut.sh"; of_plugins_fetch "$WORK/pm" >/dev/null 2>&1; echo "$?" )"
+  check "guard removed -> empty tarball accepted (rc 0); the guard is load-bearing" "0" "$mrc"
+else
+  bad "plugin mutant did not apply -- a mutant that does not mutate proves nothing"
+fi
+
 echo
 echo "passed: $pass   failed: $fail"
 [[ "$fail" -eq 0 ]]

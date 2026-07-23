@@ -30,6 +30,11 @@
 #                   entirely and behaviour is exactly what it was before OF-08. The Job
 #                   is unaffected either way: it gcsfuse-mounts its own $HERMES_HOME and
 #                   already sees the skills through that mount.
+#   HERMES_PLUGINS_OBJECT  service mode only, OPT-IN (ADR-052). Object name of the
+#                   OpenFathom plugin tarball inside HERMES_STATE_BUCKET, delivered into
+#                   $HERMES_HOME/plugins/ and enabled via plugins.enabled. Same out-of-band
+#                   contract as the skills tarball. Unset -> the block is skipped and the
+#                   gateway has no delegation tool.
 #   HERMES_JOB_OUTPUT  where to write the job's stdout (default $HERMES_HOME/job-output.txt)
 #   HERMES_INFERENCE_PROVIDER / HERMES_INFERENCE_MODEL  honored in BOTH modes, but
 #                   through two different mechanisms, because the two modes resolve the
@@ -145,6 +150,42 @@ of_skills_fetch() {
     return 1
   fi
   echo "[of-skills] loaded ${n} skill(s) from gs://${HERMES_STATE_BUCKET}/${HERMES_SKILLS_OBJECT}"
+  return 0
+}
+
+# ADR-052. Fetch the OpenFathom plugin tarball and extract it into $1 -- a
+# $HERMES_HOME/plugins/ directory Hermes scans for user plugins. Returns non-zero (and
+# says why) unless the directory ends up with at least one plugin.yaml; the caller uses
+# that to decide whether to enable the plugin. Same transport and same fail-loud contract
+# as of_skills_fetch: a 404 means the publish step was skipped, not a normal first boot.
+of_plugins_fetch() {
+  local dest="$1" tok code tarball="/tmp/of-plugins.tar.gz"
+  tok="$(of_metadata_token)" || { echo "[of-plugins] WARN: no metadata token" >&2; return 1; }
+
+  code="$(curl -sS -o "$tarball" -w '%{http_code}' --max-time 60 \
+    -H "Authorization: Bearer ${tok}" \
+    "https://storage.googleapis.com/storage/v1/b/${HERMES_STATE_BUCKET}/o/${HERMES_PLUGINS_OBJECT}?alt=media" || echo 000)"
+  if [[ "$code" != "200" ]]; then
+    echo "[of-plugins] WARN: fetch of gs://${HERMES_STATE_BUCKET}/${HERMES_PLUGINS_OBJECT} failed (HTTP ${code})" >&2
+    rm -f "$tarball"; return 1
+  fi
+
+  # Replace wholesale: a stale plugin left by a previous boot would keep loading after it
+  # was removed upstream.
+  rm -rf "$dest"; mkdir -p "$dest"
+  if ! tar xzf "$tarball" -C "$dest" 2>/dev/null; then
+    echo "[of-plugins] WARN: tarball present but did not extract" >&2
+    rm -f "$tarball"; return 1
+  fi
+  rm -f "$tarball"
+
+  local n
+  n="$(find "$dest" -name plugin.yaml -type f 2>/dev/null | wc -l)"
+  if [[ "$n" -eq 0 ]]; then
+    echo "[of-plugins] WARN: extracted tarball contains no plugin.yaml -- refusing to enable an empty plugins dir" >&2
+    return 1
+  fi
+  echo "[of-plugins] loaded ${n} plugin(s) from gs://${HERMES_STATE_BUCKET}/${HERMES_PLUGINS_OBJECT}"
   return 0
 }
 
@@ -853,6 +894,37 @@ PYEOF
       else
         echo "[of-skills] ERROR: HERMES_SKILLS_OBJECT is set but no skills were loaded --" \
              "the gateway is starting WITHOUT the OpenFathom skills" >&2
+      fi
+    fi
+
+    # ADR-052. The Sonda's create_delegation_task tool ships as a user plugin delivered
+    # here, the same out-of-band contract as the skills tarball (the CI does not write the
+    # object). Two config writes, both deliberate: plugins.enabled opts the plugin in
+    # (Hermes scans $HERMES_HOME/plugins/ but loads only enabled ones), and approvals.mode
+    # is pinned to `manual` so the tool's request_tool_approval gate actually prompts --
+    # the gate bypasses under `off`, and trusting the default to stay `manual` is the kind
+    # of silent assumption this repo pays for. Neither reopens exec on the gateway
+    # (ADR-043 holds): the tool files one issue, it is not a shell.
+    if [[ -n "${HERMES_PLUGINS_OBJECT:-}" && -n "${HERMES_STATE_BUCKET:-}" ]]; then
+      of_plugins_dir="${HERMES_HOME:-/opt/data}/plugins"
+      if of_plugins_fetch "$of_plugins_dir"; then
+        python3 - <<'PYEOF'
+from hermes_cli.config import get_config_path, fast_safe_load, ensure_hermes_home, _set_nested
+from utils import atomic_yaml_write
+p = get_config_path()
+cfg = (fast_safe_load(open(p)) or {}) if p.exists() else {}
+enabled = (cfg.get("plugins") or {}).get("enabled") or []
+if "delegation-tasks" not in enabled:
+    enabled = [*enabled, "delegation-tasks"]
+_set_nested(cfg, "plugins.enabled", enabled)
+_set_nested(cfg, "approvals.mode", "manual")
+ensure_hermes_home()
+atomic_yaml_write(p, cfg, sort_keys=False)
+print(f"✓ Enabled plugin delegation-tasks and set approvals.mode = manual in {p}")
+PYEOF
+      else
+        echo "[of-plugins] ERROR: HERMES_PLUGINS_OBJECT is set but no plugin was loaded --" \
+             "the gateway is starting WITHOUT the delegation tool" >&2
       fi
     fi
 
