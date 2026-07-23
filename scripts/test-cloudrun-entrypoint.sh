@@ -377,6 +377,10 @@ else
 fi
 check "approvals.mode pinned to manual (the gate bypasses under off)" \
   "1" "$(grep -c '_set_nested(cfg, "approvals.mode", "manual")' "$ENTRYPOINT")"
+# The enable must be DYNAMIC -- enumerate the delivered dir, not a hardcoded plugin name --
+# so a second plugin (get_current_time) is enabled by a re-published tarball, no fork change.
+check "plugin enable enumerates the delivered dir (not a hardcoded name)" \
+  "1" "$(grep -c 'os.listdir(plugins_dir)' "$ENTRYPOINT")"
 
 echo "== MUTANT: of_plugins_fetch without the plugin.yaml guard =="
 awk '/^of_plugins_fetch\(\) \{/{p=1} p{print} p&&/^\}$/{exit}' "$ENTRYPOINT" \
