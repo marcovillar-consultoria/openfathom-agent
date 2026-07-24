@@ -768,16 +768,54 @@ case "${HERMES_MODE:-service}" in
     # _try_openrouter), so the aux resolves to a real client off OPENROUTER_API_KEY. The
     # aux does NOT share the main agent's resolve_runtime_provider(); it reads
     # auxiliary.<task>.provider/model directly, and the model MUST be pinned to a valid
-    # aggregator slug -- a bare `google/gemini-2.5-flash` here would silently bill Gemini
-    # through OpenRouter instead of running Haiku. These are scalar keys two levels deep
-    # -- `hermes config set` writes them fine (unlike the LIST at agent.disabled_toolsets
-    # below, which needs the python heredoc).
+    # model string FOR THAT PROVIDER -- a bare `google/gemini-2.5-flash` here would
+    # silently bill Gemini through OpenRouter instead of running Haiku. These are
+    # scalar keys two levels deep -- `hermes config set` writes them fine (unlike the
+    # LIST at agent.disabled_toolsets below, which needs the python heredoc).
+    #
+    # openfathom-meta ENG-83: the model string used to be hardcoded to the OpenRouter
+    # routing slug (`anthropic/claude-haiku-4.5`), which is wrong the moment
+    # HERMES_INFERENCE_PROVIDER stops being openrouter -- the Anthropic-direct and
+    # Vertex providers each expect a bare model id, not an aggregator slug. Reusing
+    # $HERMES_INFERENCE_MODEL fixes that for any provider without hardcoding a second
+    # place that has to be kept in sync with the primary model: today primary and aux
+    # are deliberately the same cheap model, so this is not a behavior change, only the
+    # removal of a value that would have gone stale on this exact switch.
     if [[ -n "${HERMES_INFERENCE_PROVIDER:-}" ]]; then
       hermes config set auxiliary.compression.provider      "${HERMES_INFERENCE_PROVIDER}"
-      hermes config set auxiliary.compression.model         anthropic/claude-haiku-4.5
+      hermes config set auxiliary.compression.model         "${HERMES_INFERENCE_MODEL}"
       hermes config set auxiliary.title_generation.provider "${HERMES_INFERENCE_PROVIDER}"
-      hermes config set auxiliary.title_generation.model    anthropic/claude-haiku-4.5
+      hermes config set auxiliary.title_generation.model    "${HERMES_INFERENCE_MODEL}"
     fi
+
+    # openfathom-meta ENG-83. Two real production outages (2026-07-24, HTTP 402 --
+    # OpenRouter credit insufficient for the requested max_tokens) with NO fallback
+    # configured: agent/conversation_loop.py's is_client_error branch already tries
+    # agent._fallback_chain BEFORE aborting on exactly this class of non-retryable
+    # error -- it found nothing to try because fallback_providers was never set here.
+    # This is not a mechanism built for this switch; it is Hermes' own native fallback
+    # (hermes_cli/fallback_config.py), unused until now.
+    #
+    # vertex/google/gemini-3.6-flash, not gemini-2.5-flash: confirmed live against the
+    # real Vertex model catalog (publishers/google/models/gemini-3.6-flash,
+    # launchStage=GA, us-central1, openfathom-prod project) before writing this, not
+    # assumed from the 2.5-era config elsewhere in this file. The `google/` publisher
+    # prefix is mandatory on the Vertex OpenAI-compatible path (same lesson
+    # cloud_run_job already paid for with a real HTTP 400 "Malformed publisher").
+    # enable_vertex_access already grants the ADC this needs -- no new IAM.
+    #
+    # A LIST value (even of one entry) -- `hermes config set` cannot write it; needs
+    # the python heredoc, same reason agent.disabled_toolsets does.
+    python3 - <<'PYEOF'
+from hermes_cli.config import get_config_path, fast_safe_load, ensure_hermes_home, _set_nested
+from utils import atomic_yaml_write
+p = get_config_path()
+cfg = (fast_safe_load(open(p)) or {}) if p.exists() else {}
+_set_nested(cfg, "fallback_providers", [{"provider": "vertex", "model": "google/gemini-3.6-flash"}])
+ensure_hermes_home()
+atomic_yaml_write(p, cfg, sort_keys=False)
+print(f"✓ Set fallback_providers = [vertex/google/gemini-3.6-flash] in {p}")
+PYEOF
 
     # ENG-49. Unconditional, not env-gated, because there is no deployment of this
     # image where leaking the model's private reasoning to the user is wanted.
