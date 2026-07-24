@@ -714,12 +714,147 @@ PY
 # (gateway/run.py, agent/onboarding.py) are plain f-strings with no t() call at all;
 # setting display.language does not touch them, and nothing short of an upstream i18n
 # expansion (out of ADR-002 scope) will.
+# openfathom-meta ENG-81 (skills half). Measured 2026-07-23: asked generically what
+# skills it has, the Sonda invented plausible-sounding names instead of admitting it did
+# not track that. The fix is not a hand-written list in SOUL.md (drifts the moment a skill
+# is added or a toolset is disabled) and not a doc the Sonda might or might not read (the
+# same failure mode, one hop removed) -- it is a block computed HERE, at boot, from the two
+# facts this script already holds in this exact execution: which SKILL.md files
+# of_skills_fetch actually populated into $of_skills_dir, and which toolsets
+# of_disabled_toolsets (above) just turned off. Nothing to keep in sync; both are read live.
+#
+# Parses requires_toolsets with the SAME nesting rule openfathom-skills'
+# scripts/lint_skills.py declared_toolsets() enforces at review time
+# (metadata.hermes.requires_toolsets, not a top-level key) -- a skill CI already proved
+# compliant is read here the same way, not by a second, looser parser that could disagree.
+#
+# Reads $of_skills_dir as a global (set, unquoted `local`, in the service) case body above,
+# same pattern of_write_soul below already relies on) -- absent or missing dir (skills
+# fetch was never configured, or failed) degrades to an empty block, not an error: Dogma 2.
+of_soul_capabilities_block() {
+  local dir="${of_skills_dir:-}"
+  if [[ -z "$dir" || ! -d "$dir" ]]; then
+    echo "[of-soul-capabilities] no skills directory this boot -- SOUL.md gets no capabilities block" >&2
+    return 0
+  fi
+  python3 - "$dir" "${of_disabled_toolsets[@]}" <<'PYEOF'
+import os
+import re
+import sys
+
+skills_dir = sys.argv[1]
+disabled = set(sys.argv[2:])
+
+REQ_KEY = "requires_toolsets"
+
+
+def declared_toolsets(text):
+    # Mirror of openfathom-skills scripts/lint_skills.py declared_toolsets(): same nesting
+    # rule (metadata.hermes.requires_toolsets only), same reason a field elsewhere is read
+    # by nobody (ENG-68). Returns None for missing/misplaced/malformed -- callers fail closed.
+    if not text.startswith("---\n"):
+        return None
+    end = text.find("\n---", 4)
+    if end == -1:
+        return None
+    lines = text[4:end].splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(rf"^(\s*){REQ_KEY}\s*:\s*(.*)$", line)
+        if not m:
+            continue
+        indent, inline = len(m.group(1)), m.group(2).strip()
+        want, cur = ["hermes", "metadata"], indent
+        for j in range(i - 1, -1, -1):
+            pm = re.match(r"^(\s*)([a-z_]+)\s*:", lines[j])
+            if not pm or len(pm.group(1)) >= cur:
+                continue
+            if pm.group(2) != want[0]:
+                return None
+            want.pop(0)
+            cur = len(pm.group(1))
+            if not want:
+                break
+        if want:
+            return None
+        if inline:
+            if not (inline.startswith("[") and inline.endswith("]")):
+                return None
+            body = inline[1:-1].strip()
+            return [v.strip().strip("\"'") for v in body.split(",") if v.strip()]
+        vals = []
+        for j in range(i + 1, len(lines)):
+            bm = re.match(r"^(\s*)-\s*(.+)$", lines[j])
+            if bm and len(bm.group(1)) > indent:
+                vals.append(bm.group(2).strip().strip("\"'"))
+            elif lines[j].strip():
+                break
+        return vals
+    return None
+
+
+def declared_name(text, fallback):
+    if not text.startswith("---\n"):
+        return fallback
+    end = text.find("\n---", 4)
+    if end == -1:
+        return fallback
+    for line in text[4:end].splitlines():
+        m = re.match(r"^name\s*:\s*(.+)$", line)
+        if m:
+            return m.group(1).strip().strip("\"'")
+    return fallback
+
+
+available, unavailable = [], []
+for root, _, files in os.walk(skills_dir):
+    if "SKILL.md" not in files:
+        continue
+    text = open(os.path.join(root, "SKILL.md"), encoding="utf-8").read()
+    fallback = os.path.basename(root)
+    name = declared_name(text, fallback)
+    toolsets = declared_toolsets(text)
+    if toolsets is None:
+        # CI (lint_skills.py check 6) already refuses to merge a skill without this field
+        # declared correctly, so this should never happen in a published tarball -- but
+        # fail closed, not open: list it as unavailable rather than silently as safe.
+        unavailable.append((name, ["<requires_toolsets não declarado>"]))
+        continue
+    missing = sorted(set(toolsets) & disabled)
+    if missing:
+        unavailable.append((name, missing))
+    else:
+        available.append(name)
+
+available.sort()
+unavailable.sort(key=lambda t: t[0])
+
+lines = [
+    "## Skills disponíveis agora (gerado no boot -- não afirme status além do que está aqui)",
+    "",
+    "Toolsets desligados neste ambiente: " + (", ".join(sorted(disabled)) or "nenhum") + ".",
+    "",
+    "Disponíveis:",
+]
+lines += [f"- {n}" for n in available] if available else ["- (nenhuma)"]
+lines += ["", "Carregadas mas indisponíveis aqui (falta ferramenta desligada):"]
+lines += [f"- {n} (precisa: {', '.join(m)})" for n, m in unavailable] if unavailable else ["- (nenhuma)"]
+
+print("\n".join(lines))
+PYEOF
+}
+
 of_write_soul() {
   [[ -n "${HERMES_SOUL:-}" ]] || return 0
   local home="${HERMES_HOME:-/opt/data}"
   mkdir -p "$home"
-  printf '%s\n' "${HERMES_SOUL}" > "$home/SOUL.md"
-  echo "[of-soul] wrote declared SOUL.md (${#HERMES_SOUL} chars) to $home/SOUL.md"
+  local capabilities
+  capabilities="$(of_soul_capabilities_block)"
+  if [[ -n "$capabilities" ]]; then
+    printf '%s\n\n%s\n' "${HERMES_SOUL}" "$capabilities" > "$home/SOUL.md"
+  else
+    printf '%s\n' "${HERMES_SOUL}" > "$home/SOUL.md"
+  fi
+  echo "[of-soul] wrote declared SOUL.md (${#HERMES_SOUL} chars, capabilities block: $([[ -n "$capabilities" ]] && echo yes || echo no)) to $home/SOUL.md"
 }
 
 case "${HERMES_MODE:-service}" in
@@ -901,15 +1036,24 @@ PYEOF
     # than a SOUL instruction. This does NOT touch voice INPUT: transcription is the
     # gateway's stt_enabled auto-enrich pipeline (gateway/run.py), not a toolset, so it is
     # unaffected -- only audio/image/video GENERATION goes away.
-    python3 - <<'PYEOF'
+    #
+    # openfathom-meta ENG-81 (skills half): named once, not just inlined below, because
+    # of_soul_capabilities_block (defined above, called from of_write_soul) needs the SAME
+    # list to know which of a skill's declared requires_toolsets are actually off in this
+    # boot. One array, read twice, instead of a second literal that could drift from this
+    # one silently.
+    of_disabled_toolsets=(terminal code_execution image_gen video_gen tts)
+    python3 - "${of_disabled_toolsets[@]}" <<'PYEOF'
+import sys
 from hermes_cli.config import get_config_path, fast_safe_load, ensure_hermes_home, _set_nested
 from utils import atomic_yaml_write
+toolsets = sys.argv[1:]
 p = get_config_path()
 cfg = (fast_safe_load(open(p)) or {}) if p.exists() else {}
-_set_nested(cfg, "agent.disabled_toolsets", ["terminal", "code_execution", "image_gen", "video_gen", "tts"])
+_set_nested(cfg, "agent.disabled_toolsets", toolsets)
 ensure_hermes_home()
 atomic_yaml_write(p, cfg, sort_keys=False)
-print(f"✓ Set agent.disabled_toolsets = [terminal, code_execution, image_gen, video_gen, tts] in {p}")
+print(f"✓ Set agent.disabled_toolsets = {toolsets} in {p}")
 PYEOF
 
     # openfathom-meta ENG-52 / OF-15, ADR-043 Desenho 2. The GitHub MCP client that lets

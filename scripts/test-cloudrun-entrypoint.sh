@@ -491,6 +491,72 @@ else
   bad "usage-report mutant did not apply -- a mutant that does not mutate proves nothing"
 fi
 
+# ---------------------------------------------------------------------------
+# openfathom-meta ENG-81 (skills half) -- of_soul_capabilities_block. Boot-computed
+# capabilities summary appended to SOUL.md instead of a hand-written list that drifts
+# (or a doc the Sonda might never read). Extracted standalone, same style as
+# of_skill_usage_report above. Parses requires_toolsets with the same nesting rule
+# openfathom-skills' lint_skills.py declared_toolsets() enforces at review time.
+# ---------------------------------------------------------------------------
+echo "== case: of_soul_capabilities_block =="
+CAPS_FN="$WORK/caps.sh"
+awk '/^of_soul_capabilities_block\(\) \{/{p=1} p{print} p&&/^\}$/{exit}' "$ENTRYPOINT" > "$CAPS_FN"
+grep -q "of_soul_capabilities_block() {" "$CAPS_FN" || { echo "FATAL: of_soul_capabilities_block extraction failed" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$CAPS_FN"
+
+of_disabled_toolsets=(terminal code_execution image_gen video_gen tts)
+
+mk_skill() { # mk_skill <dir> <name> <toolsets-yaml-inline-list>
+  local dir="$1" name="$2" toolsets="$3"
+  mkdir -p "$dir"
+  cat > "$dir/SKILL.md" <<EOF
+---
+name: $name
+metadata:
+  hermes:
+    requires_toolsets: $toolsets
+---
+body
+EOF
+}
+
+CAPS_HOME="$WORK/caps-skills"
+rm -rf "$CAPS_HOME"; mkdir -p "$CAPS_HOME/shared" "$CAPS_HOME/academic"
+mk_skill "$CAPS_HOME/shared/citation-format" "citation-format" "[]"
+mk_skill "$CAPS_HOME/academic/pr-triage" "pr-triage" "[terminal]"
+
+run_caps() { ( set -euo pipefail; of_skills_dir="$CAPS_HOME" of_soul_capabilities_block ); }
+
+out="$(run_caps)"; echo "$out" | sed 's/^/    | /'
+check "header present" \
+  "1" "$(grep -c '^## Skills disponíveis agora' <<<"$out")"
+check "toolset-free skill listed as available" \
+  "1" "$(grep -c '^- citation-format$' <<<"$out")"
+check "toolset-requiring skill listed as unavailable, with reason" \
+  "1" "$(grep -c '^- pr-triage (precisa: terminal)$' <<<"$out")"
+check "unavailable skill NOT also listed under Disponíveis" \
+  "0" "$(awk '/^Disponíveis:/{f=1;next}/^$/{f=0}f' <<<"$out" | grep -c '^- pr-triage$')"
+
+echo "== case: of_soul_capabilities_block with no skills directory this boot =="
+run_caps_absent() { ( set -euo pipefail; of_skills_dir="$WORK/does-not-exist" of_soul_capabilities_block ); }
+check "no dir -> empty block (Dogma 2: degrade, don't error)" "" "$(run_caps_absent)"
+
+echo "== MUTANT: of_soul_capabilities_block without the disabled-toolset intersection guard =="
+sed 's|missing = sorted(set(toolsets) & disabled)|missing = []|' "$CAPS_FN" > "$WORK/caps-mut.sh"
+if grep -q 'missing = \[\]' "$WORK/caps-mut.sh"; then
+  mut_out="$( ( set -euo pipefail
+    # shellcheck disable=SC1090
+    source "$WORK/caps-mut.sh"
+    of_disabled_toolsets=(terminal code_execution image_gen video_gen tts)
+    of_skills_dir="$CAPS_HOME" of_soul_capabilities_block
+  ) )"
+  check "guard removed -> a skill needing a disabled toolset now leaks into Disponíveis (proves the guard is load-bearing)" \
+    "1" "$(awk '/^Disponíveis:/{f=1;next}/^Carregadas/{f=0}f' <<<"$mut_out" | grep -c '^- pr-triage$')"
+else
+  bad "capabilities mutant did not apply -- a mutant that does not mutate proves nothing"
+fi
+
 echo
 echo "passed: $pass   failed: $fail"
 [[ "$fail" -eq 0 ]]
