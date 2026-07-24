@@ -698,9 +698,22 @@ PY
 #
 # This MUST run AFTER of_state_restore (an old snapshot still carries a SOUL.md that
 # restore would extract), and before `hermes gateway run` reads it. SOUL.md is the
-# ONLY lever for the agent's spoken language: display.language does not accept pt/pt-BR
-# (config.py supports en/zh/ja/de/es/fr/tr/uk only) and localizes just static UI
-# strings, not agent output. The pt-BR requirement lives here.
+# ONLY lever for the agent's OWN spoken language -- the model's conversational output.
+#
+# CORRECTION (2026-07-24): the claim that used to sit here -- "display.language does
+# not accept pt/pt-BR (config.py supports en/zh/ja/de/es/fr/tr/uk only)" -- is WRONG
+# today. Verified directly against agent/i18n.py, not recited: SUPPORTED_LANGUAGES now
+# includes "pt" (locales/pt.yaml, 402 lines, real catalog), and "pt-br"/"pt-pt" both
+# alias to it. This drifted true to false silently after an upstream sync widened the
+# language list; nobody re-checked the comment against the code since.
+#
+# It STILL does not cover everything, and that half of the old claim holds: i18n.py's
+# own docstring scopes it to "the highest-impact static strings ... approval prompts,
+# a handful of gateway slash command replies, restart-drain notices" -- confirmed by
+# reading the call sites. Task-interruption notices and first-touch onboarding tips
+# (gateway/run.py, agent/onboarding.py) are plain f-strings with no t() call at all;
+# setting display.language does not touch them, and nothing short of an upstream i18n
+# expansion (out of ADR-002 scope) will.
 of_write_soul() {
   [[ -n "${HERMES_SOUL:-}" ]] || return 0
   local home="${HERMES_HOME:-/opt/data}"
@@ -758,6 +771,17 @@ case "${HERMES_MODE:-service}" in
     if [[ -n "${HERMES_TIMEZONE:-}" ]]; then
       hermes config set timezone "${HERMES_TIMEZONE}"
     fi
+
+    # ENG-47 / language-protocol. Unconditional, not env-gated, same reasoning as
+    # agent.reasoning_effort below -- there is no deployment of this image where
+    # English static UI strings are wanted over Portuguese. Covers the curated subset
+    # agent/i18n.py owns (approval prompts, some gateway slash replies, restart-drain
+    # notices) -- see of_write_soul's comment above for what this does NOT cover
+    # (task-interruption notices, onboarding tips: hardcoded English, no t() call,
+    # unreachable from config). "pt", not "pt-br" -- SUPPORTED_LANGUAGES carries a
+    # single Portuguese catalog and "pt-br"/"pt-pt" both alias to it (agent/i18n.py);
+    # the canonical value avoids depending on alias resolution.
+    hermes config set display.language pt
 
     # ENG-46 / ENG-56 (openfathom-meta BACKLOG). The auxiliary client -- context
     # compression, conversation-title generation -- had NO working provider while the

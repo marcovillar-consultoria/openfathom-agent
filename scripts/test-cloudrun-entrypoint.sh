@@ -417,6 +417,14 @@ check "aux compression model follows HERMES_INFERENCE_MODEL" \
 check "aux title_generation model follows HERMES_INFERENCE_MODEL" \
   "1" "$(grep -c 'hermes config set auxiliary.title_generation.model    "\${HERMES_INFERENCE_MODEL}"' "$ENTRYPOINT")"
 
+# openfathom-meta ENG-47: display.language pt, and the stale comment claiming pt is
+# unsupported is gone. Both checked because the second is the actual regression this
+# guards against -- a comment that drifted true-to-false silently once already.
+check "display.language set to pt" \
+  "1" "$(grep -c 'hermes config set display.language pt' "$ENTRYPOINT")"
+check "stale 'display.language does not accept pt' claim is gone" \
+  "0" "$(grep -c 'display.language does not accept pt' "$ENTRYPOINT")"
+
 # ---------------------------------------------------------------------------
 # of_skill_usage_report (openfathom-meta ADR-053) -- derives the skill_invocations
 # log-based metric from the .usage.json sidecar Hermes already writes natively.
