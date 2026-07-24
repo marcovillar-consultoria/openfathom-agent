@@ -396,6 +396,28 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# openfathom-meta ENG-83: fallback_providers config + the aux-model hardcoding
+# bug it exposed. Structural checks (grep on the shipped script), same style as
+# approvals.mode/plugins.enabled above -- these blocks call into hermes_cli
+# internals not importable in this bash-only test job, so the check proves the
+# CORRECT call is present rather than executing it.
+# ---------------------------------------------------------------------------
+echo "== structural: ENG-83 fallback_providers + aux model =="
+check "fallback_providers set to vertex/google/gemini-3.6-flash" \
+  "1" "$(grep -c '_set_nested(cfg, "fallback_providers", \[{"provider": "vertex", "model": "google/gemini-3.6-flash"}\])' "$ENTRYPOINT")"
+# The regression this guards: the aux model was hardcoded to the OpenRouter
+# routing slug (anthropic/claude-haiku-4.5), silently wrong the moment
+# HERMES_INFERENCE_PROVIDER stops being openrouter. Asserting the hardcoded
+# slug is GONE, not just that the new line exists, is what makes this a
+# regression test rather than an addition test.
+check "aux compression model no longer hardcoded to the OpenRouter slug" \
+  "0" "$(grep -c 'auxiliary.compression.model         anthropic/claude-haiku-4.5' "$ENTRYPOINT")"
+check "aux compression model follows HERMES_INFERENCE_MODEL" \
+  "1" "$(grep -c 'hermes config set auxiliary.compression.model         "\${HERMES_INFERENCE_MODEL}"' "$ENTRYPOINT")"
+check "aux title_generation model follows HERMES_INFERENCE_MODEL" \
+  "1" "$(grep -c 'hermes config set auxiliary.title_generation.model    "\${HERMES_INFERENCE_MODEL}"' "$ENTRYPOINT")"
+
+# ---------------------------------------------------------------------------
 # of_skill_usage_report (openfathom-meta ADR-053) -- derives the skill_invocations
 # log-based metric from the .usage.json sidecar Hermes already writes natively.
 # Extracted standalone, same style as of_plugins_fetch above (it is not part of
