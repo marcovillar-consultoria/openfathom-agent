@@ -425,6 +425,13 @@ check "display.language set to pt" \
 check "stale 'display.language does not accept pt' claim is gone" \
   "0" "$(grep -c 'display.language does not accept pt' "$ENTRYPOINT")"
 
+# openfathom-meta ENG-84: model.max_tokens ceiling, so an unbounded 64k default
+# request never again triggers OpenRouter's HTTP 402 preflight-balance rejection.
+# Structural check, same reasoning as ENG-83 above -- hermes_cli internals aren't
+# importable in this bash-only test job.
+check "model.max_tokens set to a realistic ceiling, unconditionally" \
+  "1" "$(grep -c 'hermes config set model.max_tokens 12000' "$ENTRYPOINT")"
+
 # ---------------------------------------------------------------------------
 # of_skill_usage_report (openfathom-meta ADR-053) -- derives the skill_invocations
 # log-based metric from the .usage.json sidecar Hermes already writes natively.
