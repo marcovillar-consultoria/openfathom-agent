@@ -120,10 +120,26 @@ jobs:
       # convenience, since the 1588-commit sync PR needs a real human review anyway. So the
       # workflow stops at the push and prints the compare link; the human clicks it. The
       # one manual step lands exactly where the human was already going to read the diff.
+      # `--force-with-lease`, not a bare push: the branch name is date-derived
+      # (`sync/upstream-YYYYMMDD`), so a SECOND run on the same day pushes to a ref that
+      # already exists and git rejects it as non-fast-forward. Measured 2026-07-25, and it
+      # is not a corner case -- it is precisely the re-run you need after merging a fix into
+      # `cloudrun` that the first sync branch predates. That is the fifth structural blocker
+      # this mechanism has hit (ENG-62 catalogued four).
+      #
+      # Force is right here because this branch is machine-owned and disposable: it is a
+      # rebase artifact, recreated from `cloudrun` on every run. `--force-with-lease` and
+      # not `--force` because the ONE case that must not be silently discarded is a human
+      # having pushed onto the sync branch to fix a semantic break in the rebase; the lease
+      # compares against the remote-tracking ref fetched at checkout (`fetch-depth: 0`
+      # fetches it), so that push makes this step FAIL instead of overwriting the work.
+      #
+      # Re-pushing the same branch also keeps an already-open sync PR updating in place
+      # rather than orphaning it and requiring a new one.
       - name: Push sync branch
         if: steps.rebase.outputs.conflict == 'false'
         run: |
-          git push origin "${{ steps.rebase.outputs.branch }}"
+          git push --force-with-lease origin "${{ steps.rebase.outputs.branch }}"
           echo "::notice title=Sync branch pushed::Open the PR (base cloudrun): https://github.com/${{ github.repository }}/compare/cloudrun...${{ steps.rebase.outputs.branch }}?expand=1"
           echo "Sync branch pushed. Open the PR here (base cloudrun):"
           echo "  https://github.com/${{ github.repository }}/compare/cloudrun...${{ steps.rebase.outputs.branch }}?expand=1"
