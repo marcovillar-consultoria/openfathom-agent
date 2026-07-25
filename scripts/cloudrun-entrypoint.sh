@@ -75,8 +75,15 @@
 #   HERMES_SOUL     optional, service mode -- the declared agent identity (ENG-47),
 #                   written verbatim over $HERMES_HOME/SOUL.md at boot (of_write_soul),
 #                   AFTER any snapshot restore. Versioned in openfathom-infra; this is
-#                   the only lever for the agent's spoken language (display.language does
-#                   not accept pt-BR). Empty (default) keeps the image's default SOUL.md.
+#                   the only lever for the agent's OWN spoken language -- the model's
+#                   conversational output. NOT the same knob as display.language, which
+#                   this script also sets to `pt` unconditionally: that one translates
+#                   the curated static UI strings agent/i18n.py owns, and nothing the
+#                   model generates. (An earlier version of this line claimed
+#                   display.language "does not accept pt-BR". That went stale after an
+#                   upstream sync widened SUPPORTED_LANGUAGES -- see the correction dated
+#                   2026-07-24 above of_write_soul, and the boot log, which shows `pt`
+#                   accepted in production.) Empty (default) keeps the image's SOUL.md.
 #   PORT            injected by Cloud Run; only consulted in service mode
 #   HERMES_STATE_BUCKET  optional, service mode -- GCS bucket holding the state
 #                   snapshot (ENG-45). Empty (default) disables persistence entirely
@@ -244,7 +251,9 @@ except Exception: print(0)' 2>/dev/null || echo 0)"
 #
 #     of_state_epoch="$(cat "$home/.state_epoch" 2>/dev/null | tr -cd '0-9')"
 #
-# Under `set -euo pipefail` (line 83) that is a landmine, and it detonates on the ONLY
+# Under the `set -euo pipefail` this file opens with -- named, not cited by line number,
+# because the number this comment used to carry went stale as the script grew above it --
+# that is a landmine, and it detonates on the ONLY
 # input that existed at the time: no snapshot written before ADR-049 carries the file, so
 # `cat` exits 1, `pipefail` promotes the pipeline's failure, the assignment inherits it,
 # and `set -e` kills the shell -- between "restored snapshot" and this line. Revision
@@ -1025,9 +1034,10 @@ PYEOF
     # defect.
     #
     # Why config and not code: the leak lives in agent/ and plugins/, which ADR-002
-    # puts outside this fork's 7 files. This is the only lever we have -- and it
-    # happens to be the intended one, not a workaround: `none` is a documented value
-    # of this key.
+    # (amended by ADR-035 and ADR-050) puts outside the files this fork may touch --
+    # the list is ALLOWED_FILES in scripts/validate-fork-scope.py, the only copy of it
+    # CI reads. This is the only lever we have -- and it happens to be the intended
+    # one, not a workaround: `none` is a documented value of this key.
     #
     # Do not trust the key's own comment in config.yaml ("Reasoning effort level
     # (OpenRouter and Nous Portal)"). It is wrong by omission -- VertexProfile reads
@@ -1157,7 +1167,8 @@ PYEOF
     #
     # The chain, measured 2026-07-18, not assumed: skills reach $HERMES_HOME/skills only
     # via upstream's tools/skills_sync.py (docker/stage2-hook.sh), which syncs from the
-    # image's own skills/ directory. ADR-002 keeps our repo at 7 files, so our skills are
+    # image's own skills/ directory. ADR-002 (amended by ADR-035/ADR-050) keeps our repo
+    # to the ALLOWED_FILES allow-list, which no skill is on -- so our skills are
     # NOT in the image. The Job sees them only because it gcsfuse-mounts a bucket at its
     # $HERMES_HOME; the Service has no such mount, and of_state_snapshot deliberately
     # tars only `memories plans pairing cron` -- so anything dropped into
