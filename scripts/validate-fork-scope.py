@@ -6,8 +6,12 @@
 #
 # Runs on every PR into `cloudrun` (see of-build-image.yml) and fails if the
 # PR touches any file outside the fork's declared scope. Without this, only
-# PR-review discipline protects the 7-file allow-list — the mitigation
-# ADR-002 names but that, until now, was never wired into CI.
+# PR-review discipline protects the allow-list — the mitigation ADR-002 names
+# but that, until now, was never wired into CI.
+#
+# The count is deliberately NOT written out in prose here: this comment said
+# "7-file" while ALLOWED_FILES below already held 8 (ADR-050 added the
+# entrypoint test). `len(ALLOWED_FILES)` is the only count that cannot drift.
 
 import os
 import subprocess
@@ -54,7 +58,8 @@ def main() -> int:
         for f in violations:
             print(f"  - {f}", file=sys.stderr)
         print(
-            "\nADR-002 (openfathom-meta, amended by ADR-035) restricts this fork to:",
+            "\nADR-002 (openfathom-meta, amended by ADR-035 and ADR-050) "
+            f"restricts this fork to these {len(ALLOWED_FILES)} files:",
             file=sys.stderr,
         )
         for f in sorted(ALLOWED_FILES):

@@ -6,30 +6,69 @@
 # Container names and the host port are prefixed `of-`/`OF_` on purpose, so this
 # doesn't collide with other projects' local Docker state on the same machine.
 #
+# The image tag is `of-agent:cloudrun`. Until 2026-07-25 there were two names for one
+# image: Dockerfile.cloudrun's header documented `-t of-agent:cloudrun` while this file
+# built and expected `of-agent:dev`, so following the Dockerfile's build line and then
+# this file's `up` left compose looking for an image that was never tagged. Converged on
+# `of-agent:cloudrun` -- the tag Dockerfile.cloudrun already documents, and the one the
+# real debugging sessions used (see cloudrun-entrypoint.sh's ENG-83 note).
+#
 # Usage:
 #   docker build -t of-agent:base .
-#   docker build -f Dockerfile.cloudrun -t of-agent:dev .
-#   GEMINI_API_KEY=... docker compose -f docker-compose.cloudrun.yml up of-agent-service
-#   GEMINI_API_KEY=... HERMES_TASK="..." docker compose -f docker-compose.cloudrun.yml run --rm of-agent-job
+#   docker build -f Dockerfile.cloudrun -t of-agent:cloudrun .
+#   API_SERVER_KEY=$(openssl rand -hex 32) ANTHROPIC_API_KEY=... docker compose -f docker-compose.cloudrun.yml up of-agent-service
+#   ANTHROPIC_API_KEY=... HERMES_TASK="..." docker compose -f docker-compose.cloudrun.yml run --rm of-agent-job
+#
+# API_SERVER_KEY is NOT optional and is NOT a formality: cloudrun-entrypoint.sh exits 1
+# before starting anything when HERMES_MODE=service and it is empty, because
+# gateway/platforms/api_server.py refuses a key under 16 chars ("a guessable key is remote
+# code execution" -- this endpoint dispatches agent work, and the port below is published
+# on the host). Until 2026-07-25 this file documented a service smoke test without it, so
+# the command in the header could only ever print that error. There is deliberately no
+# default value: a known key baked into a public fork is the thing the check exists to
+# prevent.
+#
+# ANTHROPIC_API_KEY, not GEMINI_API_KEY, is the primary credential -- production runs
+# HERMES_INFERENCE_PROVIDER=anthropic. GEMINI_API_KEY is now the FALLBACK credential
+# (the entrypoint writes fallback_providers = [gemini/...] unconditionally, ENG-83), so it
+# is optional here and only exercises the fallback path when present.
 services:
   of-agent-service:
-    image: of-agent:dev
+    image: of-agent:cloudrun
     container_name: of-agent-service
     environment:
       - HERMES_MODE=service
-      - GEMINI_API_KEY=${GEMINI_API_KEY:?set GEMINI_API_KEY to smoke-test service mode}
+      - API_SERVER_KEY=${API_SERVER_KEY:?set API_SERVER_KEY (>=16 chars, e.g. `openssl rand -hex 32`) -- service mode exits 1 without it}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY to smoke-test service mode}
+      # Pass-through form (no `=`): omitted from the container entirely when unset on the
+      # host, rather than injected as an empty string a provider might read as configured.
+      - GEMINI_API_KEY
+      # Pinned, not passed through blank, and NOT a mirror of production's values (those
+      # live in openfathom-infra's terraform.tfvars and are the SSOT). The provider has to
+      # be set for the smoke test to resolve one at all: config.yaml ships
+      # `provider: "auto"` after cont-init's migration, which SHADOWS the env var --
+      # see cloudrun-entrypoint.sh's header. Override either to test another provider.
+      - HERMES_INFERENCE_PROVIDER=${HERMES_INFERENCE_PROVIDER:-anthropic}
+      - HERMES_INFERENCE_MODEL=${HERMES_INFERENCE_MODEL:-claude-haiku-4-5-20251001}
     ports:
       - "${OF_PORT:-8180}:8080"
 
+  # No volume here on purpose. This service used to mount one at /data/hermes, which
+  # nothing has read since 2026-07-12: the job's output path defaulted to a hardcoded
+  # /data/hermes back then, and was fixed to $HERMES_HOME (see the comment in the
+  # entrypoint's `job)` case). HERMES_HOME is not set here, so the default is the image's
+  # own /opt/data and the mount collected nothing. The answer is `tee`d to stdout, which
+  # is what you read in the terminal; set HERMES_JOB_OUTPUT if you want it in a file.
   of-agent-job:
-    image: of-agent:dev
+    image: of-agent:cloudrun
     container_name: of-agent-job
     environment:
       - HERMES_MODE=job
       - HERMES_TASK=${HERMES_TASK:?set HERMES_TASK to smoke-test job mode}
-      - GEMINI_API_KEY=${GEMINI_API_KEY:?set GEMINI_API_KEY to smoke-test job mode}
-    volumes:
-      - of-agent-job-data:/data/hermes
-
-volumes:
-  of-agent-job-data:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY to smoke-test job mode}
+      # Pass-through form (no `=`): omitted from the container entirely when unset on the
+      # host, rather than injected as an empty string a provider might read as configured.
+      - GEMINI_API_KEY
+      # job mode passes these as `hermes -z --provider/--model` flags, not via config.yaml.
+      - HERMES_INFERENCE_PROVIDER=${HERMES_INFERENCE_PROVIDER:-anthropic}
+      - HERMES_INFERENCE_MODEL=${HERMES_INFERENCE_MODEL:-claude-haiku-4-5-20251001}
