@@ -403,8 +403,11 @@ fi
 # CORRECT call is present rather than executing it.
 # ---------------------------------------------------------------------------
 echo "== structural: ENG-83 fallback_providers + aux model =="
-check "fallback_providers set to vertex/google/gemini-3.6-flash" \
-  "1" "$(grep -c '_set_nested(cfg, "fallback_providers", \[{"provider": "vertex", "model": "google/gemini-3.6-flash"}\])' "$ENTRYPOINT")"
+# NOT vertex: a real smoke test (openfathom-meta, 2026-07-25) proved a vertex
+# fallback entry never activates (PROVIDER_REGISTRY mismatch, see the entrypoint
+# comment above this line's target) -- gemini is the entry that actually works.
+check "fallback_providers set to gemini/gemini-3.6-flash" \
+  "1" "$(grep -c '_set_nested(cfg, "fallback_providers", \[{"provider": "gemini", "model": "gemini-3.6-flash"}\])' "$ENTRYPOINT")"
 # The regression this guards: the aux model was hardcoded to the OpenRouter
 # routing slug (anthropic/claude-haiku-4.5), silently wrong the moment
 # HERMES_INFERENCE_PROVIDER stops being openrouter. Asserting the hardcoded
