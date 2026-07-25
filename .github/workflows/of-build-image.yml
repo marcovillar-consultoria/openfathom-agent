@@ -48,6 +48,16 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The scope check compares against UPSTREAM, not against this PR's base --
+      # see the rationale in validate-fork-scope.py. Without this fetch it has no
+      # ground truth and fails closed, which is the intended behaviour but is not
+      # a useful CI result, so the ref has to be here.
+      - name: Fetch upstream for the fork-scope comparison
+        run: |
+          git remote get-url upstream >/dev/null 2>&1 \
+            || git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch --no-tags --quiet upstream main
+
       - name: Validate fork scope (ADR-002, amended by ADR-035 and ADR-050)
         run: python3 scripts/validate-fork-scope.py
 
