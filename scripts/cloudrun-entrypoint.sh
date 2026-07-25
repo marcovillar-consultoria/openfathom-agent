@@ -963,16 +963,35 @@ case "${HERMES_MODE:-service}" in
     # configured: agent/conversation_loop.py's is_client_error branch already tries
     # agent._fallback_chain BEFORE aborting on exactly this class of non-retryable
     # error -- it found nothing to try because fallback_providers was never set here.
-    # This is not a mechanism built for this switch; it is Hermes' own native fallback
-    # (hermes_cli/fallback_config.py), unused until now.
+    # This is Hermes' own native fallback (hermes_cli/fallback_config.py), used here
+    # for the first time.
     #
-    # vertex/google/gemini-3.6-flash, not gemini-2.5-flash: confirmed live against the
-    # real Vertex model catalog (publishers/google/models/gemini-3.6-flash,
-    # launchStage=GA, us-central1, openfathom-prod project) before writing this, not
-    # assumed from the 2.5-era config elsewhere in this file. The `google/` publisher
-    # prefix is mandatory on the Vertex OpenAI-compatible path (same lesson
-    # cloud_run_job already paid for with a real HTTP 400 "Malformed publisher").
-    # enable_vertex_access already grants the ADC this needs -- no new IAM.
+    # NOT vertex -- confirmed broken by a real smoke test (openfathom-meta, 2026-07-25):
+    # a `vertex` fallback entry never activates. try_activate_fallback() (agent/
+    # chat_completion_helpers.py) calls resolve_provider_client() (agent/
+    # auxiliary_client.py), which resolves the provider via
+    # `PROVIDER_REGISTRY.get(provider)` -- and that PROVIDER_REGISTRY
+    # (hermes_cli/auth.py) is a DIFFERENT registry from the one
+    # plugins/model-providers/vertex/__init__.py populates via
+    # providers.register_provider() (which only feeds the PRIMARY-provider code
+    # path, hermes_cli/runtime_provider.py). Confirmed live, inside a real
+    # of-agent:cloudrun container, even with the vertex-provider plugin enabled and
+    # the gateway restarted: `'vertex' in PROVIDER_REGISTRY` is False. The
+    # `elif pconfig.auth_type == "vertex":` branch in resolve_provider_client
+    # (auxiliary_client.py:5003) is dead code in hermes-agent 0.18.2 -- nothing
+    # ever populates that registry key. Fixing it is out of scope: neither file
+    # is one of the 8 this fork may touch (ADR-002/035/050).
+    #
+    # gemini (Google AI Studio), not vertex: `"gemini"` IS in
+    # hermes_cli.auth.PROVIDER_REGISTRY (auth_type="api_key", confirmed live in the
+    # same container), so it actually activates through the same
+    # resolve_provider_client() that rejected vertex. Auth is a plain
+    # GEMINI_API_KEY env var (plugins/model-providers/gemini/__init__.py:
+    # env_vars=("GOOGLE_API_KEY", "GEMINI_API_KEY")) -- no entrypoint translation
+    # needed, same class as ANTHROPIC_API_KEY/OPENROUTER_API_KEY above. Model slug
+    # is bare `gemini-3.6-flash`, no `google/` prefix -- that prefix is specific to
+    # Vertex's OpenAI-compatible path, not the AI Studio native endpoint
+    # (generativelanguage.googleapis.com).
     #
     # A LIST value (even of one entry) -- `hermes config set` cannot write it; needs
     # the python heredoc, same reason agent.disabled_toolsets does.
@@ -981,10 +1000,10 @@ from hermes_cli.config import get_config_path, fast_safe_load, ensure_hermes_hom
 from utils import atomic_yaml_write
 p = get_config_path()
 cfg = (fast_safe_load(open(p)) or {}) if p.exists() else {}
-_set_nested(cfg, "fallback_providers", [{"provider": "vertex", "model": "google/gemini-3.6-flash"}])
+_set_nested(cfg, "fallback_providers", [{"provider": "gemini", "model": "gemini-3.6-flash"}])
 ensure_hermes_home()
 atomic_yaml_write(p, cfg, sort_keys=False)
-print(f"✓ Set fallback_providers = [vertex/google/gemini-3.6-flash] in {p}")
+print(f"✓ Set fallback_providers = [gemini/gemini-3.6-flash] in {p}")
 PYEOF
 
     # ENG-49. Unconditional, not env-gated, because there is no deployment of this
