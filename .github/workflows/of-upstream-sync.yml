@@ -163,13 +163,121 @@ jobs:
       #
       # Re-pushing the same branch also keeps an already-open sync PR updating in place
       # rather than orphaning it and requiring a new one.
+      #
+      # title=/body= on the compare link (added 2026-07-27, openfathom-meta ENG-62):
+      # without them, the human clicking the link lands on NousResearch's
+      # PULL_REQUEST_TEMPLATE.md verbatim -- unchecked boxes for "type of change",
+      # cross-platform testing, skill checklists -- none of which apply to a
+      # mechanical weekly merge, and the title defaults to a Title-Cased branch
+      # name ("Sync/upstream 20260727"). Confirmed via GitHub's own docs
+      # (docs.github.com/en/pull-requests/reference/using-query-parameters-to-create-a-pull-request)
+      # and a corroborating community report (github.com/orgs/community/discussions/62482):
+      # `body=` REPLACES the auto-filled template rather than appending to it --
+      # exactly what we want, not a bug to route around. `gh pr create` itself
+      # stays off the table (org policy, see below); this only changes what's
+      # pre-typed on the page the human still has to open and click through.
+      #
+      # The check-attribution note below is COMPUTED, not a static string
+      # (openfathom-meta ENG-62, second edit same day, 2026-07-27). A first
+      # attempt tried to silence `Check contributors / check-attribution` by
+      # adding `contributors/emails/*` mapping files -- itself an ADR-002
+      # fork-scope violation (`contributors/` isn't one of the 8 allowed
+      # files), caught by `validate-scope` failing right after, reverted. A
+      # second attempt tried amending ADR-002's scope to allow exactly that --
+      # ADR-055 (2026-07-25, two days earlier) had already considered and
+      # rejected this same move (its "Alternativa C"): trading the fork-scope
+      # asset ADR-002 protects for an upstream attribution check is "the worst
+      # available deal". ADR-055 Decision 3 stands: the check stays red,
+      # permanently, by construction (this fork's `main` is frozen at the
+      # OF-01 bootstrap forever, so that commit's author is unmapped against
+      # `origin/main` on every sync PR, forever). But Decision 4 already shows
+      # the fix that makes a permanent red usable instead of noise: replace
+      # the human judgment call with a mechanical one. This step does that for
+      # check-attribution by re-running `validate-fork-scope.py upstream/main`
+      # right here -- the SAME script the separate CI job runs, no duplicated
+      # logic -- against the sync branch before the PR body is written. A pass
+      # PROVES the diff stays inside the 8-file allow-list, which is the one
+      # fact that makes check-attribution's redness the known structural one
+      # rather than a real problem, so the PR body says so and no per-sync
+      # discussion is needed. A failure says so loudly instead: something in
+      # this sync sits outside the allow-list, which is a real scope problem,
+      # not the known false-positive, and must not be waved through as "the
+      # usual check-attribution red".
+      #
+      # The `ci_review`/`mcp_catalog` warning below reuses
+      # `scripts/ci/classify_changes.py` -- the SAME classifier `ci.yml`'s
+      # `detect` job runs to decide whether the `ci-reviewed` label is required
+      # -- rather than re-deriving the path rules here, so the two can't drift
+      # apart. Deliberately NOT included: the supply-chain critical-pattern scan
+      # (`supply-chain-audit.yml`'s "Scan PR for critical supply chain risks"),
+      # because that logic lives inline in the workflow, not in an importable
+      # script, and re-implementing it here would be exactly the duplication
+      # this reuse is trying to avoid. This warning is a hint, never applies the
+      # label itself: `ci-reviewed` means a human opted in after looking, and
+      # pre-checking it from automation would erase the one case (a sync that
+      # itself edits a workflow/action) the label exists to catch.
       - name: Push sync branch
         if: steps.rebase.outputs.conflict == 'false'
         run: |
           git push --force-with-lease origin "${{ steps.rebase.outputs.branch }}"
-          echo "::notice title=Sync branch pushed::Open the PR (base cloudrun): https://github.com/${{ github.repository }}/compare/cloudrun...${{ steps.rebase.outputs.branch }}?expand=1"
+
+          upstream_sha=$(git rev-parse --short upstream/main)
+          n_commits=$(git rev-list --count cloudrun..upstream/main)
+          diffstat=$(git diff --shortstat "cloudrun..${{ steps.rebase.outputs.branch }}" | sed 's/^ *//')
+          repo_url="${{ github.server_url }}/${{ github.repository }}"
+          run_url="${repo_url}/actions/runs/${{ github.run_id }}"
+
+          classify=$(git diff --name-only "cloudrun..${{ steps.rebase.outputs.branch }}" | python3 scripts/ci/classify_changes.py)
+          ci_review=$(echo "$classify" | grep '^ci_review=' | cut -d= -f2)
+          mcp_catalog=$(echo "$classify" | grep '^mcp_catalog=' | cut -d= -f2)
+
+          if scope_report=$(python3 scripts/validate-fork-scope.py upstream/main 2>&1); then
+            scope_ok=true
+          else
+            scope_ok=false
+          fi
+
+          title="chore(sync): merge upstream/main@${upstream_sha} into cloudrun"
+          lines=(
+            "Weekly upstream sync ($(date -u +%Y-%m-%d)). Merge, not rebase (ADR-002 / ENG-62 sixth blocker) -- auto-generated, applied clean, no conflict."
+            ""
+            "- upstream/main @ ${upstream_sha}, ${n_commits} commit(s) ahead of cloudrun before this merge"
+            "- ${diffstat}"
+            "- sync run: ${run_url}"
+            ""
+            "Before merging:"
+            "- [ ] CI green (\`validate-fork-scope.py\` already ran and must still report 8 files)"
+            "- [ ] skim the diff for anything touching a cloudrun-owned file (Dockerfile.cloudrun, cloudrun-entrypoint.sh, hermes-gateway/) that upstream renamed or removed"
+          )
+          if [ "$scope_ok" = "true" ]; then
+            lines+=(
+              ""
+              "ℹ️ \`Check contributors / check-attribution\` is expected to fail here (ADR-055 Decision 3) -- mechanically confirmed this run: \`validate-fork-scope.py upstream/main\` reports the diff stays inside the 8-file allow-list, so this is the known, permanent, structural false-positive (this fork's \`main\` is frozen at the OF-01 bootstrap, so its author is unmapped against \`origin/main\` on every sync, by construction). Safe to merge red on this check alone. Do not add \`contributors/emails/\` mapping files to silence it -- that itself violates ADR-002's fork scope (rejected twice: ADR-055 2026-07-25, and again 2026-07-27)."
+            )
+          else
+            lines+=(
+              ""
+              "🚨 scope check FAILED this run (\`validate-fork-scope.py upstream/main\`) -- this diff is NOT limited to the 8-file allow-list, so any check-attribution (or other) redness here is **not** the known ADR-055 false-positive. Investigate before merging:"
+              '```'
+              "${scope_report}"
+              '```'
+            )
+          fi
+          if [ "$ci_review" = "true" ] || [ "$mcp_catalog" = "true" ]; then
+            lines+=(
+              ""
+              "⚠️ this sync touches CI-sensitive and/or MCP-catalog file(s) (classify_changes.py: ci_review=${ci_review}, mcp_catalog=${mcp_catalog}) -- read the diff before deciding whether \`ci-reviewed\` applies. Not applied automatically."
+            )
+          fi
+          body=$(printf '%s\n' "${lines[@]}")
+
+          title_enc=$(jq -nr --arg v "$title" '$v|@uri')
+          body_enc=$(jq -nr --arg v "$body" '$v|@uri')
+          pr_url="${repo_url}/compare/cloudrun...${{ steps.rebase.outputs.branch }}?expand=1&title=${title_enc}&body=${body_enc}"
+
+          echo "::notice title=Sync branch pushed::Open the PR (base cloudrun): ${pr_url}"
           echo "Sync branch pushed. Open the PR here (base cloudrun):"
-          echo "  https://github.com/${{ github.repository }}/compare/cloudrun...${{ steps.rebase.outputs.branch }}?expand=1"
+          echo "  ${pr_url}"
 
       # No `gh issue create` here (removed 2026-07-27, openfathom-meta ENG-62 sixth
       # blocker): the org disables workflow write permissions with no per-repo or
