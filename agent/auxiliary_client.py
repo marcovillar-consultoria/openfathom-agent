@@ -4188,6 +4188,7 @@ def _try_main_agent_model_fallback(
     failed_provider: str,
     task: str = None,
     reason: str = "error",
+    failed_model: Optional[str] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Last-resort fallback to the user's main agent provider + model.
 
@@ -4196,8 +4197,23 @@ def _try_main_agent_model_fallback(
     layer: if nothing the user asked for can serve the request, try the
     main chat model before giving up.
 
-    Skips when the failed provider already IS the main provider (no point
-    retrying the same backend that just failed).
+    ``failed_model`` narrows the same-provider skip to the exact
+    (provider, model) pair that just failed, mirroring
+    :func:`_try_configured_fallback_chain`.  This matters for self-hosted /
+    custom endpoints serving several models behind one provider label: the
+    aux compression model timing out says nothing about the health of the
+    main agent model deployed on the same URL (real incident: aux
+    ``glm-5.2`` hung and timed out while main ``macaron-v1-venti`` on the
+    identical endpoint was serving 448K-token turns fine — the
+    provider-label skip discarded the one fallback that would have worked).
+
+    - Model-specific runtime failures (timeout, connection, rate limit,
+      model-incompatible, invalid response) pass ``failed_model``: skip the
+      main model only when it IS the exact model that failed.
+    - Provider-wide failures (auth 401, payment 402) and legacy callers
+      leave ``failed_model`` as None, keeping the whole-provider skip —
+      the shared credentials/account are broken, so the main model on the
+      same provider cannot help either.
 
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
@@ -4214,9 +4230,23 @@ def _try_main_agent_model_fallback(
     if not main_provider or not main_model or main_provider.lower() in {"auto", ""}:
         return None, None, ""
 
-    skip = (failed_provider or "").lower().strip()
-    if main_provider.lower() == skip:
-        # The thing that failed IS the main model — nothing to fall back to.
+    # Identity + scope semantics owned by agent.backend_identity (#72468):
+    # model-scoped failures skip only the exact deployment that failed;
+    # provider-wide failures (no failed_model) skip the credential surface.
+    from agent.backend_identity import (
+        BackendIdentity,
+        FailureScope,
+        should_skip_candidate,
+    )
+
+    skip_model = (failed_model or "").strip().lower() or None
+    if should_skip_candidate(
+        BackendIdentity.build(provider=main_provider, model=main_model),
+        BackendIdentity.build(provider=failed_provider, model=skip_model),
+        FailureScope.MODEL if skip_model else FailureScope.CREDENTIAL,
+    ):
+        # The thing that failed IS the main model (or the failure was
+        # provider-wide) — nothing to fall back to.
         return None, None, ""
     if _is_provider_unhealthy(main_provider):
         _log_skip_unhealthy(main_provider, task)
@@ -4326,12 +4356,32 @@ def _try_configured_fallback_chain(
     task: str,
     failed_provider: str,
     reason: str = "error",
+    failed_model: Optional[str] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try user-configured fallback_chain for a specific auxiliary task.
 
     Reads auxiliary.<task>.fallback_chain from config.yaml and tries each
     entry in order.  Each entry must have at least ``provider``; ``model``,
     ``base_url``, and ``api_key`` are optional.
+
+    ``failed_model`` narrows the skip check to the exact (provider, model)
+    pair that just failed, rather than the whole provider. Without it every
+    entry sharing the failed provider is skipped (the original behaviour).
+    Callers pass it only when a sibling model on the same provider could
+    plausibly recover:
+
+    - Model-specific runtime failures (timeout, connection, rate limit,
+      model-incompatible, invalid response) pass ``failed_model`` so a
+      chain that intentionally lists several models under the same provider
+      — e.g. two more NVIDIA NIM models after the primary NIM model times
+      out — is not skipped wholesale. Only the exact model that failed is
+      skipped; the siblings still run instead of jumping straight to the
+      main-agent-model safety net.
+    - Provider-wide failures (auth 401, payment 402) and "no client could
+      be built" callers leave ``failed_model`` as None, keeping the whole
+      provider skipped — the shared credentials/account behind every model
+      on that provider are broken, so a sibling can't help and the
+      main-agent-model safety net should be reached instead.
 
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
@@ -4344,7 +4394,24 @@ def _try_configured_fallback_chain(
     if not chain or not isinstance(chain, list):
         return None, None, ""
 
-    skip = failed_provider.lower().strip()
+    skip_model = (failed_model or "").strip().lower() or None
+    # Identity + scope semantics owned by agent.backend_identity (#59561,
+    # #72468): a failed_model means the failure was model-scoped (timeout /
+    # connection / rate limit) — only the exact deployment is skipped; no
+    # failed_model means provider-wide (auth/payment) — the whole credential
+    # surface is skipped.
+    from agent.backend_identity import (
+        BackendIdentity,
+        FailureScope,
+        should_skip_candidate,
+    )
+
+    failed_ident = BackendIdentity.build(
+        provider=failed_provider, model=skip_model,
+    )
+    failure_scope = (
+        FailureScope.MODEL if skip_model else FailureScope.CREDENTIAL
+    )
     tried = []
     min_ctx = _task_minimum_context_length(task)
 
@@ -4352,9 +4419,20 @@ def _try_configured_fallback_chain(
         if not isinstance(entry, dict):
             continue
         fb_provider = str(entry.get("provider", "")).strip()
-        if not fb_provider or fb_provider.lower() == skip:
+        if not fb_provider:
             continue
-        fb_model = str(entry.get("model", "")).strip() or None
+        fb_model_raw = str(entry.get("model", "")).strip()
+        if should_skip_candidate(
+            BackendIdentity.build(
+                provider=fb_provider,
+                model=fb_model_raw,
+                base_url=str(entry.get("base_url") or ""),
+            ),
+            failed_ident,
+            failure_scope,
+        ):
+            continue
+        fb_model = fb_model_raw or None
 
         label = f"fallback_chain[{i}]({fb_provider})"
 
@@ -7234,20 +7312,67 @@ def _is_streaming_rejected_error(exc: Exception) -> bool:
     )
 
 
-def _create_with_progress(client: Any, kwargs: Dict[str, Any], task: Optional[str] = None) -> Any:
-    """chat.completions.create() that streams when a progress hook is active.
+def _provider_requires_stream(provider: str, base_url: Optional[str]) -> bool:
+    """Detect providers that only accept streaming (non-stream = HTTP 400).
+
+    Some OpenAI-compatible endpoints reject non-streaming chat requests
+    outright — e.g. Tencent Copilot returns
+    ``{"code": 11101, "msg": "Non-stream chat request is currently not
+    supported"}``. The main conversation loop already streams, so interactive
+    chat works; auxiliary tasks (title generation, compression, web extract)
+    used the non-streaming path and failed on every call. When this returns
+    True the auxiliary client sends ``stream=True`` and aggregates the chunks
+    itself (see :func:`_aggregate_chat_stream`). Credit @kudi88 (PR #60686).
+
+    Beyond the known-host list, users can mark ANY custom endpoint as
+    stream-only via ``auxiliary.stream_only_base_urls`` in config.yaml
+    (list of substrings matched against the endpoint URL).
+    """
+    _url = str(base_url or "").lower()
+    if not _url:
+        return False
+    # Tencent Copilot — "Non-stream chat request is currently not supported"
+    if base_url_host_matches(_url, "copilot.tencent.com"):
+        return True
+    try:
+        from hermes_cli.config import load_config
+        aux_cfg = (load_config() or {}).get("auxiliary", {})
+        markers = aux_cfg.get("stream_only_base_urls") or []
+        if isinstance(markers, (list, tuple)):
+            for marker in markers:
+                if isinstance(marker, str) and marker.strip() and marker.strip().lower() in _url:
+                    return True
+    except Exception:
+        # Config read is best-effort; never break an aux call over it.
+        pass
+    return False
+
+
+def _create_with_progress(
+    client: Any,
+    kwargs: Dict[str, Any],
+    task: Optional[str] = None,
+    *,
+    force_stream: bool = False,
+) -> Any:
+    """chat.completions.create() that streams when a progress hook is active
+    or the provider only accepts streamed requests.
 
     Behavior is byte-for-byte identical to a plain ``create(**kwargs)`` when
-    no hook is installed (every existing caller/task) or when the client's
+    neither trigger applies (every existing caller/task) or when the client's
     wire adapter streams internally. With a hook + a chunk-capable client,
     the request is sent with ``stream=True`` and aggregated, ticking the hook
     per chunk — so the configured ``timeout`` acts per stream read (idle)
     rather than as a total budget, and outer liveness watchdogs see tokens
-    moving. Providers that reject the streamed request fall back to the
-    plain non-streaming call.
+    moving. ``force_stream=True`` (stream-only providers such as Tencent
+    Copilot — credit @kudi88, PR #60686) takes the same streamed path even
+    without a hook. Providers that reject the streamed request fall back to
+    the plain non-streaming call — except under ``force_stream``, where a
+    stream-only provider rejects the plain call by definition, so the
+    original error is surfaced to the normal recovery chains instead.
     """
     _notify_aux_progress()  # request dispatched counts as progress
-    if not _aux_progress_active() or _client_streams_internally(client):
+    if (not _aux_progress_active() and not force_stream) or _client_streams_internally(client):
         return client.chat.completions.create(**kwargs)
 
     total_ceiling = _aux_stream_total_ceiling(kwargs.get("timeout"))
@@ -7262,7 +7387,8 @@ def _create_with_progress(client: Any, kwargs: Dict[str, Any], task: Optional[st
         # recovery chains (credential refresh, pool rotation, provider
         # fallback) see the same error they would on a plain call.
         if (
-            _is_transient_transport_error(exc)
+            force_stream
+            or _is_transient_transport_error(exc)
             or _is_auth_error(exc)
             or _is_payment_error(exc)
             or _is_rate_limit_error(exc)
@@ -7300,62 +7426,13 @@ def _aggregate_chat_stream(
     TimeoutError when *total_ceiling* seconds elapse before the stream
     finishes — phrased with "timed out" so existing timeout classification
     (``_is_timeout_error``) treats it exactly like a request timeout.
+    Accumulation is shared with the async mirror via
+    :class:`_ChatStreamAccumulator`.
     """
-    started = time.monotonic()
-    content_parts: List[str] = []
-    reasoning_parts: List[str] = []
-    tool_calls_acc: Dict[int, Dict[str, Any]] = {}
-    finish_reason = None
-    usage = None
-    resp_id = ""
-    resp_model = model or ""
+    acc = _ChatStreamAccumulator(model=model, total_ceiling=total_ceiling)
     try:
         for chunk in chunks:
-            _notify_aux_progress()
-            if total_ceiling is not None and (time.monotonic() - started) >= total_ceiling:
-                raise TimeoutError(
-                    f"Auxiliary streamed call timed out after {total_ceiling:.0f}s "
-                    "total ceiling (stream still open but over budget)"
-                )
-            resp_id = getattr(chunk, "id", None) or resp_id
-            resp_model = getattr(chunk, "model", None) or resp_model
-            chunk_usage = getattr(chunk, "usage", None)
-            if chunk_usage:
-                usage = chunk_usage
-            choices = getattr(chunk, "choices", None) or []
-            if not choices:
-                continue
-            choice = choices[0]
-            finish_reason = getattr(choice, "finish_reason", None) or finish_reason
-            delta = getattr(choice, "delta", None)
-            if delta is None:
-                continue
-            piece = getattr(delta, "content", None)
-            if piece:
-                content_parts.append(piece)
-            # Thinking models stream reasoning deltas before any content —
-            # they count as forward progress (the tick above) and are kept
-            # out of .content, mirroring non-streaming responses where
-            # reasoning arrives in a separate field.
-            reasoning_piece = (
-                getattr(delta, "reasoning", None)
-                or getattr(delta, "reasoning_content", None)
-            )
-            if reasoning_piece and isinstance(reasoning_piece, str):
-                reasoning_parts.append(reasoning_piece)
-            for tc in (getattr(delta, "tool_calls", None) or []):
-                idx = getattr(tc, "index", 0) or 0
-                acc = tool_calls_acc.setdefault(
-                    idx, {"id": "", "name": "", "arguments": []}
-                )
-                if getattr(tc, "id", None):
-                    acc["id"] = tc.id
-                fn = getattr(tc, "function", None)
-                if fn is not None:
-                    if getattr(fn, "name", None):
-                        acc["name"] = fn.name
-                    if getattr(fn, "arguments", None):
-                        acc["arguments"].append(fn.arguments)
+            acc.feed(chunk)
     finally:
         close_fn = getattr(chunks, "close", None)
         if callable(close_fn):
@@ -7363,38 +7440,157 @@ def _aggregate_chat_stream(
                 close_fn()
             except Exception:
                 pass
+    return acc.finish()
 
-    tool_calls = None
-    if tool_calls_acc:
-        tool_calls = [
-            SimpleNamespace(
-                id=acc["id"],
-                type="function",
-                function=SimpleNamespace(
-                    name=acc["name"],
-                    arguments="".join(acc["arguments"]),
-                ),
+
+class _ChatStreamAccumulator:
+    """Shared per-chunk accumulation for sync and async stream aggregation.
+
+    Mirrors :func:`_aggregate_chat_stream`'s chunk handling so the async
+    consumer below cannot drift from the sync one (same content/reasoning/
+    tool-call delta reassembly, same "timed out" ceiling phrasing).
+    """
+
+    def __init__(self, model: str = "", total_ceiling: Optional[float] = None):
+        self._started = time.monotonic()
+        self._total_ceiling = total_ceiling
+        self.content_parts: List[str] = []
+        self.reasoning_parts: List[str] = []
+        self.tool_calls_acc: Dict[int, Dict[str, Any]] = {}
+        self.finish_reason = None
+        self.usage = None
+        self.resp_id = ""
+        self.resp_model = model or ""
+
+    def feed(self, chunk: Any) -> None:
+        _notify_aux_progress()
+        if (
+            self._total_ceiling is not None
+            and (time.monotonic() - self._started) >= self._total_ceiling
+        ):
+            raise TimeoutError(
+                f"Auxiliary streamed call timed out after {self._total_ceiling:.0f}s "
+                "total ceiling (stream still open but over budget)"
             )
-            for _idx, acc in sorted(tool_calls_acc.items())
-        ]
+        self.resp_id = getattr(chunk, "id", None) or self.resp_id
+        self.resp_model = getattr(chunk, "model", None) or self.resp_model
+        chunk_usage = getattr(chunk, "usage", None)
+        if chunk_usage:
+            self.usage = chunk_usage
+        choices = getattr(chunk, "choices", None) or []
+        if not choices:
+            return
+        choice = choices[0]
+        self.finish_reason = getattr(choice, "finish_reason", None) or self.finish_reason
+        delta = getattr(choice, "delta", None)
+        if delta is None:
+            return
+        piece = getattr(delta, "content", None)
+        if piece:
+            self.content_parts.append(piece)
+        reasoning_piece = (
+            getattr(delta, "reasoning", None)
+            or getattr(delta, "reasoning_content", None)
+        )
+        if reasoning_piece and isinstance(reasoning_piece, str):
+            self.reasoning_parts.append(reasoning_piece)
+        for tc in (getattr(delta, "tool_calls", None) or []):
+            idx = getattr(tc, "index", 0) or 0
+            acc = self.tool_calls_acc.setdefault(
+                idx, {"id": "", "name": "", "arguments": []}
+            )
+            if getattr(tc, "id", None):
+                acc["id"] = tc.id
+            fn = getattr(tc, "function", None)
+            if fn is not None:
+                if getattr(fn, "name", None):
+                    acc["name"] = fn.name
+                if getattr(fn, "arguments", None):
+                    acc["arguments"].append(fn.arguments)
 
-    message = SimpleNamespace(
-        role="assistant",
-        content="".join(content_parts),
-        tool_calls=tool_calls,
-        reasoning="".join(reasoning_parts) or None,
-    )
-    choice = SimpleNamespace(
-        index=0,
-        message=message,
-        finish_reason=finish_reason or "stop",
-    )
-    return SimpleNamespace(
-        id=resp_id,
-        model=resp_model,
-        object="chat.completion",
-        choices=[choice],
-        usage=usage,
+    def finish(self) -> Any:
+        tool_calls = None
+        if self.tool_calls_acc:
+            tool_calls = [
+                SimpleNamespace(
+                    id=acc["id"],
+                    type="function",
+                    function=SimpleNamespace(
+                        name=acc["name"],
+                        arguments="".join(acc["arguments"]),
+                    ),
+                )
+                for _idx, acc in sorted(self.tool_calls_acc.items())
+            ]
+        message = SimpleNamespace(
+            role="assistant",
+            content="".join(self.content_parts),
+            tool_calls=tool_calls,
+            reasoning="".join(self.reasoning_parts) or None,
+        )
+        choice = SimpleNamespace(
+            index=0,
+            message=message,
+            finish_reason=self.finish_reason or "stop",
+        )
+        return SimpleNamespace(
+            id=self.resp_id,
+            model=self.resp_model,
+            object="chat.completion",
+            choices=[choice],
+            usage=self.usage,
+        )
+
+
+async def _aggregate_chat_stream_async(
+    chunks: Any,
+    *,
+    model: str = "",
+    total_ceiling: Optional[float] = None,
+) -> Any:
+    """Async mirror of :func:`_aggregate_chat_stream` (``async for`` consumer).
+
+    The AsyncOpenAI stream contract is an async iterator — consuming it with
+    the sync helper raises. Same accumulation and ceiling semantics via
+    :class:`_ChatStreamAccumulator`.
+    """
+    acc = _ChatStreamAccumulator(model=model, total_ceiling=total_ceiling)
+    try:
+        async for chunk in chunks:
+            acc.feed(chunk)
+    finally:
+        close_fn = getattr(chunks, "close", None) or getattr(chunks, "aclose", None)
+        if callable(close_fn):
+            try:
+                result = close_fn()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                pass
+    return acc.finish()
+
+
+async def _acreate_with_stream(
+    client: Any,
+    kwargs: Dict[str, Any],
+    task: Optional[str] = None,
+) -> Any:
+    """Async chat.completions.create() for stream-only providers.
+
+    Sends ``stream=True`` and aggregates the async chunk stream into a
+    complete response (credit @kudi88, PR #60686 — async contract fixed to
+    ``async for`` and tool-call deltas preserved per sweeper review).
+    """
+    total_ceiling = _aux_stream_total_ceiling(kwargs.get("timeout"))
+    stream_kwargs = dict(kwargs)
+    stream_kwargs["stream"] = True
+    stream_kwargs["stream_options"] = {"include_usage": True}
+    chunks = await client.chat.completions.create(**stream_kwargs)
+    # Defensive: shims may hand back a complete response despite stream=True.
+    if hasattr(chunks, "choices"):
+        return chunks
+    return await _aggregate_chat_stream_async(
+        chunks, model=str(kwargs.get("model") or ""), total_ceiling=total_ceiling,
     )
 
 
@@ -7598,7 +7794,13 @@ def call_llm(
         # for the transient retry every auxiliary task shares. (PR #16587)
         try:
             return _validate_llm_response(
-                _create_with_progress(client, kwargs, task), task,
+                _create_with_progress(
+                    client, kwargs, task,
+                    force_stream=_provider_requires_stream(
+                        resolved_provider, _base_info or resolved_base_url,
+                    ),
+                ),
+                task,
                 provider=resolved_provider, base_url=_base_info)
         except Exception as transient_err:
             if not _is_transient_transport_error(transient_err):
@@ -7631,7 +7833,13 @@ def call_llm(
                 time.sleep(_backoff)
                 try:
                     return _validate_llm_response(
-                        _create_with_progress(client, kwargs, task), task)
+                        _create_with_progress(
+                            client, kwargs, task,
+                            force_stream=_provider_requires_stream(
+                                resolved_provider, _base_info or resolved_base_url,
+                            ),
+                        ),
+                        task)
                 except Exception as retry_transient:
                     if not _is_transient_transport_error(retry_transient):
                         raise
@@ -7948,6 +8156,15 @@ def call_llm(
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
                         task or "call", reason, resolved_provider, first_err)
 
+            # Narrow the configured-chain skip to the exact model that
+            # failed ONLY for model-specific failures. Auth (401) and
+            # payment (402) errors are provider-wide — the credentials or
+            # account behind every model on that provider are the same — so
+            # a sibling model can't recover; keep skipping the whole
+            # provider so the main-agent-model safety net is still reached.
+            _chain_failed_model = (
+                None if reason in ("auth error", "payment error") else final_model
+            )
             # Fallback order (#26882, #26803):
             #   1. User-configured fallback_chain (per-task) if set
             #   2. For auto: top-level main fallback_providers/fallback_model
@@ -7956,7 +8173,8 @@ def call_llm(
             fb_client, fb_model, fb_label = (None, None, "")
             if is_auto:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
+                    task, resolved_provider or "auto", reason=reason,
+                    failed_model=_chain_failed_model)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_fallback_chain(
                         task, resolved_provider or "auto", reason=reason)
@@ -7965,10 +8183,12 @@ def call_llm(
                         resolved_provider, task, reason=reason)
             else:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
+                    task, resolved_provider or "auto", reason=reason,
+                    failed_model=_chain_failed_model)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-                        resolved_provider, task, reason=reason)
+                        resolved_provider, task, reason=reason,
+                        failed_model=_chain_failed_model)
 
             if fb_client is not None:
                 fb_resp = _call_fallback_candidate_sync(
@@ -8184,9 +8404,25 @@ async def async_call_llm(
         # Retry ONCE on the same provider for a transient transport blip
         # before the except-chain escalates to fallback — see call_llm()
         # for the rationale. (PR #16587)
+        _force_stream_async = (
+            _provider_requires_stream(
+                resolved_provider, _client_base or resolved_base_url,
+            )
+            and not isinstance(client, (
+                AsyncCodexAuxiliaryClient,
+                AsyncAnthropicAuxiliaryClient,
+                AsyncBedrockAuxiliaryClient,
+            ))
+        )
+
+        async def _acreate(_kwargs: Dict[str, Any]) -> Any:
+            if _force_stream_async:
+                return await _acreate_with_stream(client, _kwargs, task)
+            return await client.chat.completions.create(**_kwargs)
+
         try:
             return _validate_llm_response(
-                await client.chat.completions.create(**kwargs), task,
+                await _acreate(kwargs), task,
                 provider=resolved_provider, base_url=_client_base)
         except Exception as transient_err:
             if not _is_transient_transport_error(transient_err):
@@ -8207,7 +8443,7 @@ async def async_call_llm(
                 task or "call", transient_err,
             )
             return _validate_llm_response(
-                await client.chat.completions.create(**kwargs), task)
+                await _acreate(kwargs), task)
     except Exception as first_err:
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
@@ -8466,6 +8702,15 @@ async def async_call_llm(
             logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
                         task or "call", reason, resolved_provider, first_err)
 
+            # Narrow the configured-chain skip to the exact model that
+            # failed ONLY for model-specific failures. Auth (401) and
+            # payment (402) errors are provider-wide — the credentials or
+            # account behind every model on that provider are the same — so
+            # a sibling model can't recover; keep skipping the whole
+            # provider so the main-agent-model safety net is still reached.
+            _chain_failed_model = (
+                None if reason in ("auth error", "payment error") else final_model
+            )
             # Fallback order (#26882, #26803):
             #   1. User-configured fallback_chain (per-task) if set
             #   2. For auto: top-level main fallback_providers/fallback_model
@@ -8474,7 +8719,8 @@ async def async_call_llm(
             fb_client, fb_model, fb_label = (None, None, "")
             if is_auto:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
+                    task, resolved_provider or "auto", reason=reason,
+                    failed_model=_chain_failed_model)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_fallback_chain(
                         task, resolved_provider or "auto", reason=reason)
@@ -8483,10 +8729,12 @@ async def async_call_llm(
                         resolved_provider, task, reason=reason)
             else:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
+                    task, resolved_provider or "auto", reason=reason,
+                    failed_model=_chain_failed_model)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-                        resolved_provider, task, reason=reason)
+                        resolved_provider, task, reason=reason,
+                        failed_model=_chain_failed_model)
 
             if fb_client is not None:
                 # Convert sync fallback client to async
