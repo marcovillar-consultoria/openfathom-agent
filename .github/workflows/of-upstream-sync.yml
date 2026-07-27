@@ -176,6 +176,19 @@ jobs:
       # exactly what we want, not a bug to route around. `gh pr create` itself
       # stays off the table (org policy, see below); this only changes what's
       # pre-typed on the page the human still has to open and click through.
+      #
+      # The `ci_review`/`mcp_catalog` warning below reuses
+      # `scripts/ci/classify_changes.py` -- the SAME classifier `ci.yml`'s
+      # `detect` job runs to decide whether the `ci-reviewed` label is required
+      # -- rather than re-deriving the path rules here, so the two can't drift
+      # apart. Deliberately NOT included: the supply-chain critical-pattern scan
+      # (`supply-chain-audit.yml`'s "Scan PR for critical supply chain risks"),
+      # because that logic lives inline in the workflow, not in an importable
+      # script, and re-implementing it here would be exactly the duplication
+      # this reuse is trying to avoid. This warning is a hint, never applies the
+      # label itself: `ci-reviewed` means a human opted in after looking, and
+      # pre-checking it from automation would erase the one case (a sync that
+      # itself edits a workflow/action) the label exists to catch.
       - name: Push sync branch
         if: steps.rebase.outputs.conflict == 'false'
         run: |
@@ -187,17 +200,29 @@ jobs:
           repo_url="${{ github.server_url }}/${{ github.repository }}"
           run_url="${repo_url}/actions/runs/${{ github.run_id }}"
 
+          classify=$(git diff --name-only "cloudrun..${{ steps.rebase.outputs.branch }}" | python3 scripts/ci/classify_changes.py)
+          ci_review=$(echo "$classify" | grep '^ci_review=' | cut -d= -f2)
+          mcp_catalog=$(echo "$classify" | grep '^mcp_catalog=' | cut -d= -f2)
+
           title="chore(sync): merge upstream/main@${upstream_sha} into cloudrun"
-          body=$(printf '%s\n' \
-            "Weekly upstream sync ($(date -u +%Y-%m-%d)). Merge, not rebase (ADR-002 / ENG-62 sixth blocker) -- auto-generated, applied clean, no conflict." \
-            "" \
-            "- upstream/main @ ${upstream_sha}, ${n_commits} commit(s) ahead of cloudrun before this merge" \
-            "- ${diffstat}" \
-            "- sync run: ${run_url}" \
-            "" \
-            "Before merging:" \
-            "- [ ] CI green (\`validate-fork-scope.py\` already ran and must still report 8 files)" \
-            "- [ ] skim the diff for anything touching a cloudrun-owned file (Dockerfile.cloudrun, cloudrun-entrypoint.sh, hermes-gateway/) that upstream renamed or removed")
+          lines=(
+            "Weekly upstream sync ($(date -u +%Y-%m-%d)). Merge, not rebase (ADR-002 / ENG-62 sixth blocker) -- auto-generated, applied clean, no conflict."
+            ""
+            "- upstream/main @ ${upstream_sha}, ${n_commits} commit(s) ahead of cloudrun before this merge"
+            "- ${diffstat}"
+            "- sync run: ${run_url}"
+            ""
+            "Before merging:"
+            "- [ ] CI green (\`validate-fork-scope.py\` already ran and must still report 8 files)"
+            "- [ ] skim the diff for anything touching a cloudrun-owned file (Dockerfile.cloudrun, cloudrun-entrypoint.sh, hermes-gateway/) that upstream renamed or removed"
+          )
+          if [ "$ci_review" = "true" ] || [ "$mcp_catalog" = "true" ]; then
+            lines+=(
+              ""
+              "⚠️ this sync touches CI-sensitive and/or MCP-catalog file(s) (classify_changes.py: ci_review=${ci_review}, mcp_catalog=${mcp_catalog}) -- read the diff before deciding whether \`ci-reviewed\` applies. Not applied automatically."
+            )
+          fi
+          body=$(printf '%s\n' "${lines[@]}")
 
           title_enc=$(jq -nr --arg v "$title" '$v|@uri')
           body_enc=$(jq -nr --arg v "$body" '$v|@uri')
