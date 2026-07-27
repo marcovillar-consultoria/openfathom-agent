@@ -1918,9 +1918,9 @@ class AIAgent:
         # where the next live turn re-reads it as an instruction and the agent
         # "becomes" the curator. Hard-stop before any DB touch.
         if getattr(self, "_persist_disabled", False):
-            return
+            return None
         if not self._session_db:
-            return
+            return None
         # Persist user-message override (#48677 chokepoint): historically this
         # mutated the live `messages` list in place, which — on the early
         # crash-resilience persist that runs BEFORE the API call is built —
@@ -2122,8 +2122,10 @@ class AIAgent:
             # allocated next turn at a recycled address.
             self._flushed_db_message_ids = set()
             self._last_flushed_db_idx = len(messages)
+            return True
         except Exception as e:
             logger.warning("Session DB append_message failed: %s", e)
+            return False
 
     def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:
         """
@@ -3443,6 +3445,14 @@ class AIAgent:
                 "the model produced no follow-up text. Send `continue` to "
                 "let it summarize."
             )
+        if reason == "session_persistence_failed":
+            return (
+                prefix
+                + "the turn was stopped because session storage could not be "
+                "written (the transcript would have been lost on restart). "
+                "Check disk space / permissions for the state DB, then send "
+                "your message again."
+            )
         # Unknown/diagnostic-only reasons (e.g. "unknown", guardrail_halt
         # which already surfaces its own message) — don't second-guess.
         return ""
@@ -3496,6 +3506,17 @@ class AIAgent:
     def get_rate_limit_state(self):
         """Return the last captured RateLimitState, or None."""
         return self._rate_limit_state
+
+    def _capture_anthropic_response_headers(self, http_response: Any) -> None:
+        """Capture out-of-band state from Anthropic Messages response headers.
+
+        The Anthropic SDK's aggregated ``Message`` drops HTTP headers. Portal
+        (and other providers) put rate-limit and credits state there — the same
+        families the OpenAI-wire streaming path captures via
+        ``stream.response``. Fail-open: each capture swallows its own errors.
+        """
+        self._capture_rate_limits(http_response)
+        self._capture_credits(http_response)
 
     def _capture_credits(self, http_response: Any) -> None:
         """Parse x-nous-credits-* headers, cache CreditsState, fire threshold notices.
@@ -4868,7 +4889,12 @@ class AIAgent:
         *,
         force: bool = True,
     ) -> bool:
-        if self.api_mode != "chat_completions" or self.provider != "nous":
+        if self.provider != "nous":
+            return False
+        # Portal serves anthropic/* on the native Messages route, so a session
+        # can be holding either client kind when its short-lived invoke JWT
+        # expires. Both need the refresh or the turn dies on a 401.
+        if self.api_mode not in ("chat_completions", "anthropic_messages"):
             return False
 
         try:
@@ -4891,6 +4917,13 @@ class AIAgent:
 
         self.api_key = api_key.strip()
         self.base_url = base_url.strip().rstrip("/")
+
+        if self.api_mode == "anthropic_messages":
+            self._anthropic_api_key = self.api_key
+            self._anthropic_base_url = self.base_url
+            self._rebuild_anthropic_client()
+            return True
+
         self._client_kwargs["api_key"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
         # Nous requests should not inherit OpenRouter-only attribution headers.
@@ -5212,6 +5245,10 @@ class AIAgent:
             api_kwargs,
             log_prefix=getattr(self, "log_prefix", ""),
             prefer_stream=not bool(getattr(self, "_disable_streaming", False)),
+            # Rate-limit + credits state live in response headers, which the
+            # parsed Message drops. No-ops on providers that don't send the
+            # matching header families (x-ratelimit-* / x-nous-credits-*).
+            on_response=self._capture_anthropic_response_headers,
         )
 
     def _rebuild_anthropic_client(self) -> None:
