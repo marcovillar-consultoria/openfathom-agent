@@ -177,6 +177,33 @@ jobs:
       # stays off the table (org policy, see below); this only changes what's
       # pre-typed on the page the human still has to open and click through.
       #
+      # The check-attribution note below is COMPUTED, not a static string
+      # (openfathom-meta ENG-62, second edit same day, 2026-07-27). A first
+      # attempt tried to silence `Check contributors / check-attribution` by
+      # adding `contributors/emails/*` mapping files -- itself an ADR-002
+      # fork-scope violation (`contributors/` isn't one of the 8 allowed
+      # files), caught by `validate-scope` failing right after, reverted. A
+      # second attempt tried amending ADR-002's scope to allow exactly that --
+      # ADR-055 (2026-07-25, two days earlier) had already considered and
+      # rejected this same move (its "Alternativa C"): trading the fork-scope
+      # asset ADR-002 protects for an upstream attribution check is "the worst
+      # available deal". ADR-055 Decision 3 stands: the check stays red,
+      # permanently, by construction (this fork's `main` is frozen at the
+      # OF-01 bootstrap forever, so that commit's author is unmapped against
+      # `origin/main` on every sync PR, forever). But Decision 4 already shows
+      # the fix that makes a permanent red usable instead of noise: replace
+      # the human judgment call with a mechanical one. This step does that for
+      # check-attribution by re-running `validate-fork-scope.py upstream/main`
+      # right here -- the SAME script the separate CI job runs, no duplicated
+      # logic -- against the sync branch before the PR body is written. A pass
+      # PROVES the diff stays inside the 8-file allow-list, which is the one
+      # fact that makes check-attribution's redness the known structural one
+      # rather than a real problem, so the PR body says so and no per-sync
+      # discussion is needed. A failure says so loudly instead: something in
+      # this sync sits outside the allow-list, which is a real scope problem,
+      # not the known false-positive, and must not be waved through as "the
+      # usual check-attribution red".
+      #
       # The `ci_review`/`mcp_catalog` warning below reuses
       # `scripts/ci/classify_changes.py` -- the SAME classifier `ci.yml`'s
       # `detect` job runs to decide whether the `ci-reviewed` label is required
@@ -204,6 +231,12 @@ jobs:
           ci_review=$(echo "$classify" | grep '^ci_review=' | cut -d= -f2)
           mcp_catalog=$(echo "$classify" | grep '^mcp_catalog=' | cut -d= -f2)
 
+          if scope_report=$(python3 scripts/validate-fork-scope.py upstream/main 2>&1); then
+            scope_ok=true
+          else
+            scope_ok=false
+          fi
+
           title="chore(sync): merge upstream/main@${upstream_sha} into cloudrun"
           lines=(
             "Weekly upstream sync ($(date -u +%Y-%m-%d)). Merge, not rebase (ADR-002 / ENG-62 sixth blocker) -- auto-generated, applied clean, no conflict."
@@ -216,6 +249,20 @@ jobs:
             "- [ ] CI green (\`validate-fork-scope.py\` already ran and must still report 8 files)"
             "- [ ] skim the diff for anything touching a cloudrun-owned file (Dockerfile.cloudrun, cloudrun-entrypoint.sh, hermes-gateway/) that upstream renamed or removed"
           )
+          if [ "$scope_ok" = "true" ]; then
+            lines+=(
+              ""
+              "ℹ️ \`Check contributors / check-attribution\` is expected to fail here (ADR-055 Decision 3) -- mechanically confirmed this run: \`validate-fork-scope.py upstream/main\` reports the diff stays inside the 8-file allow-list, so this is the known, permanent, structural false-positive (this fork's \`main\` is frozen at the OF-01 bootstrap, so its author is unmapped against \`origin/main\` on every sync, by construction). Safe to merge red on this check alone. Do not add \`contributors/emails/\` mapping files to silence it -- that itself violates ADR-002's fork scope (rejected twice: ADR-055 2026-07-25, and again 2026-07-27)."
+            )
+          else
+            lines+=(
+              ""
+              "🚨 scope check FAILED this run (\`validate-fork-scope.py upstream/main\`) -- this diff is NOT limited to the 8-file allow-list, so any check-attribution (or other) redness here is **not** the known ADR-055 false-positive. Investigate before merging:"
+              '```'
+              "${scope_report}"
+              '```'
+            )
+          fi
           if [ "$ci_review" = "true" ] || [ "$mcp_catalog" = "true" ]; then
             lines+=(
               ""
