@@ -163,13 +163,49 @@ jobs:
       #
       # Re-pushing the same branch also keeps an already-open sync PR updating in place
       # rather than orphaning it and requiring a new one.
+      #
+      # title=/body= on the compare link (added 2026-07-27, openfathom-meta ENG-62):
+      # without them, the human clicking the link lands on NousResearch's
+      # PULL_REQUEST_TEMPLATE.md verbatim -- unchecked boxes for "type of change",
+      # cross-platform testing, skill checklists -- none of which apply to a
+      # mechanical weekly merge, and the title defaults to a Title-Cased branch
+      # name ("Sync/upstream 20260727"). Confirmed via GitHub's own docs
+      # (docs.github.com/en/pull-requests/reference/using-query-parameters-to-create-a-pull-request)
+      # and a corroborating community report (github.com/orgs/community/discussions/62482):
+      # `body=` REPLACES the auto-filled template rather than appending to it --
+      # exactly what we want, not a bug to route around. `gh pr create` itself
+      # stays off the table (org policy, see below); this only changes what's
+      # pre-typed on the page the human still has to open and click through.
       - name: Push sync branch
         if: steps.rebase.outputs.conflict == 'false'
         run: |
           git push --force-with-lease origin "${{ steps.rebase.outputs.branch }}"
-          echo "::notice title=Sync branch pushed::Open the PR (base cloudrun): https://github.com/${{ github.repository }}/compare/cloudrun...${{ steps.rebase.outputs.branch }}?expand=1"
+
+          upstream_sha=$(git rev-parse --short upstream/main)
+          n_commits=$(git rev-list --count cloudrun..upstream/main)
+          diffstat=$(git diff --shortstat "cloudrun..${{ steps.rebase.outputs.branch }}" | sed 's/^ *//')
+          repo_url="${{ github.server_url }}/${{ github.repository }}"
+          run_url="${repo_url}/actions/runs/${{ github.run_id }}"
+
+          title="chore(sync): merge upstream/main@${upstream_sha} into cloudrun"
+          body=$(printf '%s\n' \
+            "Weekly upstream sync ($(date -u +%Y-%m-%d)). Merge, not rebase (ADR-002 / ENG-62 sixth blocker) -- auto-generated, applied clean, no conflict." \
+            "" \
+            "- upstream/main @ ${upstream_sha}, ${n_commits} commit(s) ahead of cloudrun before this merge" \
+            "- ${diffstat}" \
+            "- sync run: ${run_url}" \
+            "" \
+            "Before merging:" \
+            "- [ ] CI green (\`validate-fork-scope.py\` already ran and must still report 8 files)" \
+            "- [ ] skim the diff for anything touching a cloudrun-owned file (Dockerfile.cloudrun, cloudrun-entrypoint.sh, hermes-gateway/) that upstream renamed or removed")
+
+          title_enc=$(jq -nr --arg v "$title" '$v|@uri')
+          body_enc=$(jq -nr --arg v "$body" '$v|@uri')
+          pr_url="${repo_url}/compare/cloudrun...${{ steps.rebase.outputs.branch }}?expand=1&title=${title_enc}&body=${body_enc}"
+
+          echo "::notice title=Sync branch pushed::Open the PR (base cloudrun): ${pr_url}"
           echo "Sync branch pushed. Open the PR here (base cloudrun):"
-          echo "  https://github.com/${{ github.repository }}/compare/cloudrun...${{ steps.rebase.outputs.branch }}?expand=1"
+          echo "  ${pr_url}"
 
       # No `gh issue create` here (removed 2026-07-27, openfathom-meta ENG-62 sixth
       # blocker): the org disables workflow write permissions with no per-repo or
