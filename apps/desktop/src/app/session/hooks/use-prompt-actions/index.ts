@@ -498,6 +498,8 @@ export function usePromptActions({
     busyRef,
     copy,
     createBackendSessionForSend,
+    getRoutedStoredSessionId,
+    getRuntimeIdForStoredSession,
     handleSkinCommand,
     handoffSession,
     openMemoryGraph,
@@ -517,7 +519,9 @@ export function usePromptActions({
 
       if (!attachments.length && SLASH_COMMAND_RE.test(visibleText)) {
         triggerHaptic('selection')
-        await executeSlashCommand(visibleText)
+        // Forward the explicit target (background queue drain, tile) — dropping
+        // it ran the command against whatever chat happened to be in front.
+        await executeSlashCommand(visibleText, options?.sessionId ? { sessionId: options.sessionId } : undefined)
 
         return true
       }

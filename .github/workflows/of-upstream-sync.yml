@@ -39,14 +39,20 @@ on:
     - cron: '0 3 * * 1' # Monday 03:00 UTC
   workflow_dispatch:
 
-# `permissions:` here governs the default GITHUB_TOKEN. It still matters for the
-# conflict path (`gh issue create`, which needs `issues: write`) -- the App does NOT
-# carry the Issues permission, and github-actions[bot] is a visible bot, so ENG-74's
-# "indistinguishable from a human" concern does not apply to that path. The push+PR
-# path does NOT use GITHUB_TOKEN; it uses the App installation token minted below.
+# `permissions:` here governs the default GITHUB_TOKEN. The push+PR path does NOT
+# use it -- it uses the App installation token minted below. `issues: write` USED
+# to be declared here for the conflict path (`gh issue create`), removed 2026-07-27
+# (openfathom-meta ENG-62, sixth blocker): the org disables write permissions for
+# workflows with no per-repo override -- `PUT .../actions/permissions/workflow` with
+# `default_workflow_permissions=write` returns `409 Conflict: "Write permissions for
+# workflows are disabled by the organization"`, and an explicit `permissions:` key in
+# the workflow file does NOT override that org-wide policy in this account's plan
+# (measured: the declaration was already present and `gh issue create` still failed
+# with `Resource not accessible by integration`). Same class of restriction as the
+# PR-creation block below, just for Issues instead of Pull requests. The conflict
+# path no longer needs `issues: write` at all -- see "Report conflict" below.
 permissions:
   contents: write
-  issues: write
   pull-requests: write
 
 jobs:
@@ -144,24 +150,38 @@ jobs:
           echo "Sync branch pushed. Open the PR here (base cloudrun):"
           echo "  https://github.com/${{ github.repository }}/compare/cloudrun...${{ steps.rebase.outputs.branch }}?expand=1"
 
-      - name: Open conflict issue
+      # No `gh issue create` here (removed 2026-07-27, openfathom-meta ENG-62 sixth
+      # blocker): the org disables workflow write permissions with no per-repo or
+      # per-workflow override, `issues: write` above never took effect, and there is
+      # no in-scope fix that doesn't touch org-wide policy for every repo, not just
+      # this one -- out of proportion to a once-a-week convenience notification. This
+      # step instead makes the run itself the signal: a scheduled workflow run that
+      # fails gets GitHub's own notification (by default, to whoever last edited this
+      # file's `cron:` line) with no extra permission required, plus `::error::` and a
+      # job summary a human lands on from the Actions tab.
+      #
+      # Remediation is push-a-branch-and-open-a-PR, NOT `git push --force-with-lease`
+      # straight to `cloudrun` -- that used to be the documented fix, until the branch
+      # protection ruleset (ENG-2) rejected exactly that with `GH013: Cannot force-push
+      # to this branch`, measured 2026-07-27 resolving this same conflict.
+      - name: Report conflict
         if: steps.rebase.outputs.conflict == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cat > /tmp/issue-body.md <<'EOF'
-          The weekly rebase of `cloudrun` onto `upstream/main` failed with a conflict and was aborted. Resolve manually:
-
-          ```
-          git fetch upstream main
-          git checkout cloudrun
-          git rebase upstream/main
-          # fix conflicts
-          git push --force-with-lease
-          ```
-
-          See ADR-002 (openfathom-meta) for the fork-scope rule this branch must keep obeying while resolving.
-          EOF
-          gh issue create \
-            --title "upstream-sync: rebase conflict ($(date -u +%Y-%m-%d))" \
-            --body-file /tmp/issue-body.md
+          {
+            echo "## upstream-sync: rebase conflict ($(date -u +%Y-%m-%d))"
+            echo
+            echo "The weekly rebase of \`cloudrun\` onto \`upstream/main\` failed with a conflict and was aborted. Resolve manually:"
+            echo
+            echo '```'
+            echo "git fetch upstream main"
+            echo "git checkout cloudrun"
+            echo "git checkout -b fix/upstream-sync-conflict"
+            echo "git rebase upstream/main"
+            echo "# fix conflicts"
+            echo "git push origin fix/upstream-sync-conflict"
+            echo "gh pr create --base cloudrun --head fix/upstream-sync-conflict"
+            echo '```'
+            echo
+            echo "See ADR-002 (openfathom-meta) for the fork-scope rule this branch must keep obeying while resolving. Direct push to \`cloudrun\` is rejected by branch protection -- open a PR."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "::error title=upstream-sync conflict::Weekly rebase of cloudrun onto upstream/main failed -- see job summary for the resolve-manually steps"
