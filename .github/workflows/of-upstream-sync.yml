@@ -7,19 +7,20 @@ name: of-upstream-sync
 # Filename is `of-upstream-sync.yml`, not the `upstream-sync.yml` ADR-002 lists
 # verbatim -- this repo's own .github/workflows/ already carries upstream's own
 # workflow files, and an `of-` prefix means a future upstream file with the same
-# short name can never collide during the weekly rebase. Same reasoning as the
+# short name can never collide during the weekly sync. Same reasoning as the
 # `of-` prefix on every container/image/port this fork adds locally.
 #
 # Also deviates from ADR-002's literal wording on the success path: the ADR says
 # "rebase succeeds -> push and tag the new image" (direct push to `cloudrun`).
 # This opens a PR into `cloudrun` instead. PLAN.md's OF-03 task text already
-# says "abre PR se o rebase for bem-sucedido" — a rebase that applies cleanly
-# can still be semantically wrong (upstream renaming something
-# cloudrun-entrypoint.sh depends on), and a force-push straight to the branch
-# of-build-image.yml builds from would skip the one human look that would catch
-# that. Both deviations are flagged in docs/BACKLOG.md (openfathom-meta, ENG-32)
-# for an ADR-002 wording correction — real ADR/implementation mismatches, not
-# silent choices.
+# says "abre PR se o rebase for bem-sucedido" — a rebase (or, since 2026-07-27,
+# a merge -- see "Attempt cloudrun merge" below) that applies cleanly can still
+# be semantically wrong (upstream renaming something cloudrun-entrypoint.sh
+# depends on), and a force-push straight to the branch of-build-image.yml
+# builds from would skip the one human look that would catch that. Both
+# deviations are flagged in docs/BACKLOG.md (openfathom-meta, ENG-32) for an
+# ADR-002 wording correction — real ADR/implementation mismatches, not silent
+# choices.
 #
 # TWO PRECONDITIONS THIS FILE CANNOT ENFORCE, both of which fail silently -- no
 # red run, no alert, just nothing happening (ENG-62, measured 2026-07-18):
@@ -98,20 +99,40 @@ jobs:
       # that step every single time it fired. Measured 2026-07-18 (ENG-62): the
       # merge-base of origin/main and upstream/main is not origin/main.
       #
-      # The sync never needed our `main`: what it rebases onto is upstream's tree,
+      # The sync never needed our `main`: what it merges onto is upstream's tree,
       # and `upstream/main` names that directly. Dropping the step also drops a
       # `git push origin main` from a workflow that runs unattended on a public
       # fork -- less surface, same outcome. Our `main` simply stays frozen at the
       # OF-01 bootstrap; nothing reads it once `cloudrun` is the default branch.
-      - name: Attempt cloudrun rebase
+      #
+      # `git merge`, NOT `git rebase` (changed 2026-07-27, ENG-62 sixth blocker,
+      # openfathom-meta). The previous version of this step ran
+      # `git rebase upstream/main`, and it broke for a reason that had nothing to
+      # do with upstream: an earlier sync PR (#34) was merged into `cloudrun` with
+      # GitHub's "create a merge commit" strategy, leaving a real two-parent merge
+      # commit in `cloudrun`'s history. `git log` hides one of those two parent
+      # lineages by default (merge-history simplification); `git rebase` does NOT
+      # simplify -- it replays every commit unique to `cloudrun`, including the
+      # hidden lineage, and that replay collided with itself
+      # (`CONFLICT (add/add)` in README.openfathom.md, no upstream commit involved
+      # at all -- confirmed by `git log <merge-base>..upstream/main -- README.openfathom.md`
+      # coming back empty). `git merge` does not replay history commit-by-commit;
+      # it three-way-diffs tree state at the tips, so it is blind to whatever
+      # shape `cloudrun`'s own history takes -- proven the same day, same
+      # conflict, zero errors with `git merge upstream/main --no-edit` where the
+      # rebase failed. This is not a one-off workaround: as long as this repo
+      # allows PRs to merge into `cloudrun` as a real merge commit (the GitHub
+      # default, still enabled), a future rebase-based sync would remain exposed
+      # to the same class of failure. Merge is not.
+      - name: Attempt cloudrun merge
         id: rebase
         run: |
           branch="sync/upstream-$(date -u +%Y%m%d)"
           git checkout -b "$branch" cloudrun
-          if git rebase upstream/main; then
+          if git merge upstream/main --no-edit; then
             echo "conflict=false" >> "$GITHUB_OUTPUT"
           else
-            git rebase --abort
+            git merge --abort
             echo "conflict=true" >> "$GITHUB_OUTPUT"
           fi
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
@@ -134,9 +155,9 @@ jobs:
       # this mechanism has hit (ENG-62 catalogued four).
       #
       # Force is right here because this branch is machine-owned and disposable: it is a
-      # rebase artifact, recreated from `cloudrun` on every run. `--force-with-lease` and
+      # merge artifact, recreated from `cloudrun` on every run. `--force-with-lease` and
       # not `--force` because the ONE case that must not be silently discarded is a human
-      # having pushed onto the sync branch to fix a semantic break in the rebase; the lease
+      # having pushed onto the sync branch to fix a semantic break in the merge; the lease
       # compares against the remote-tracking ref fetched at checkout (`fetch-depth: 0`
       # fetches it), so that push makes this step FAIL instead of overwriting the work.
       #
@@ -168,20 +189,20 @@ jobs:
         if: steps.rebase.outputs.conflict == 'true'
         run: |
           {
-            echo "## upstream-sync: rebase conflict ($(date -u +%Y-%m-%d))"
+            echo "## upstream-sync: merge conflict ($(date -u +%Y-%m-%d))"
             echo
-            echo "The weekly rebase of \`cloudrun\` onto \`upstream/main\` failed with a conflict and was aborted. Resolve manually:"
+            echo "The weekly merge of \`upstream/main\` into \`cloudrun\` failed with a conflict and was aborted. Resolve manually:"
             echo
             echo '```'
             echo "git fetch upstream main"
             echo "git checkout cloudrun"
             echo "git checkout -b fix/upstream-sync-conflict"
-            echo "git rebase upstream/main"
-            echo "# fix conflicts"
+            echo "git merge upstream/main --no-edit"
+            echo "# fix conflicts, then: git add <files> && git commit"
             echo "git push origin fix/upstream-sync-conflict"
             echo "gh pr create --base cloudrun --head fix/upstream-sync-conflict"
             echo '```'
             echo
             echo "See ADR-002 (openfathom-meta) for the fork-scope rule this branch must keep obeying while resolving. Direct push to \`cloudrun\` is rejected by branch protection -- open a PR."
           } | tee -a "$GITHUB_STEP_SUMMARY"
-          echo "::error title=upstream-sync conflict::Weekly rebase of cloudrun onto upstream/main failed -- see job summary for the resolve-manually steps"
+          echo "::error title=upstream-sync conflict::Weekly merge of upstream/main into cloudrun failed -- see job summary for the resolve-manually steps"
