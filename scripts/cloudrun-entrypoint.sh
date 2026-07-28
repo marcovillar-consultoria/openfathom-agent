@@ -289,8 +289,9 @@ except Exception:
 PY
 }
 
-# openfathom-meta ADR-049. Exit 0 iff the messages in tarball $1 (MINE) are a superset of
-# those in tarball $2 (THEIRS) -- i.e. promoting mine over theirs destroys nothing.
+# openfathom-meta ADR-049. Exit 0 iff the messages AND the memory entries in tarball $1
+# (MINE) are a superset of those in tarball $2 (THEIRS) -- i.e. promoting mine over theirs
+# destroys nothing.
 #
 # The key is (session_id, role, timestamp, sha1(content)) and NEVER the `id` column. `id`
 # is an autoincrement primary key assigned per-database, so two states that diverged
@@ -302,9 +303,25 @@ PY
 # true -- which would promote right over a deliberately emptied state. That is exactly
 # the curated tarball the reset runbook uploads. The epoch guard already refuses that
 # case; this is the second, independent lock on the same door.
+#
+# MEMORY, ADDED -- openfathom-meta ENG-66. Before this, the function's name lied by
+# omission: it decided every real promotion (3 confirmed in production, 2026-07-24/26/27)
+# on messages alone, while memories/ (MEMORY.md, USER.md) rode along in the same tarball
+# with NOTHING checked. A promotion could be a strict superset of messages and a strict
+# SUBSET of memories, silently -- exactly the gap a product whose pitch is "learns from
+# use" cannot afford. Compared at ENTRY granularity (tools/memory_tool.py's own
+# ENTRY_DELIMITER = "\n§\n" split), not whole-file bytes: a memory file grows by
+# appending entries, so two files that both contain entry X but differ elsewhere (order,
+# an entry only one side has) must not register as "X changed" -- the same reasoning that
+# already keeps messages compared row-by-row instead of as one table hash. Absence of a
+# memories/ directory is NOT fail-closed the way a missing state.db is: an instance that
+# never wrote a memory is ordinary, not a signal of a deliberate reset (that guard is the
+# epoch check, upstream of this function).
 of_state_messages_superset() {
   python3 - "$1" "$2" <<'PY'
 import sys, tarfile, sqlite3, hashlib, os, tempfile
+
+MEMORY_ENTRY_DELIMITER = "\n§\n"  # tools/memory_tool.py::ENTRY_DELIMITER
 
 def keys(path):
     """Message identity set, or None when the tarball carries no state.db."""
@@ -331,8 +348,29 @@ def keys(path):
     finally:
         os.unlink(tmp)
 
+def memory_keys(path):
+    """(relative_path, sha1(entry)) for every memory entry under memories/ in the
+    tarball. Empty set if the tarball has no memories/ at all -- that is a normal
+    state, not the fail-closed signal state.db's absence is."""
+    result = set()
+    with tarfile.open(path) as t:
+        for m in t.getmembers():
+            if not m.isfile():
+                continue
+            parts = [p for p in m.name.split("/") if p not in (".", "")]
+            if len(parts) < 2 or parts[0] != "memories":
+                continue
+            rel = "/".join(parts[1:])
+            raw = t.extractfile(m).read().decode("utf-8", errors="replace")
+            for entry in raw.split(MEMORY_ENTRY_DELIMITER):
+                entry = entry.strip()
+                if entry:
+                    result.add((rel, hashlib.sha1(entry.encode()).hexdigest()))
+    return result
+
 try:
     mine, theirs = keys(sys.argv[1]), keys(sys.argv[2])
+    mine_mem, theirs_mem = memory_keys(sys.argv[1]), memory_keys(sys.argv[2])
 except Exception as e:
     print(f"comparison failed: {e}", file=sys.stderr)
     raise SystemExit(2)
@@ -345,10 +383,16 @@ if mine is None:
     raise SystemExit(4)
 
 missing = theirs - mine
-if missing:
-    print(f"{len(missing)} message(s) exist only in the live snapshot", file=sys.stderr)
+missing_mem = theirs_mem - mine_mem
+if missing or missing_mem:
+    if missing:
+        print(f"{len(missing)} message(s) exist only in the live snapshot", file=sys.stderr)
+    if missing_mem:
+        print(f"{len(missing_mem)} memory entry/entries exist only in the live snapshot", file=sys.stderr)
     raise SystemExit(1)
-print(f"superset confirmed: {len(mine)} mine vs {len(theirs)} live, {len(mine - theirs)} added")
+print(f"superset confirmed: {len(mine)} mine vs {len(theirs)} live messages, "
+      f"{len(mine - theirs)} added; {len(mine_mem)} mine vs {len(theirs_mem)} live "
+      f"memory entries, {len(mine_mem - theirs_mem)} added")
 PY
 }
 
@@ -555,13 +599,30 @@ PY
 # format `name:hash` per line) is upstream's own record of which ones came from the image,
 # rewritten by every sync -- so it is correct no matter when sync ran, which a boot-time
 # listing would not be (sync runs twice: docker/stage2-hook.sh, then again inside
-# `hermes gateway run`). Validated against the real artifact in BOTH directions, not just
-# the convenient one: `apple-notes` is in it, `arch-brainstorm` is not.
+# `hermes gateway run`).
 #
-# Bundled skills nest one level under a category (skills/apple/apple-notes/), while the
-# manifest keys are flat basenames -- so the match is on the SKILL DIRECTORY NAME, not on
-# the path. That is safe from collisions because upstream's _create_skill refuses a name
-# that already exists in any skills dir.
+# THE KEY IS THE FRONTMATTER NAME, NOT THE DIRECTORY NAME -- openfathom-meta ENG-88.
+# A prior version of this comment claimed "the manifest keys are flat basenames -- so the
+# match is on the SKILL DIRECTORY NAME", validated only against `apple-notes`/`arch-brainstorm`
+# (a case where both happen to agree). That claim is false in general: tools/skills_sync.py
+# indexes the manifest by the `name:` field of SKILL.md's YAML frontmatter
+# (_read_skill_name), and upstream commit 503da4e30 (2026-07-23, "align skill directory
+# names with frontmatter name") renamed 4 bundled directories to match their frontmatter --
+# our image predates that commit, so those 4 (vllm, lm-evaluation-harness, audiocraft,
+# segment-anything at the time) sat in the manifest under a DIFFERENT key than their
+# on-disk directory name, the basename match always missed, and every boot re-deposited
+# them as if the agent had written them: measured, 20 objects in skills-inbox/, 1 genuine.
+# 14 more bundled/optional skills carry the same dir != frontmatter split today (all in
+# optional-skills/, e.g. peft -> peft-fine-tuning) -- latent until one is hub-installed.
+#
+# So the match below tries BOTH the directory basename and the frontmatter `name:`
+# against the manifest, mirroring upstream's own _read_skill_name (fallback = basename
+# when frontmatter has no name field or the file can't be read) -- plus a second
+# provenance table upstream also maintains and this function used to ignore entirely:
+# ~/.hermes/skills/.hub/lock.json (tools/skill_usage.py::_read_hub_installed_names),
+# which records skills installed via the Skills Hub rather than shipped in the image.
+# Safe from name collisions for the same reason upstream's own lookup is: _create_skill
+# refuses a name that already exists in any skills dir.
 #
 # NOTE this sweeps `service` mode only, and that is what makes the manifest sufficient:
 # on the Service our own OpenFathom skills live in $HERMES_HOME/openfathom-skills (read
@@ -573,6 +634,95 @@ PY
 # 72 that shipped in the image. Uploading all 72 into a review queue would train the
 # reviewer to ignore the queue, which is the failure this whole mechanism exists to
 # prevent. So: refuse, and say so.
+#
+# Self-contained (no import of tools/skills_sync.py or tools/skill_usage.py, both outside
+# the fork's 8-file scope -- ADR-002/035/050): re-derives the same frontmatter-name and
+# hub-lock lookups those modules already do, read-only, without patching or depending on
+# their internals. Prints one skill DIRECTORY PATH per line for every skill judged
+# agent-written (i.e. NOT bundled/hub-installed); the caller stages exactly those.
+of_skills_inbox_genuine_dirs() {
+  local skills="$1" manifest="$2"
+  python3 - "$skills" "$manifest" <<'PYEOF'
+import json
+import sys
+from pathlib import Path
+
+skills_root, manifest_path = Path(sys.argv[1]), Path(sys.argv[2])
+
+
+def read_skill_name(skill_md, fallback):
+    """Mirrors tools/skills_sync.py::_read_skill_name."""
+    try:
+        content = skill_md.read_text(encoding="utf-8", errors="replace")[:4000]
+    except OSError:
+        return fallback
+    in_frontmatter = False
+    for line in content.split("\n"):
+        stripped = line.strip()
+        if stripped == "---":
+            if in_frontmatter:
+                break
+            in_frontmatter = True
+            continue
+        if in_frontmatter and stripped.startswith("name:"):
+            value = stripped.split(":", 1)[1].strip().strip("\"'")
+            if value:
+                return value
+    return fallback
+
+
+def read_manifest_keys(path):
+    """Mirrors tools/skills_sync.py::_read_manifest (v1 and v2 formats)."""
+    keys = set()
+    if not path.exists():
+        return keys
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        name = line.partition(":")[0].strip() if ":" in line else line
+        if name:
+            keys.add(name)
+    return keys
+
+
+def read_hub_names(root):
+    """Mirrors tools/skill_usage.py::_read_hub_installed_names."""
+    lock_path = root / ".hub" / "lock.json"
+    if not lock_path.exists():
+        return set()
+    try:
+        data = json.loads(lock_path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return set()
+    installed = data.get("installed") if isinstance(data, dict) else None
+    if not isinstance(installed, dict):
+        return set()
+    return {str(k) for k in installed.keys()}
+
+
+manifest_keys = read_manifest_keys(manifest_path)
+hub_names = read_hub_names(skills_root)
+
+for skill_md in skills_root.rglob("SKILL.md"):
+    dir_path = skill_md.parent
+    if dir_path == skills_root:
+        # Same refusal as before: a SKILL.md at the root would stage the WHOLE tree.
+        print(f"WARN: ignoring a SKILL.md at the root of {skills_root}", file=sys.stderr)
+        continue
+    dirname = dir_path.name
+    frontmatter_name = read_skill_name(skill_md, dirname)
+    if (
+        dirname in manifest_keys
+        or frontmatter_name in manifest_keys
+        or dirname in hub_names
+        or frontmatter_name in hub_names
+    ):
+        continue
+    print(str(dir_path))
+PYEOF
+}
+
 of_skills_inbox_deposit() {
   local home="${HERMES_HOME:-/opt/data}" skills manifest stage tarball tok code obj n
   skills="$home/skills"
@@ -588,18 +738,11 @@ of_skills_inbox_deposit() {
   stage="/tmp/of-inbox-stage"; tarball="/tmp/of-inbox.tar.gz"
   rm -rf "$stage" "$tarball"; mkdir -p "$stage"
 
-  local skill_md dir name
-  while IFS= read -r skill_md; do
-    dir="$(dirname "$skill_md")"
-    # A SKILL.md sitting at the ROOT of skills/ would make name="skills" and stage the
-    # WHOLE tree -- the 72 bundled ones included. Not a shape upstream produces, but the
-    # blast radius is exactly what this function exists to avoid, so it is cheaper to
-    # refuse it than to reason about whether it can happen.
-    [[ "$dir" == "$skills" ]] && { echo "[of-inbox] WARN: ignoring a SKILL.md at the root of $skills" >&2; continue; }
+  local dir name
+  while IFS= read -r dir; do
     name="$(basename "$dir")"
-    grep -q "^${name}:" "$manifest" && continue
     cp -a "$dir" "$stage/$name" 2>/dev/null || echo "[of-inbox] WARN: could not stage $dir" >&2
-  done < <(find "$skills" -name SKILL.md -type f 2>/dev/null)
+  done < <(of_skills_inbox_genuine_dirs "$skills" "$manifest")
 
   n="$(find "$stage" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
   if [[ "$n" -eq 0 ]]; then
