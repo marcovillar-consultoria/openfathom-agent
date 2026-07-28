@@ -1066,6 +1066,17 @@ case "${HERMES_MODE:-service}" in
     # deployment of this image where a bare chat reply needs the model's full 64k.
     hermes config set model.max_tokens 12000
 
+    # openfathom-meta ENG-101. Never set, so production ran on the 5m default.
+    # Measured from a real session's session_model_usage (2026-07-28):
+    # cache_read 79.5% of input-side tokens, cache_write 20.5% -- and a 5m TTL
+    # write costs 1.25x base vs 0.1x for a read, a 12.5x penalty on whatever
+    # expires between Telegram turns. The write share, not the read share, is
+    # what a longer TTL targets; 1h write costs 2x instead, but amortizes
+    # across the paused-then-resumed conversation pattern this gateway sees.
+    # Unconditional, same reasoning as model.max_tokens above -- no deployment
+    # of this image benefits from the 5m default over 1h.
+    hermes config set prompt_caching.cache_ttl 1h
+
     if [[ -n "${HERMES_TIMEZONE:-}" ]]; then
       hermes config set timezone "${HERMES_TIMEZONE}"
     fi

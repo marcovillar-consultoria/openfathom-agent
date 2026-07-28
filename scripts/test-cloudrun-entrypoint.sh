@@ -503,6 +503,12 @@ check "stale 'display.language does not accept pt' claim is gone" \
 check "model.max_tokens set to a realistic ceiling, unconditionally" \
   "1" "$(grep -c 'hermes config set model.max_tokens 12000' "$ENTRYPOINT")"
 
+# openfathom-meta ENG-101: prompt_caching.cache_ttl 1h, so a >5-minute pause between
+# Telegram turns no longer forces a 1.25x cache write where a 0.1x cache read would do.
+# Structural check, same reasoning as model.max_tokens above.
+check "prompt_caching.cache_ttl set to 1h, unconditionally" \
+  "1" "$(grep -c 'hermes config set prompt_caching.cache_ttl 1h' "$ENTRYPOINT")"
+
 # ---------------------------------------------------------------------------
 # of_skill_usage_report (openfathom-meta ADR-053) -- derives the skill_invocations
 # log-based metric from the .usage.json sidecar Hermes already writes natively.
