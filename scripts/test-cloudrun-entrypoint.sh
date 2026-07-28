@@ -215,6 +215,74 @@ printf ' 4 2 \n' > "$EPOCH_HOME/.state_epoch"
 check "strips noise -> digits only" "42" "$(read_epoch)"
 rm -f "$EPOCH_HOME/.state_epoch"
 
+# ---------------------------------------------------------------------------
+# Memory comparison (openfathom-meta ENG-66). Before this, of_state_messages_superset
+# decided every promotion on messages alone -- memories/ rode along in the same tarball
+# with nothing checked, so a promotion could be a message-superset and a memory-SUBSET,
+# silently. Fixture below builds a minimal, identical state.db on both sides (so the
+# message half of the decision is a no-op) and varies only memories/MEMORY.md, split by
+# tools/memory_tool.py's own ENTRY_DELIMITER ("\n§\n") -- entry granularity, not
+# whole-file bytes, so append-only growth or reordering must not read as "changed".
+# ---------------------------------------------------------------------------
+mk_state_with_memory() { # mk_state_with_memory <out.tar.gz> <epoch> <memory-relpath> <entry> [entry ...]
+  local out="$1" epoch="$2" mem_rel="$3"; shift 3
+  local d; d="$(mktemp -d -p "$WORK")"
+  printf '%s\n' "$epoch" > "$d/.state_epoch"
+  python3 - "$d/state.db" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("create table messages (id integer primary key, session_id text, role text, "
+            "content text, timestamp real)")
+con.execute("insert into messages (id, session_id, role, content, timestamp) "
+            "values (1, 's1', 'user', 'hello', 100)")
+con.commit(); con.close()
+PY
+  mkdir -p "$d/memories/$(dirname "$mem_rel")"
+  local content="" e
+  for e in "$@"; do
+    [[ -n "$content" ]] && content+=$'\n§\n'
+    content+="$e"
+  done
+  printf '%s' "$content" > "$d/memories/$mem_rel"
+  tar czf "$out" -C "$d" .
+}
+
+echo "== case 8: memory superset, messages equal -> PROMOTES =="
+reset_stub
+mk_state_with_memory "$MINE"   3 "MEMORY.md" "user prefers pt-BR" "runs make check before push"
+mk_state_with_memory "$THEIRS" 3 "MEMORY.md" "user prefers pt-BR"
+LIVE="$THEIRS"; of_state_epoch=3
+out="$(run_promote "$MINE")"; echo "$out" | sed 's/^/    | /'
+check "promoted"                        "yes" "$(promoted)"
+check "mentions memory entries in the summary" "1" "$(echo "$out" | grep -c 'memory entries')"
+
+echo "== case 9: memory divergence, messages equal -> does NOT promote (the ENG-66 gap) =="
+reset_stub
+mk_state_with_memory "$MINE"   3 "MEMORY.md" "user prefers pt-BR"
+mk_state_with_memory "$THEIRS" 3 "MEMORY.md" "user prefers pt-BR" "LIVE-ONLY memory entry"
+LIVE="$THEIRS"; of_state_epoch=3
+out="$(run_promote "$MINE")"; echo "$out" | sed 's/^/    | /'
+check "not promoted (messages alone would have said yes)" "no" "$(promoted)"
+check "names memory as the reason"      "1"   "$(echo "$out" | grep -c 'memory entry/entries exist only in the live snapshot')"
+
+echo "== case 10: same entries, different order/whitespace -> still PROMOTES (entry-level, not whole-file)=="
+reset_stub
+mk_state_with_memory "$MINE"   3 "MEMORY.md" "  runs make check before push  " "user prefers pt-BR"
+mk_state_with_memory "$THEIRS" 3 "MEMORY.md" "user prefers pt-BR" "runs make check before push"
+LIVE="$THEIRS"; of_state_epoch=3
+out="$(run_promote "$MINE")"; echo "$out" | sed 's/^/    | /'
+check "promoted despite reordering/whitespace" "yes" "$(promoted)"
+
+setup_memory_would_be_lost() {
+  mk_state_with_memory "$MINE"   3 "MEMORY.md" "only-mine"
+  mk_state_with_memory "$THEIRS" 3 "MEMORY.md" "only-mine" "LIVE-ONLY, would be lost"
+  LIVE="$THEIRS"; of_state_epoch=3
+}
+echo "== MUTANT: memory comparison removed (the pre-ENG-66 behaviour) =="
+mutant "memory check removed" \
+  's|missing_mem = theirs_mem - mine_mem|missing_mem = set()|' \
+  setup_memory_would_be_lost "yes" "missing_mem = set()"
+
 echo "== structural: promotion is wired AFTER the conflict is parked =="
 # The ordering is the entire safety argument -- any interruption must leave the state
 # parked exactly as before. A unit test cannot observe ordering inside of_state_snapshot,
@@ -565,6 +633,89 @@ if grep -q 'missing = \[\]' "$WORK/caps-mut.sh"; then
     "1" "$(awk '/^Disponíveis:/{f=1;next}/^Carregadas/{f=0}f' <<<"$mut_out" | grep -c '^- pr-triage$')"
 else
   bad "capabilities mutant did not apply -- a mutant that does not mutate proves nothing"
+fi
+
+# ---------------------------------------------------------------------------
+# of_skills_inbox_genuine_dirs (openfathom-meta ENG-88) -- the Dogma 5 review-queue
+# discriminator. Extracted standalone, same style as of_skill_usage_report above.
+# Regression target: a skill's on-disk DIRECTORY NAME can differ from the `name:`
+# in its own SKILL.md frontmatter (upstream renamed 4 bundled skills this way on
+# 2026-07-23, commit 503da4e30) -- the OLD basename-only match against
+# .bundled_manifest (keyed by frontmatter name) missed all four, every boot,
+# depositing them into skills-inbox/ as if the agent had written them (measured:
+# 20 objects, 1 genuine). No network stub needed: this function never touches
+# curl/of_metadata_token, only stdout/stderr.
+# ---------------------------------------------------------------------------
+echo "== case: of_skills_inbox_genuine_dirs =="
+INBOX_FN="$WORK/inbox.sh"
+awk '/^of_skills_inbox_genuine_dirs\(\) \{/{p=1} p{print} p&&/^\}$/{exit}' "$ENTRYPOINT" > "$INBOX_FN"
+grep -q "of_skills_inbox_genuine_dirs() {" "$INBOX_FN" || { echo "FATAL: of_skills_inbox_genuine_dirs extraction failed" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$INBOX_FN"
+
+INBOX_SKILLS="$WORK/inbox-skills"
+mk_inbox_skill() { # mk_inbox_skill <relative-dir-under-skills> <frontmatter-name>
+  local rel="$1" fmname="$2"
+  local dir="$INBOX_SKILLS/skills/$rel"
+  mkdir -p "$dir"
+  printf -- '---\nname: %s\ndescription: "test"\n---\nbody\n' "$fmname" > "$dir/SKILL.md"
+}
+
+rm -rf "$INBOX_SKILLS"; mkdir -p "$INBOX_SKILLS/skills"
+# Bundled, dir name MATCHES frontmatter -- the convenient case the old comment
+# validated against ("apple-notes").
+mk_inbox_skill "apple/apple-notes" "apple-notes"
+# Bundled, dir name DIFFERS from frontmatter -- the ENG-88 shape (vllm on disk,
+# "serving-llms-vllm" in the manifest, the real pre-503da4e30 pair).
+mk_inbox_skill "mlops/vllm" "serving-llms-vllm"
+# Installed via the Skills Hub, not in .bundled_manifest at all, but IS in
+# .hub/lock.json -- a second provenance table the old code never consulted.
+mk_inbox_skill "optional-skills-installed/peft" "peft-fine-tuning"
+mkdir -p "$INBOX_SKILLS/skills/.hub"
+printf '{"installed": {"peft-fine-tuning": {"install_path": "optional-skills-installed/peft"}}}\n' \
+  > "$INBOX_SKILLS/skills/.hub/lock.json"
+# The one that should actually be flagged: not in the manifest, not in the hub
+# lock, under either name.
+mk_inbox_skill "machine-written-genuine" "machine-written-genuine"
+
+INBOX_MANIFEST="$INBOX_SKILLS/skills/.bundled_manifest"
+printf 'apple-notes:aaa\nserving-llms-vllm:bbb\n' > "$INBOX_MANIFEST"
+
+out="$(of_skills_inbox_genuine_dirs "$INBOX_SKILLS/skills" "$INBOX_MANIFEST" 2>"$WORK/inbox.stderr")"
+echo "$out" | sed 's/^/    | /'
+check "bundled, dir name == frontmatter -> NOT flagged" \
+  "0" "$(grep -c '/apple/apple-notes$' <<<"$out")"
+check "bundled, dir name != frontmatter -> NOT flagged (the ENG-88 regression)" \
+  "0" "$(grep -c '/mlops/vllm$' <<<"$out")"
+check "hub-installed skill -> NOT flagged" \
+  "0" "$(grep -c '/optional-skills-installed/peft$' <<<"$out")"
+check "genuine agent-written skill -> IS flagged" \
+  "1" "$(grep -c '/machine-written-genuine$' <<<"$out")"
+check "exactly one path flagged total" \
+  "1" "$(grep -c . <<<"$out")"
+
+echo "== case: of_skills_inbox_genuine_dirs -- SKILL.md at the root of skills/ =="
+rm -rf "$WORK/inbox-root"; mkdir -p "$WORK/inbox-root/skills"
+printf -- '---\nname: root-skill\n---\nbody\n' > "$WORK/inbox-root/skills/SKILL.md"
+: > "$WORK/inbox-root/manifest"
+root_out="$(of_skills_inbox_genuine_dirs "$WORK/inbox-root/skills" "$WORK/inbox-root/manifest" 2>"$WORK/inbox-root.stderr")"
+check "root SKILL.md -> not staged (would sweep the whole tree)" "" "$root_out"
+check "root SKILL.md -> warns on stderr, not stdout" \
+  "1" "$(grep -c 'ignoring a SKILL.md at the root' "$WORK/inbox-root.stderr")"
+
+echo "== MUTANT: of_skills_inbox_genuine_dirs without the frontmatter-name fallback =="
+# Reverts the match to basename-only against the manifest -- the exact bug measured
+# in production (ENG-88): a bundled skill whose directory name differs from its
+# frontmatter name is then indistinguishable from one the agent wrote.
+sed 's/frontmatter_name = read_skill_name(skill_md, dirname)/frontmatter_name = dirname/' \
+  "$INBOX_FN" > "$WORK/inbox-mut.sh"
+if grep -q 'frontmatter_name = dirname$' "$WORK/inbox-mut.sh"; then
+  mut_out="$( ( source "$WORK/inbox-mut.sh"
+    of_skills_inbox_genuine_dirs "$INBOX_SKILLS/skills" "$INBOX_MANIFEST" 2>/dev/null ) )"
+  check "guard removed -> the dir!=frontmatter bundled skill now leaks as genuine (proves the fix is load-bearing)" \
+    "1" "$(grep -c '/mlops/vllm$' <<<"$mut_out")"
+else
+  bad "inbox mutant did not apply -- a mutant that does not mutate proves nothing"
 fi
 
 echo
