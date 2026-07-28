@@ -92,6 +92,12 @@
 #   HERMES_STATE_OBJECT  optional -- object name inside that bucket. Default
 #                   gateway-state.tar.gz. Must not contain `/` (it goes into a URL
 #                   path segment unescaped).
+#   HERMES_MEMORIES_OBJECT  optional, service mode -- openfathom-meta ENG-103. Object
+#                   name for memories/ (MEMORY.md, USER.md), inside the SAME bucket as
+#                   HERMES_STATE_OBJECT but its own independent compare-and-swap. Default
+#                   memories.tar.gz. Split out of the combined state tarball so a
+#                   memory-only write conflict no longer competes with, or waits on,
+#                   messages' much higher write-conflict rate.
 set -euo pipefail
 
 # --- State persistence (ENG-45) ---------------------------------------------
@@ -469,6 +475,110 @@ except Exception: print(0)' 2>/dev/null || echo 0)"
   esac
 }
 
+# openfathom-meta ENG-103. Called on a 412 BEFORE giving up: copies into $1 (a live
+# state.db path, writable) every message that exists only in $2 (a downloaded live
+# tarball), so a retried conditional upload has a chance to succeed instead of parking
+# on the first genuine divergence. Read-only comparison is of_state_messages_superset
+# above; this one writes.
+#
+# hermes_state.py declares `messages.session_id TEXT NOT NULL REFERENCES sessions(id)`
+# and opens its connection with `PRAGMA foreign_keys=ON` (hermes_state.py:1995) -- a
+# message copied without its session row violates the FK on the next real boot, even if
+# this staging copy's own connection does not happen to enforce it. So the session row
+# is copied first, `INSERT OR IGNORE` (never overwriting a session the destination
+# already has).
+#
+# `id` is NEVER copied -- same reason of_state_messages_superset never compares on it:
+# autoincrement, reused across diverging databases. Letting the destination assign a
+# fresh id also means messages_fts/messages_fts_trigram's own `AFTER INSERT` triggers
+# (keyed on `new.id`) fire correctly with no special handling.
+#
+# Column set is the INTERSECTION of both sides' schemas (a deploy can straddle two
+# schema versions), never a hardcoded list -- the schema carries ~20 columns beyond the
+# 4-column dedup key. If the 4 key columns are not all in that intersection, the schemas
+# are too divergent to merge safely: fail closed (non-zero exit), the caller parks
+# exactly as before this function existed.
+of_state_merge_messages() {
+  python3 - "$1" "$2" <<'PY'
+import sys, tarfile, sqlite3, hashlib, os, tempfile
+
+dest_path, live_tarball = sys.argv[1], sys.argv[2]
+
+def extract_live_db(tarball_path):
+    with tarfile.open(tarball_path) as t:
+        m = next((x for x in t.getmembers()
+                  if os.path.basename(x.name) == "state.db" and x.isfile()), None)
+        if m is None:
+            return None
+        fd, tmp = tempfile.mkstemp(suffix=".db")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(t.extractfile(m).read())
+        return tmp
+
+def cols(con, table):
+    return [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
+
+live_db = extract_live_db(live_tarball)
+if live_db is None:
+    print("live tarball has no state.db -- nothing to merge", file=sys.stderr)
+    raise SystemExit(3)
+
+try:
+    dest = sqlite3.connect(dest_path)
+    dest.execute(f"ATTACH DATABASE ? AS live_attach", (live_db,))
+    dest.execute("PRAGMA foreign_keys=ON")
+
+    dest_msg_cols = cols(dest, "messages")
+    live_msg_cols = set(r[1] for r in dest.execute("PRAGMA live_attach.table_info(messages)"))
+    common_msg = [c for c in dest_msg_cols if c in live_msg_cols and c != "id"]
+    REQUIRED = {"session_id", "role", "content", "timestamp"}
+    if not REQUIRED.issubset(set(common_msg)):
+        print(f"schema too divergent to merge safely (missing {REQUIRED - set(common_msg)})",
+              file=sys.stderr)
+        raise SystemExit(4)
+
+    dest_sess_cols = cols(dest, "sessions")
+    live_sess_cols = set(r[1] for r in dest.execute("PRAGMA live_attach.table_info(sessions)"))
+    common_sess = [c for c in dest_sess_cols if c in live_sess_cols]
+
+    dest_keys = {
+        (s, r, ts, hashlib.sha1((c or "").encode()).hexdigest())
+        for s, r, c, ts in dest.execute(
+            "select session_id, role, content, timestamp from messages")
+    }
+
+    col_list = ", ".join(common_msg)
+    sess_col_list = ", ".join(common_sess)
+    merged_msgs = merged_sess = 0
+
+    for row in dest.execute(
+            f"select id, {col_list} from live_attach.messages").fetchall():
+        live_id = row[0]
+        rec = dict(zip(common_msg, row[1:]))
+        key = (rec["session_id"], rec["role"], rec["timestamp"],
+               hashlib.sha1((rec.get("content") or "").encode()).hexdigest())
+        if key in dest_keys:
+            continue
+        before = dest.execute("select total_changes()").fetchone()[0]
+        dest.execute(
+            f"insert or ignore into sessions ({sess_col_list}) "
+            f"select {sess_col_list} from live_attach.sessions where id = ?",
+            (rec["session_id"],))
+        merged_sess += dest.execute("select total_changes()").fetchone()[0] - before
+        dest.execute(
+            f"insert into messages ({col_list}) "
+            f"select {col_list} from live_attach.messages where id = ?", (live_id,))
+        merged_msgs += 1
+        dest_keys.add(key)
+
+    dest.commit()
+    print(f"[of-state-merge] merged {merged_msgs} message(s), {merged_sess} session(s) "
+          f"from the live snapshot")
+finally:
+    os.unlink(live_db)
+PY
+}
+
 # Runs after `hermes` has exited, so every *.db is closed and WAL-checkpointed and
 # a plain tar of it is consistent. `VACUUM INTO` is still used for the .db files:
 # it is the one documented way to get a consistent single-file copy even if hermes
@@ -477,6 +587,94 @@ except Exception: print(0)' 2>/dev/null || echo 0)"
 # Excludes are caches and logs -- re-derivable, and `.cache/uv` alone is 209
 # objects. `skills/` is excluded because the image re-syncs bundled skills into it
 # on every boot anyway.
+# openfathom-meta ENG-103. Uploads $2 (a tarball built from staging dir $1) to
+# HERMES_STATE_OBJECT with a compare-and-swap (ifGenerationMatch=of_state_generation).
+# On a 412 -- the object moved since this instance restored -- instead of parking
+# immediately (the old behaviour, ADR-049), it downloads the live object, merges its
+# messages into $1/state.db (of_state_merge_messages), re-tars, and retries the
+# conditional write against the freshly-read generation, up to
+# OF_STATE_MERGE_MAX_ATTEMPTS times. Only once that is exhausted (or a step along the
+# way itself fails: live epoch newer, download fails, merge fails) does it fall back to
+# the original park + of_state_try_promote path -- UNCHANGED, still the final safety
+# net for genuine, unmergeable contention.
+of_state_snapshot_upload() {
+  local stage="$1" tarball="$2" tok="$3"
+  local max_attempts="${OF_STATE_MERGE_MAX_ATTEMPTS:-3}"
+  local gen="${of_state_generation:-0}" attempt=0 code
+
+  while :; do
+    attempt=$((attempt + 1))
+    code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 60 -X POST \
+      -H "Authorization: Bearer ${tok}" -H "Content-Type: application/gzip" \
+      --data-binary "@${tarball}" \
+      "https://storage.googleapis.com/upload/storage/v1/b/${HERMES_STATE_BUCKET}/o?uploadType=media&name=${HERMES_STATE_OBJECT}&ifGenerationMatch=${gen}" \
+      || echo 000)"
+
+    if [[ "$code" == "200" ]]; then
+      echo "[of-state] snapshot uploaded to gs://${HERMES_STATE_BUCKET}/${HERMES_STATE_OBJECT} (attempt ${attempt}, generation matched ${gen})"
+      return 0
+    fi
+    if [[ "$code" != "412" ]]; then
+      echo "[of-state] ERROR: snapshot upload failed (HTTP ${code}); THIS SESSION IS LOST" >&2
+      return 0
+    fi
+    if [[ "$attempt" -ge "$max_attempts" ]]; then
+      echo "[of-state] WARN: still conflicting after ${attempt} attempt(s) -- parking" >&2
+      break
+    fi
+
+    echo "[of-state] WARN: gs://${HERMES_STATE_BUCKET}/${HERMES_STATE_OBJECT} changed since this instance restored (attempt ${attempt}/${max_attempts}, generation ${gen}) -- merging instead of parking" >&2
+    local live="/tmp/of-state-live-merge.tar.gz" live_code
+    live_code="$(curl -sS -o "$live" -w '%{http_code}' --max-time 20 \
+      -H "Authorization: Bearer ${tok}" \
+      "https://storage.googleapis.com/storage/v1/b/${HERMES_STATE_BUCKET}/o/${HERMES_STATE_OBJECT}?alt=media" || echo 000)"
+    if [[ "$live_code" != "200" ]]; then
+      echo "[of-state] WARN: could not download live snapshot to merge (HTTP ${live_code}) -- parking" >&2
+      rm -f "$live"; break
+    fi
+
+    local live_epoch; live_epoch="$(of_state_tarball_epoch "$live")"
+    if [[ "${of_state_epoch:-0}" -lt "$live_epoch" ]]; then
+      echo "[of-state] WARN: live epoch ${live_epoch} is newer than ours (${of_state_epoch:-0}) -- a deliberate reset happened, NOT merging. Parking." >&2
+      rm -f "$live"; break
+    fi
+
+    if ! of_state_merge_messages "$stage/state.db" "$live"; then
+      echo "[of-state] WARN: merge failed -- parking" >&2
+      rm -f "$live"; break
+    fi
+    rm -f "$live"
+
+    tar czf "$tarball" -C "$stage" . || { echo "[of-state] ERROR: re-tar after merge failed; SESSION LOST" >&2; return 0; }
+
+    gen="$(curl -sS --max-time 20 -H "Authorization: Bearer ${tok}" \
+      "https://storage.googleapis.com/storage/v1/b/${HERMES_STATE_BUCKET}/o/${HERMES_STATE_OBJECT}" 2>/dev/null \
+      | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("generation") or 0)
+except Exception: print(0)' 2>/dev/null || echo 0)"
+    if [[ -z "$gen" || "$gen" == "0" ]]; then
+      echo "[of-state] WARN: could not re-read the live generation -- parking" >&2
+      break
+    fi
+  done
+
+  # Exhausted or aborted: park exactly as before this function existed, then let
+  # of_state_try_promote have the final say -- it independently re-checks the three
+  # guards (live exists, epoch not regressed, superset), so it stays correct even
+  # though this loop already tried a merge.
+  local conflict="${HERMES_STATE_OBJECT%.tar.gz}.conflict-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 60 -X POST \
+    -H "Authorization: Bearer ${tok}" -H "Content-Type: application/gzip" \
+    --data-binary "@${tarball}" \
+    "https://storage.googleapis.com/upload/storage/v1/b/${HERMES_STATE_BUCKET}/o?uploadType=media&name=${conflict}" || echo 000)"
+  if [[ "$code" == "200" ]]; then
+    echo "[of-state] conflict snapshot parked at gs://${HERMES_STATE_BUCKET}/${conflict} -- BOTH states survive" >&2
+    of_state_try_promote "$tarball" "$conflict" "$tok"
+  else
+    echo "[of-state] ERROR: conflict snapshot upload failed (HTTP ${code}); THIS SESSION IS LOST" >&2
+  fi
+}
+
 of_state_snapshot() {
   local home="${HERMES_HOME:-/opt/data}" stage="/tmp/of-state-stage" tarball="/tmp/of-state-snap.tar.gz" tok code
   rm -rf "$stage" "$tarball"; mkdir -p "$stage"
@@ -508,9 +706,14 @@ PY
   #                             re-synced every boot so the manifest never matches and
   #                             it is discarded and rebuilt regardless
   local p
-  for p in memories plans pairing cron; do
+  for p in plans pairing cron; do
     [[ -e "$home/$p" ]] && cp -a "$home/$p" "$stage/$p"
   done
+  # openfathom-meta ENG-103. memories/ used to be copied here too, into the same tarball
+  # and the same compare-and-swap as messages. It now has its own object and its own CAS
+  # (of_memories_snapshot) -- a memory-only conflict no longer competes with, or waits
+  # on, the message tarball's much higher write-conflict rate.
+  #
   # openfathom-meta ADR-049. Carry the epoch we booted with into the tarball we write.
   # A deliberate wipe bumps this (see the reset runbook); an instance still holding the
   # older epoch is then refused promotion, which is the only reason deleting on purpose
@@ -532,46 +735,309 @@ PY
   # ifGenerationMatch turns that into a refusal: we write only if the object is
   # still at the generation we restored from (0 = "no live version existed"). GCS
   # answers 412 when it moved, which is exactly the case where writing would
-  # destroy. We then park the snapshot in a conflict object instead of dropping it
-  # -- neither side is lost, and the log says so.
-  #
-  # This does NOT fix the ordering (the incoming revision still starts stale); it
-  # fixes the destruction. The ordering has no fix from in here: hermes holds the
-  # SQLite connection open for the process lifetime, so re-restoring underneath a
-  # running gateway is the documented corruption path, and restarting it would cost
-  # a ~21s outage plus dropped requests. At min=0 -- the ADR-039 target -- the
-  # overlap does not arise at all: the instance dies whole, then a later request
-  # cold-starts and restores.
-  local url="https://storage.googleapis.com/upload/storage/v1/b/${HERMES_STATE_BUCKET}/o?uploadType=media&name=${HERMES_STATE_OBJECT}&ifGenerationMatch=${of_state_generation:-0}"
-  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 60 -X POST \
-    -H "Authorization: Bearer ${tok}" -H "Content-Type: application/gzip" \
-    --data-binary "@${tarball}" "$url" || echo 000)"
+  # destroy. openfathom-meta ENG-103: of_state_snapshot_upload now retries with a
+  # merge before falling back to parking -- see that function for the full contract.
+  of_state_snapshot_upload "$stage" "$tarball" "$tok"
+  rm -rf "$stage" "$tarball"
+}
 
-  if [[ "$code" == "412" ]]; then
-    local conflict="${HERMES_STATE_OBJECT%.tar.gz}.conflict-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
-    echo "[of-state] WARN: snapshot NOT written -- gs://${HERMES_STATE_BUCKET}/${HERMES_STATE_OBJECT} changed since this instance restored (generation ${of_state_generation:-0})." >&2
-    echo "[of-state] WARN: another revision wrote a newer snapshot; overwriting it would destroy it. Parking this one at ${conflict} instead." >&2
-    code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 60 -X POST \
+# openfathom-meta ENG-103. Shared GET-then-parse-generation idiom for the memories
+# functions below, several of which need to read an object's current GCS generation.
+# NOT applied to the of_state_* call sites that already inline this same idiom (in
+# of_state_restore, of_state_try_promote, of_state_snapshot_upload) -- those predate this
+# helper, and touching already-tested code for a pure DRY gain is out of scope here.
+of_gcs_read_generation() {
+  local bucket="$1" object="$2" tok="$3"
+  curl -sS --max-time 15 -H "Authorization: Bearer ${tok}" \
+    "https://storage.googleapis.com/storage/v1/b/${bucket}/o/${object}" 2>/dev/null \
+    | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("generation") or 0)
+except Exception: print(0)' 2>/dev/null || echo 0
+}
+
+# openfathom-meta ENG-103. Union-merge every memory entry under $2 (src_dir) into $1
+# (dest_dir), by entry content -- ENTRY_DELIMITER = "\n§\n", the same split
+# tools/memory_tool.py uses (confirmed at tools/memory_tool.py:69,866-874). Only ADDS
+# entries dest does not already have; never removes or reorders dest's own entries, so
+# two instances that each wrote independently converge to the union with no "winner" to
+# pick -- a memory entry that exists on both sides with different wording is simply kept
+# as two distinct entries, not coalesced. Writes with the SAME atomic temp-file+rename
+# pattern tools/memory_tool.py::_write_file uses, for the same reason: a reader must
+# never observe a half-written file.
+#
+# EXCLUDED, never treated as a mergeable entry file:
+#   - `*.lock`       -- tools/memory_tool.py's own per-file lock, transient by construction
+#   - `.mem_*.tmp`   -- its atomic-write staging file, same reason
+#   - `.memories_epoch` -- this mechanism's OWN control file (see of_memories_tarball_epoch
+#     below). Unioning it as if it were prose would append two integers with the entry
+#     delimiter and corrupt the one thing that must read back as a bare integer -- the
+#     exact bug class that took production down once already for `.state_epoch` (see
+#     of_state_read_local_epoch above). Epoch is written directly by the caller, never by
+#     this function.
+#
+# Absence of src_dir is not an error (first boot, before any memories snapshot exists);
+# dest_dir is created if missing.
+of_memory_union() {
+  python3 - "$1" "$2" <<'PY'
+import sys, os, tempfile
+
+dest_dir, src_dir = sys.argv[1], sys.argv[2]
+DELIM = "\n§\n"  # tools/memory_tool.py::ENTRY_DELIMITER == "\n§\n"
+
+def entries_of(path):
+    if not os.path.isfile(path):
+        return []
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        raw = fh.read()
+    return [e.strip() for e in raw.split(DELIM) if e.strip()]
+
+def excluded(rel):
+    base = os.path.basename(rel)
+    if base.endswith(".lock"):
+        return True
+    if base.startswith(".mem_") and base.endswith(".tmp"):
+        return True
+    if rel == ".memories_epoch":
+        return True
+    return False
+
+if not os.path.isdir(src_dir):
+    raise SystemExit(0)
+
+os.makedirs(dest_dir, exist_ok=True)
+merged_entries = merged_files = 0
+for root, _dirs, files in os.walk(src_dir):
+    for name in files:
+        src_path = os.path.join(root, name)
+        rel = os.path.relpath(src_path, src_dir)
+        if excluded(rel):
+            continue
+        dest_path = os.path.join(dest_dir, rel)
+        dest_entries = entries_of(dest_path)
+        src_entries = entries_of(src_path)
+        seen = set(dest_entries)
+        added = [e for e in src_entries if e not in seen]
+        if not added:
+            continue
+        merged = dest_entries + added
+        dest_parent = os.path.dirname(dest_path) or dest_dir
+        os.makedirs(dest_parent, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=dest_parent, prefix=".mem_", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(DELIM.join(merged))
+            os.replace(tmp, dest_path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        merged_entries += len(added)
+        merged_files += 1
+print(f"[of-memory-union] merged {merged_entries} new entry/entries across {merged_files} file(s)")
+PY
+}
+
+# openfathom-meta ENG-103. Same contract as of_state_tarball_epoch, but reads
+# `.memories_epoch` instead of `.state_epoch` -- memories now travel in their own
+# tarball with their own epoch, independent of the messages/plans/pairing/cron one.
+of_memories_tarball_epoch() {
+  python3 - "$1" <<'PY' 2>/dev/null || echo 0
+import sys, tarfile, os
+try:
+    with tarfile.open(sys.argv[1]) as t:
+        m = next((x for x in t.getmembers()
+                  if os.path.basename(x.name) == ".memories_epoch" and x.isfile()), None)
+        if m is None:
+            print(0); raise SystemExit(0)
+        raw = t.extractfile(m).read().decode("utf-8", "replace").strip()
+    print(int(raw) if raw.isdigit() else 0)
+except Exception:
+    print(0)
+PY
+}
+
+# openfathom-meta ENG-103. Restores memories/ from its OWN object (HERMES_MEMORIES_OBJECT),
+# independent of of_state_restore -- a memories-only conflict no longer competes with the
+# much higher write-conflict rate of the messages tarball.
+#
+# Called AFTER of_state_restore (which may still extract a memories/ directory out of a
+# LEGACY combined tarball written before this split existed) and BEFORE of_write_soul.
+# UNION, never overwrite: whatever of_state_restore already put on disk from a legacy
+# tarball is the destination; what THIS object holds is the source. Union is commutative,
+# so there is no "which one wins" question at boot (unlike
+# of_memories_write_with_merge_retry, where the epoch guard exists precisely because a
+# decision has to be made about resurrection).
+#
+# Best-effort by design, same as of_state_restore (Dogma 2): a gateway that boots with
+# fewer memories than it should is degraded, not down.
+of_memories_restore() {
+  local tok code tarball="/tmp/of-memories-restore.tar.gz"
+  local mem_dir="${HERMES_HOME:-/opt/data}/memories"
+  tok="$(of_metadata_token)" || { echo "[of-memories] WARN: no metadata token; starting with restored state only" >&2; return 0; }
+
+  of_memories_generation="$(of_gcs_read_generation "$HERMES_STATE_BUCKET" "$HERMES_MEMORIES_OBJECT" "$tok")"
+
+  code="$(curl -sS -o "$tarball" -w '%{http_code}' --max-time 30 \
+    -H "Authorization: Bearer ${tok}" \
+    "https://storage.googleapis.com/storage/v1/b/${HERMES_STATE_BUCKET}/o/${HERMES_MEMORIES_OBJECT}?alt=media" || echo 000)"
+  case "$code" in
+    200) ;;
+    404) echo "[of-memories] no memories snapshot yet (first boot)"; rm -f "$tarball"; return 0 ;;
+    *)   echo "[of-memories] WARN: memories restore failed (HTTP ${code}); starting with restored state only" >&2; rm -f "$tarball"; return 0 ;;
+  esac
+
+  local extract_dir; extract_dir="$(mktemp -d)"
+  if tar xzf "$tarball" -C "$extract_dir" 2>/dev/null; then
+    of_memory_union "$mem_dir" "$extract_dir"
+    echo "[of-memories] merged memories from gs://${HERMES_STATE_BUCKET}/${HERMES_MEMORIES_OBJECT}"
+  else
+    echo "[of-memories] WARN: memories snapshot present but did not extract" >&2
+  fi
+  rm -rf "$extract_dir" "$tarball"
+}
+
+# openfathom-meta ENG-103. Retry-with-merge for the memories CAS, same shape as
+# of_state_snapshot_upload but simpler: the merge step (of_memory_union) is safe and
+# commutative by construction, so it never "fails" the way a message merge can on
+# divergent schema -- the only way this loop runs out is persistent generation
+# contention. On exhaustion (or an aborted guard) it gives up THIS cycle rather than
+# parking a conflict object: memories are re-synced every
+# HERMES_MEMORY_SYNC_INTERVAL_SECONDS (Passo 3), so the next tick retries from a fresh
+# generation read. The one case this leaves exposed -- persistent contention on the
+# FINAL, shutdown-triggered call, with no next tick to retry on -- is accepted: periodic
+# ticks already carried forward everything older than one interval, so at most the last
+# interval's worth of entries is at risk, never the whole session's memory.
+of_memories_write_with_merge_retry() {
+  local mem_dir="$1" tarball="$2" tok="$3"
+  local max_attempts="${OF_STATE_MERGE_MAX_ATTEMPTS:-3}"
+  local gen="${of_memories_generation:-0}" attempt=0 code
+
+  while :; do
+    attempt=$((attempt + 1))
+    code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 -X POST \
       -H "Authorization: Bearer ${tok}" -H "Content-Type: application/gzip" \
       --data-binary "@${tarball}" \
-      "https://storage.googleapis.com/upload/storage/v1/b/${HERMES_STATE_BUCKET}/o?uploadType=media&name=${conflict}" || echo 000)"
+      "https://storage.googleapis.com/upload/storage/v1/b/${HERMES_STATE_BUCKET}/o?uploadType=media&name=${HERMES_MEMORIES_OBJECT}&ifGenerationMatch=${gen}" \
+      || echo 000)"
+
     if [[ "$code" == "200" ]]; then
-      echo "[of-state] conflict snapshot parked at gs://${HERMES_STATE_BUCKET}/${conflict} -- BOTH states survive" >&2
-      # openfathom-meta ADR-049. The state is safe on the line above; everything past this
-      # point can only improve on it. Measured on 2026-07-20, the common case here is not
-      # divergence at all -- it is this instance holding strictly MORE than the live object
-      # and being refused anyway, because "the generation moved" is only a proxy for "I
-      # would destroy something". of_state_try_promote checks the real question.
-      of_state_try_promote "$tarball" "$conflict" "$tok"
-    else
-      echo "[of-state] ERROR: conflict snapshot upload failed (HTTP ${code}); THIS SESSION IS LOST" >&2
+      echo "[of-memories] snapshot uploaded to gs://${HERMES_STATE_BUCKET}/${HERMES_MEMORIES_OBJECT} (attempt ${attempt}, generation matched ${gen})"
+      # Carry the new generation forward into the GLOBAL (no `local` -- same reason
+      # of_state_generation is not local) so the NEXT periodic tick (Passo 3) targets it.
+      # Without this every subsequent cycle would still CAS against the generation this
+      # instance started with, which the object has already moved past, and would 412
+      # into an unnecessary merge forever.
+      of_memories_generation="$(of_gcs_read_generation "$HERMES_STATE_BUCKET" "$HERMES_MEMORIES_OBJECT" "$tok")"
+      return 0
     fi
-  elif [[ "$code" == "200" ]]; then
-    echo "[of-state] snapshot uploaded to gs://${HERMES_STATE_BUCKET}/${HERMES_STATE_OBJECT} ($(stat -c%s "$tarball") bytes, generation matched ${of_state_generation:-0})"
-  else
-    echo "[of-state] ERROR: snapshot upload failed (HTTP ${code}); THIS SESSION IS LOST" >&2
-  fi
+    if [[ "$code" != "412" ]]; then
+      echo "[of-memories] ERROR: snapshot upload failed (HTTP ${code}); this cycle's memories are lost" >&2
+      return 0
+    fi
+    if [[ "$attempt" -ge "$max_attempts" ]]; then
+      echo "[of-memories] WARN: still conflicting after ${attempt} attempt(s) -- giving up this cycle" >&2
+      return 0
+    fi
+
+    echo "[of-memories] WARN: gs://${HERMES_STATE_BUCKET}/${HERMES_MEMORIES_OBJECT} changed since last read (attempt ${attempt}/${max_attempts}, generation ${gen}) -- merging" >&2
+    # mktemp, not a fixed name: this loop's own SIGTERM-vs-final-flush race (see
+    # of_memories_snapshot below) means two invocations of this function can be in
+    # flight at once -- a fixed path here would let one instance's `rm -f` race the
+    # other's `curl -o`.
+    local live live_code; live="$(mktemp --suffix=.tar.gz)"
+    live_code="$(curl -sS -o "$live" -w '%{http_code}' --max-time 15 \
+      -H "Authorization: Bearer ${tok}" \
+      "https://storage.googleapis.com/storage/v1/b/${HERMES_STATE_BUCKET}/o/${HERMES_MEMORIES_OBJECT}?alt=media" || echo 000)"
+    if [[ "$live_code" != "200" ]]; then
+      echo "[of-memories] WARN: could not download live memories to merge (HTTP ${live_code}) -- giving up this cycle" >&2
+      rm -f "$live"; return 0
+    fi
+
+    local live_epoch; live_epoch="$(of_memories_tarball_epoch "$live")"
+    if [[ "${of_state_epoch:-0}" -lt "$live_epoch" ]]; then
+      echo "[of-memories] WARN: live memories epoch ${live_epoch} is newer than ours (${of_state_epoch:-0}) -- a deliberate reset happened, NOT merging. Giving up this cycle." >&2
+      rm -f "$live"; return 0
+    fi
+
+    local live_extract; live_extract="$(mktemp -d)"
+    if ! tar xzf "$live" -C "$live_extract" 2>/dev/null; then
+      echo "[of-memories] WARN: live memories tarball did not extract -- giving up this cycle" >&2
+      rm -f "$live"; rm -rf "$live_extract"; return 0
+    fi
+    rm -f "$live"
+    of_memory_union "$mem_dir" "$live_extract"
+    rm -rf "$live_extract"
+
+    printf '%s\n' "${of_state_epoch:-0}" > "$mem_dir/.memories_epoch"
+    tar czf "$tarball" -C "$mem_dir" . || { echo "[of-memories] ERROR: re-tar after merge failed; this cycle's memories are lost" >&2; return 0; }
+
+    gen="$(of_gcs_read_generation "$HERMES_STATE_BUCKET" "$HERMES_MEMORIES_OBJECT" "$tok")"
+    if [[ -z "$gen" || "$gen" == "0" ]]; then
+      echo "[of-memories] WARN: could not re-read the live generation -- giving up this cycle" >&2
+      return 0
+    fi
+  done
+}
+
+# openfathom-meta ENG-103. Snapshots $HERMES_HOME/memories into its own tarball and
+# uploads it to HERMES_MEMORIES_OBJECT via CAS, independent of of_state_snapshot.
+#
+# stage/tarball are mktemp'd fresh EVERY call, deliberately never a fixed path: unlike
+# of_state_snapshot (which runs exactly once, from of_on_term or the normal-exit path,
+# never both), this function can genuinely be IN FLIGHT TWICE AT ONCE. The periodic loop
+# (Passo 3) calls it every HERMES_MEMORY_SYNC_INTERVAL_SECONDS; of_on_term's
+# `kill -TERM "$of_memories_loop_pid"` does not (and, given the shutdown budget, should
+# not) wait for that call to finish before running its own final flush -- and bash
+# defers a pending trap until the loop's CURRENT foreground command (a curl, not
+# specially interruptible like `wait`) returns. A fixed path would let one invocation's
+# `rm -rf "$stage"` delete the directory the other is mid-`cp`/`tar` into.
+of_memories_snapshot() {
+  local home="${HERMES_HOME:-/opt/data}" mem_dir
+  mem_dir="$home/memories"
+  [[ -d "$mem_dir" ]] || { echo "[of-memories] no memories dir yet -- nothing to snapshot"; return 0; }
+
+  local stage tarball tok
+  stage="$(mktemp -d)"; tarball="$(mktemp --suffix=.tar.gz)"
+  cp -a "$mem_dir/." "$stage/" 2>/dev/null || true
+  # Copied, THEN pruned -- never delete inside $mem_dir itself, which memory_tool.py may
+  # be actively writing to (live, concurrently, from Passo 3's periodic loop) while this
+  # runs. Its own .lock/.mem_*.tmp are real only for the instant of one write.
+  find "$stage" -name '*.lock' -delete 2>/dev/null || true
+  find "$stage" -name '.mem_*.tmp' -delete 2>/dev/null || true
+
+  printf '%s\n' "${of_state_epoch:-0}" > "$stage/.memories_epoch"
+  tar czf "$tarball" -C "$stage" . || { echo "[of-memories] ERROR: tar failed; this cycle's memories are lost" >&2; rm -rf "$stage"; return 0; }
+  [[ -s "$tarball" ]] || { echo "[of-memories] WARN: nothing to snapshot"; rm -rf "$stage" "$tarball"; return 0; }
+  tok="$(of_metadata_token)" || { echo "[of-memories] ERROR: no metadata token; this cycle's memories are lost" >&2; rm -rf "$stage" "$tarball"; return 0; }
+
+  of_memories_write_with_merge_retry "$stage" "$tarball" "$tok"
   rm -rf "$stage" "$tarball"
+}
+
+# openfathom-meta ENG-103, Passo 3. Periodic persistence for memories/ -- independent of
+# the message snapshot, which still only runs on shutdown (Passo 1, unchanged). A crash
+# (SIGKILL, not a graceful SIGTERM) loses at most one interval's worth of memories instead
+# of everything since the last shutdown-triggered snapshot.
+#
+# ASYMMETRY, DELIBERATE: memories are written with the gateway STILL ALIVE (this loop);
+# messages only after it dies (of_state_snapshot, called from of_on_term and the
+# normal-exit path). A future reader must not "fix" this loop to run only after the
+# gateway's own `wait` returns -- that would defeat the entire purpose of this step.
+#
+# `sleep "$interval" & wait "$!"` (not a bare `sleep "$interval"`) so a TERM/INT arriving
+# mid-interval interrupts the WAIT immediately -- a foreground `sleep` would run to
+# completion before bash even checks for a pending trap. Same pattern already used for
+# `wait "${of_gateway_pid}"` below. `|| true` because an interrupted wait returns >128,
+# which `set -e` would otherwise treat as fatal and kill the loop's own subshell.
+of_memories_sync_loop() {
+  local interval="${HERMES_MEMORY_SYNC_INTERVAL_SECONDS:-90}"
+  trap 'exit 0' TERM INT
+  while true; do
+    sleep "$interval" & wait "$!" || true
+    of_memories_snapshot || echo "[of-memories] WARN: periodic sync cycle failed" >&2
+  done
 }
 
 # openfathom-meta ADR-048, decision 2. Deposit the skills the AGENT wrote this session
@@ -1417,6 +1883,8 @@ PYEOF
 
     HERMES_STATE_OBJECT="${HERMES_STATE_OBJECT:-gateway-state.tar.gz}"
     of_state_restore
+    HERMES_MEMORIES_OBJECT="${HERMES_MEMORIES_OBJECT:-memories.tar.gz}"
+    of_memories_restore
     of_write_soul
 
     # We can no longer `exec`: something has to outlive `hermes` to take the
@@ -1448,16 +1916,30 @@ PYEOF
     hermes gateway run &
     of_gateway_pid=$!
 
+    # openfathom-meta ENG-103, Passo 3. Started AFTER of_memories_restore has already run
+    # (earlier in this same boot sequence) -- this background loop inherits
+    # of_memories_generation at the moment of the fork below, so if that ordering is ever
+    # reversed the loop would inherit 0 and its first periodic write would always 412.
+    of_memories_sync_loop &
+    of_memories_loop_pid=$!
+
     of_on_term() {
       trap - TERM INT
       kill -TERM "${of_gateway_pid}" 2>/dev/null || true
       wait "${of_gateway_pid}" 2>/dev/null || true
+      kill -TERM "${of_memories_loop_pid:-}" 2>/dev/null || true
       of_state_snapshot
       # AFTER the snapshot, deliberately, and the ordering is the whole safety argument.
       # Cloud Run allocates ~10s of shutdown and the snapshot is sized to own it (see the
       # S6_CMD_RECEIVE_SIGNALS reasoning below). If the budget runs out, SIGKILL lands on
       # THIS call, not on the conversation state -- a lost skill deposit costs one
       # session's unreviewed drafts, a lost snapshot costs the user's real conversation.
+      #
+      # openfathom-meta ENG-103, Passo 3. Final flush, AFTER of_state_snapshot -- covers
+      # the delta since the last periodic tick. Memories are small and cheap next to the
+      # full state.db tarball, so this is deliberately the SECOND-to-last network call,
+      # not competing with of_state_snapshot for the shutdown budget's early seconds.
+      of_memories_snapshot
       of_skills_inbox_deposit
       # LAST of the three, deliberately: no network call, so if the budget is already
       # gone by here the only casualty is a boot's worth of usage-count log lines.
@@ -1470,7 +1952,9 @@ PYEOF
     # `wait` returns >128); the second reaps `hermes` on the normal-exit path, where
     # no signal ever arrives and the gateway simply died on its own.
     wait "${of_gateway_pid}" || true
+    kill -TERM "${of_memories_loop_pid:-}" 2>/dev/null || true
     of_state_snapshot
+    of_memories_snapshot
     of_skills_inbox_deposit
     of_skill_usage_report
     ;;

@@ -38,11 +38,24 @@ extract_fns() { # extract_fns <dest> [sed-mutation]
   local dest="$1" mutation="${2:-}"
   : > "$dest"
   local fn
-  for fn in of_state_read_local_epoch of_state_tarball_epoch of_state_messages_superset of_state_try_promote; do
+  for fn in of_state_read_local_epoch of_state_tarball_epoch of_state_messages_superset of_state_try_promote of_state_merge_messages of_state_snapshot_upload of_gcs_read_generation of_memory_union of_memories_tarball_epoch of_memories_restore of_memories_snapshot of_memories_write_with_merge_retry of_memories_sync_loop; do
     awk -v f="$fn" '$0 ~ "^"f"\\(\\) \\{" {p=1} p {print} p && /^\}$/ {exit}' "$ENTRYPOINT" >> "$dest"
     echo >> "$dest"
   done
   grep -q "of_state_try_promote() {" "$dest" || { echo "FATAL: extraction failed" >&2; exit 1; }
+  [[ -n "$mutation" ]] && sed -i "$mutation" "$dest"
+  return 0
+}
+
+# extract_one_fn <dest> <fn-name> [sed-mutation] -- like extract_fns, but pulls a SINGLE
+# named function. Needed when a mutation's pattern is not unique across the whole bundle
+# (sed's occurrence flag counts per LINE, not per file, so it cannot target "the 2nd
+# occurrence of this line anywhere in the file") -- source the normal bundle first for
+# unmutated dependencies, then source this file's single function on top to override it.
+extract_one_fn() {
+  local dest="$1" fn="$2" mutation="${3:-}"
+  awk -v f="$fn" '$0 ~ "^"f"\\(\\) \\{" {p=1} p {print} p && /^\}$/ {exit}' "$ENTRYPOINT" > "$dest"
+  grep -q "${fn}() {" "$dest" || { echo "FATAL: extraction of $fn failed" >&2; exit 1; }
   [[ -n "$mutation" ]] && sed -i "$mutation" "$dest"
   return 0
 }
@@ -78,6 +91,16 @@ CALLS="$WORK/calls.log"
 LIVE=""          # tarball served for ?alt=media; empty => HTTP 404
 LIVE_GEN="42"    # generation reported by the metadata GET
 UPLOADED="$WORK/uploaded.tar.gz"
+# Queue of upload response codes, one per line, FIFO. A FILE, not a bash array: every
+# `code="$(curl ...)"` call in the real code is a command substitution, which forks a
+# SUBSHELL -- an array mutated inside curl() there would vanish the moment that subshell
+# exits, and every upload would keep seeing the same first element forever (confirmed:
+# the first version of this stub did exactly that, silently, and every "412 then 200"
+# scenario looped on 412 no matter how the queue was primed). A file write is real I/O
+# and survives the subshell. Empty/absent -> "200" (every existing test leaves this
+# unset and sees no behaviour change).
+UPLOAD_CODES_FILE="$WORK/upload_codes"
+set_upload_codes() { printf '%s\n' "$@" > "$UPLOAD_CODES_FILE"; }
 
 of_metadata_token() { echo "stub-token"; }
 
@@ -105,13 +128,20 @@ curl() {
   if [[ "$method" == "DELETE" ]]; then echo "204"; return 0; fi
   if [[ "$url" == *"uploadType=media"* ]]; then
     [[ -n "$data" ]] && cp -f "$data" "$UPLOADED"
-    echo "200"; return 0
+    if [[ -s "$UPLOAD_CODES_FILE" ]]; then
+      head -n1 "$UPLOAD_CODES_FILE"
+      tail -n +2 "$UPLOAD_CODES_FILE" > "$UPLOAD_CODES_FILE.tmp"
+      mv "$UPLOAD_CODES_FILE.tmp" "$UPLOAD_CODES_FILE"
+    else
+      echo "200"
+    fi
+    return 0
   fi
   # Object metadata GET -> generation.
   printf '{"generation":"%s"}\n' "$LIVE_GEN"
 }
 
-reset_stub() { : > "$CALLS"; rm -f "$UPLOADED"; LIVE=""; LIVE_GEN="42"; }
+reset_stub() { : > "$CALLS"; rm -f "$UPLOADED"; LIVE=""; LIVE_GEN="42"; : > "$UPLOAD_CODES_FILE"; }
 promoted()  { [[ -f "$UPLOADED" ]] && echo yes || echo no; }
 deleted()   { grep -q "^DELETE " "$CALLS" && echo yes || echo no; }
 
@@ -388,6 +418,518 @@ if grep -q 'cat "${HERMES_HOME' "$WORK/regress.sh"; then
 else
   bad "regression mutation did not apply"
 fi
+
+# ---------------------------------------------------------------------------
+# of_state_merge_messages (openfathom-meta ENG-103) -- retry-with-merge for the CAS of
+# messages. Unlike of_state_messages_superset (read-only comparison), this one WRITES:
+# it copies rows that exist only in the live tarball into the destination db, so a
+# retry of the conditional upload has a chance to succeed instead of parking on the
+# first genuine divergence.
+#
+# hermes_state.py declares `messages.session_id TEXT NOT NULL REFERENCES sessions(id)`
+# and opens the connection with `PRAGMA foreign_keys=ON` (hermes_state.py:1995) -- a
+# message copied in without its session row violates the FK. The fixtures below build
+# a real `sessions` table (mk_state()/mk_state_with_memory() above deliberately do not,
+# and must keep not doing so -- changing them would ripple into every existing test).
+# ---------------------------------------------------------------------------
+mk_full_db() { # mk_full_db <out.db> <sessions:"id1,id2,..."> <id:session:role:ts:content> ...
+  local out="$1" sessions_csv="$2"; shift 2
+  python3 - "$out" "$sessions_csv" "$@" <<'PY'
+import sqlite3, sys
+db, sessions_csv = sys.argv[1], sys.argv[2]
+specs = sys.argv[3:]
+con = sqlite3.connect(db)
+con.execute("PRAGMA foreign_keys=ON")
+con.execute("create table sessions (id text primary key, title text)")
+con.execute(
+    "create table messages (id integer primary key, "
+    "session_id text not null references sessions(id), role text, content text, "
+    "timestamp real)"
+)
+for sid in [s for s in sessions_csv.split(",") if s]:
+    con.execute("insert into sessions (id, title) values (?, ?)", (sid, "session " + sid))
+for spec in specs:
+    mid, sess, role, ts, content = spec.split(":", 4)
+    con.execute(
+        "insert into messages (id, session_id, role, content, timestamp) "
+        "values (?,?,?,?,?)", (int(mid), sess, role, content, float(ts)))
+con.commit(); con.close()
+PY
+}
+mk_full_state() { # mk_full_state <out.tar.gz> <epoch> <sessions csv> <msg specs...>
+  local out="$1" epoch="$2" sessions_csv="$3"; shift 3
+  local d; d="$(mktemp -d -p "$WORK")"
+  printf '%s\n' "$epoch" > "$d/.state_epoch"
+  mk_full_db "$d/state.db" "$sessions_csv" "$@"
+  tar czf "$out" -C "$d" .
+}
+
+echo "== case: of_state_merge_messages copies a missing message AND its session row (FK) =="
+DEST_DB="$WORK/merge-dest.db"
+mk_full_db "$DEST_DB" "s1" "1:s1:user:100:hello"
+LIVE_MERGE_TB="$WORK/merge-live.tar.gz"
+mk_full_state "$LIVE_MERGE_TB" 3 "s1,s2" "1:s1:user:100:hello" "2:s2:user:200:only-in-live"
+merge_out="$(of_state_merge_messages "$DEST_DB" "$LIVE_MERGE_TB" 2>&1)"; merge_rc=$?
+echo "$merge_out" | sed 's/^/    | /'
+check "merge succeeds (exit 0)" "0" "$merge_rc"
+check "session s2 copied" "1" "$(python3 -c "
+import sqlite3
+con = sqlite3.connect('$DEST_DB')
+con.execute('PRAGMA foreign_keys=ON')
+print(con.execute(\"select count(*) from sessions where id='s2'\").fetchone()[0])
+")"
+check "message only-in-live copied, readable under foreign_keys=ON" "1" "$(python3 -c "
+import sqlite3
+con = sqlite3.connect('$DEST_DB')
+con.execute('PRAGMA foreign_keys=ON')
+print(con.execute(\"select count(*) from messages where content='only-in-live'\").fetchone()[0])
+")"
+check "no duplicate of the message both sides already shared" "1" "$(python3 -c "
+import sqlite3
+con = sqlite3.connect('$DEST_DB')
+print(con.execute(\"select count(*) from messages where content='hello'\").fetchone()[0])
+")"
+
+echo "== case: of_state_merge_messages -- schema too divergent (live has no content column) -> fails closed =="
+DEST_DB2="$WORK/merge-dest2.db"
+mk_full_db "$DEST_DB2" "s1" "1:s1:user:100:hello"
+LIVE_TB2="$WORK/merge-live2.tar.gz"
+d2="$(mktemp -d -p "$WORK")"
+printf '3\n' > "$d2/.state_epoch"
+python3 - "$d2/state.db" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("create table sessions (id text primary key, title text)")
+con.execute("insert into sessions (id, title) values ('s2', 'session s2')")
+# Deliberately missing `content` -- the shape of a schema too far apart to merge safely.
+con.execute(
+    "create table messages (id integer primary key, "
+    "session_id text not null references sessions(id), role text, timestamp real)")
+con.execute(
+    "insert into messages (id, session_id, role, timestamp) values (2, 's2', 'user', 200)")
+con.commit(); con.close()
+PY
+tar czf "$LIVE_TB2" -C "$d2" .
+merge_out2="$(of_state_merge_messages "$DEST_DB2" "$LIVE_TB2" 2>&1)"; merge_rc2=$?
+echo "$merge_out2" | sed 's/^/    | /'
+check "merge fails closed on divergent schema (exit 4)" "4" "$merge_rc2"
+check "names the missing column in the error" "1" "$(echo "$merge_out2" | grep -c 'content')"
+check "dest untouched by a failed merge" "1" "$(python3 -c "
+import sqlite3
+con = sqlite3.connect('$DEST_DB2')
+print(con.execute(\"select count(*) from messages\").fetchone()[0])
+")"
+
+echo "== MUTANT: of_state_merge_messages -- sessions copy removed =="
+# Comments out the sessions INSERT via a SQL line-comment appended to the mutated string
+# (the two f-string pieces concatenate into ONE line, so `--` blanks both the neutered
+# insert AND the select that used to follow it). The FK (PRAGMA foreign_keys=ON) then
+# refuses the message insert that references the now-missing session -- an unhandled
+# IntegrityError, not a graceful non-zero: the mutant is killed by the merge CRASHING,
+# which is still "did not succeed", the only thing the assertion below requires.
+DEST_DB3="$WORK/merge-dest3.db"
+mk_full_db "$DEST_DB3" "s1" "1:s1:user:100:hello"
+LIVE_TB3="$WORK/merge-live3.tar.gz"
+mk_full_state "$LIVE_TB3" 3 "s1,s2" "1:s1:user:100:hello" "2:s2:user:200:only-in-live"
+extract_fns "$WORK/merge-mut1.sh" \
+  's|insert or ignore into sessions ({sess_col_list}) |select 1 as noop where 0=1 -- |'
+if grep -q 'select 1 as noop where 0=1' "$WORK/merge-mut1.sh"; then
+  ( # shellcheck disable=SC1090
+    source "$WORK/merge-mut1.sh"
+    of_state_merge_messages "$DEST_DB3" "$LIVE_TB3" >/dev/null 2>&1
+    echo "$?" > "$WORK/merge-mut1.rc"
+  )
+  mut1_rc="$(cat "$WORK/merge-mut1.rc")"
+  check "sessions copy removed -- merge no longer succeeds (proves the FK copy is load-bearing)" \
+    "1" "$([[ "$mut1_rc" != "0" ]] && echo 1 || echo 0)"
+else
+  bad "sessions-copy mutation did not apply -- a mutant that does not mutate proves nothing"
+fi
+
+echo "== MUTANT: of_state_merge_messages -- schema-divergence guard removed =="
+# Without the guard, a message missing a REQUIRED column (here: content) is not refused --
+# it is merged anyway, silently dropping the column. That is the SPECIFIC wrong behaviour:
+# not a crash, a quiet loss of message content.
+extract_fns "$WORK/merge-mut2.sh" \
+  's|if not REQUIRED.issubset(set(common_msg)):|if False:|'
+if grep -q 'if False:' "$WORK/merge-mut2.sh"; then
+  DEST_DB4="$WORK/merge-dest4.db"
+  mk_full_db "$DEST_DB4" "s1" "1:s1:user:100:hello"
+  d4="$(mktemp -d -p "$WORK")"
+  printf '3\n' > "$d4/.state_epoch"
+  python3 - "$d4/state.db" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("create table sessions (id text primary key, title text)")
+con.execute("insert into sessions (id, title) values ('s2', 'session s2')")
+con.execute(
+    "create table messages (id integer primary key, "
+    "session_id text not null references sessions(id), role text, timestamp real)")
+con.execute(
+    "insert into messages (id, session_id, role, timestamp) values (2, 's2', 'user', 200)")
+con.commit(); con.close()
+PY
+  LIVE_TB4="$WORK/merge-live4.tar.gz"
+  tar czf "$LIVE_TB4" -C "$d4" .
+  ( # shellcheck disable=SC1090
+    source "$WORK/merge-mut2.sh"
+    of_state_merge_messages "$DEST_DB4" "$LIVE_TB4" >/dev/null 2>&1
+    echo "$?" > "$WORK/merge-mut2.rc"
+  )
+  mut2_rc="$(cat "$WORK/merge-mut2.rc")"
+  check "guard removed -- schema mismatch no longer fails closed (exit 4)" \
+    "1" "$([[ "$mut2_rc" != "4" ]] && echo 1 || echo 0)"
+else
+  bad "schema-guard mutation did not apply -- a mutant that does not mutate proves nothing"
+fi
+
+# ---------------------------------------------------------------------------
+# of_state_snapshot_upload (openfathom-meta ENG-103) -- the retry-with-merge loop that
+# replaces of_state_snapshot's old inline "try once, park on 412" upload block. On a 412
+# it downloads the live object, merges (of_state_merge_messages) and retries the
+# conditional upload, up to OF_STATE_MERGE_MAX_ATTEMPTS times, before falling back to
+# the existing park + of_state_try_promote path.
+# ---------------------------------------------------------------------------
+mk_upload_stage() { # mk_upload_stage <stage-dir> <epoch> <sessions csv> <msg specs...>
+  local stage="$1" epoch="$2" sessions_csv="$3"; shift 3
+  mkdir -p "$stage"
+  mk_full_db "$stage/state.db" "$sessions_csv" "$@"
+  printf '%s\n' "$epoch" > "$stage/.state_epoch"
+}
+
+echo "== case: of_state_snapshot_upload -- resolves on the 2nd attempt via merge, no park =="
+reset_stub
+STAGE1="$WORK/upload-stage1"; rm -rf "$STAGE1"
+mk_upload_stage "$STAGE1" 3 "s1" "1:s1:user:100:hello"
+TARBALL1="$WORK/upload-tb1.tar.gz"
+tar czf "$TARBALL1" -C "$STAGE1" .
+LIVE_FOR_RETRY="$WORK/upload-live1.tar.gz"
+mk_full_state "$LIVE_FOR_RETRY" 3 "s1,s2" "1:s1:user:100:hello" "2:s2:user:200:only-in-live"
+LIVE="$LIVE_FOR_RETRY"; set_upload_codes 412 200; of_state_generation=42; of_state_epoch=3
+out="$(of_state_snapshot_upload "$STAGE1" "$TARBALL1" "stub-token" 2>&1)"; echo "$out" | sed 's/^/    | /'
+check "no conflict object was ever uploaded" "0" "$(grep -c 'name=.*conflict-' "$CALLS")"
+check "exactly 2 main-upload attempts happened" "2" "$(grep -c 'uploadType=media&name=gateway-state.tar.gz' "$CALLS")"
+mkdir -p "$WORK/uploaded-extract1"; tar xzf "$UPLOADED" -C "$WORK/uploaded-extract1"
+check "the merged message reached the uploaded tarball" "1" "$(python3 -c "
+import sqlite3
+con = sqlite3.connect('$WORK/uploaded-extract1/state.db')
+print(con.execute(\"select count(*) from messages where content='only-in-live'\").fetchone()[0])
+")"
+
+echo "== case: of_state_snapshot_upload -- teto de tentativas esgotado -> parks =="
+reset_stub
+STAGE2="$WORK/upload-stage2"; rm -rf "$STAGE2"
+mk_upload_stage "$STAGE2" 3 "s1" "1:s1:user:100:hello"
+TARBALL2="$WORK/upload-tb2.tar.gz"
+tar czf "$TARBALL2" -C "$STAGE2" .
+LIVE="$LIVE_FOR_RETRY"; set_upload_codes 412 412 412; of_state_generation=42; of_state_epoch=3
+out="$(of_state_snapshot_upload "$STAGE2" "$TARBALL2" "stub-token" 2>&1)"; echo "$out" | sed 's/^/    | /'
+check "exactly 3 retry-loop attempts happened (the configured ceiling)" \
+  "3" "$(echo "$out" | grep -cE 'restored \(attempt [0-9]+/3|still conflicting after 3 attempt')"
+check "exactly 1 conflict object was parked" "1" "$(grep -c 'name=.*conflict-' "$CALLS")"
+check "says still conflicting" "1" "$(echo "$out" | grep -c 'still conflicting after 3 attempt')"
+
+echo "== case: of_state_snapshot_upload -- live epoch newer mid-retry -> aborts WITHOUT merging, parks =="
+reset_stub
+STAGE3="$WORK/upload-stage3"; rm -rf "$STAGE3"
+mk_upload_stage "$STAGE3" 3 "s1" "1:s1:user:100:hello"
+TARBALL3="$WORK/upload-tb3.tar.gz"
+tar czf "$TARBALL3" -C "$STAGE3" .
+LIVE_RESET_TB="$WORK/upload-live-reset.tar.gz"
+mk_full_state "$LIVE_RESET_TB" 9 "s1" "1:s1:user:100:hello"   # epoch 9: a deliberate reset
+LIVE="$LIVE_RESET_TB"; set_upload_codes 412; of_state_generation=42; of_state_epoch=3
+out="$(of_state_snapshot_upload "$STAGE3" "$TARBALL3" "stub-token" 2>&1)"; echo "$out" | sed 's/^/    | /'
+check "only 1 main-upload attempt -- the epoch guard aborted the retry, not the ceiling" \
+  "1" "$(grep -c 'uploadType=media&name=gateway-state.tar.gz' "$CALLS")"
+check "no merge was attempted" "0" "$(echo "$out" | grep -c 'merged.*message')"
+check "names the deliberate reset (the retry loop's own guard, not just try_promote's)" \
+  "1" "$(echo "$out" | grep -c 'deliberate reset happened, NOT merging')"
+check "park succeeds (only 1 queued 412 -- the queue is empty by the time the park upload runs)" \
+  "1" "$(echo "$out" | grep -c 'conflict snapshot parked at')"
+
+echo "== MUTANT: of_state_snapshot_upload -- retry removed (parks on the FIRST 412, like before ENG-103) =="
+extract_fns "$WORK/upload-mut.sh" \
+  's|if \[\[ "\$attempt" -ge "\$max_attempts" \]\]; then|if true; then|'
+if grep -q 'if true; then' "$WORK/upload-mut.sh"; then
+  reset_stub
+  STAGE4="$WORK/upload-stage4"; rm -rf "$STAGE4"
+  mk_upload_stage "$STAGE4" 3 "s1" "1:s1:user:100:hello"
+  TARBALL4="$WORK/upload-tb4.tar.gz"
+  tar czf "$TARBALL4" -C "$STAGE4" .
+  LIVE="$LIVE_FOR_RETRY"; set_upload_codes 412 200; of_state_generation=42; of_state_epoch=3
+  ( # shellcheck disable=SC1090
+    source "$WORK/upload-mut.sh"
+    of_state_snapshot_upload "$STAGE4" "$TARBALL4" "stub-token" >/dev/null 2>&1
+  )
+  check "retry removed -- now parks after just 1 attempt (proves the retry is load-bearing)" \
+    "1" "$(grep -c 'name=.*conflict-' "$CALLS")"
+  check "retry removed -- never reaches the 2nd main-upload attempt" \
+    "1" "$(grep -c 'uploadType=media&name=gateway-state.tar.gz' "$CALLS")"
+else
+  bad "retry-removal mutation did not apply -- a mutant that does not mutate proves nothing"
+fi
+
+# ---------------------------------------------------------------------------
+# of_memory_union / of_memories_restore / of_memories_snapshot / of_memories_write_with_
+# merge_retry (openfathom-meta ENG-103) -- memories move into their own CAS unit,
+# independent of state.db's. Merge for memories is ALWAYS union-by-entry (never "genuine
+# divergence" -- text union is safe and commutative by construction), gated by the same
+# epoch guard ADR-049 already uses for messages, so a deliberate removal of a memory
+# entry cannot be resurrected by a stale instance's own periodic sync.
+# ---------------------------------------------------------------------------
+DELIM_PY='"\n§\n"'  # tools/memory_tool.py::ENTRY_DELIMITER == "\n§\n"
+
+mk_mem_file() { # mk_mem_file <root_dir> <relpath> <entry> [entry ...]
+  local root="$1" rel="$2"; shift 2
+  mkdir -p "$root/$(dirname "$rel")"
+  python3 - "$root/$rel" "$@" <<PY
+import sys
+path = sys.argv[1]
+entries = sys.argv[2:]
+DELIM = $DELIM_PY
+with open(path, "w", encoding="utf-8") as fh:
+    fh.write(DELIM.join(entries))
+PY
+}
+
+mem_file_entries() { # mem_file_entries <path> -- one parsed entry per line
+  python3 - "$1" <<PY
+import sys
+path = sys.argv[1]
+DELIM = $DELIM_PY
+try:
+    with open(path, encoding="utf-8") as fh:
+        raw = fh.read()
+except FileNotFoundError:
+    raw = ""
+for e in [e.strip() for e in raw.split(DELIM) if e.strip()]:
+    print(e)
+PY
+}
+
+mk_memories_tarball() { # mk_memories_tarball <out.tar.gz> <epoch> <relpath> <entry> [entry ...]
+  local out="$1" epoch="$2" rel="$3"; shift 3
+  local d; d="$(mktemp -d -p "$WORK")"
+  printf '%s\n' "$epoch" > "$d/.memories_epoch"
+  mk_mem_file "$d" "$rel" "$@"
+  tar czf "$out" -C "$d" .
+}
+
+echo "== case: of_memory_union -- adds src-only entries, keeps dest's own =="
+UDEST1="$WORK/union-dest1"; USRC1="$WORK/union-src1"; rm -rf "$UDEST1" "$USRC1"
+mk_mem_file "$UDEST1" "MEMORY.md" "user prefers pt-BR"
+mk_mem_file "$USRC1" "MEMORY.md" "user prefers pt-BR" "runs make check before push"
+of_memory_union "$UDEST1" "$USRC1" >/dev/null 2>&1
+check "dest gained the src-only entry" "1" "$(mem_file_entries "$UDEST1/MEMORY.md" | grep -c '^runs make check before push$')"
+check "dest kept its own entry" "1" "$(mem_file_entries "$UDEST1/MEMORY.md" | grep -c '^user prefers pt-BR$')"
+check "no duplicate of the shared entry" "1" "$(mem_file_entries "$UDEST1/MEMORY.md" | grep -c '^user prefers pt-BR$')"
+
+echo "== case: of_memory_union -- commutative, order of application does not change the resulting set =="
+UA="$WORK/union-a"; UB="$WORK/union-b"; rm -rf "$UA" "$UB"
+mk_mem_file "$UA" "USER.md" "goal: ship OF-09"
+mk_mem_file "$UB" "USER.md" "prefers dd/mm/yyyy dates"
+COPY_A_UNION_B="$WORK/union-a-then-b"; rm -rf "$COPY_A_UNION_B"; cp -a "$UA" "$COPY_A_UNION_B"
+of_memory_union "$COPY_A_UNION_B" "$UB" >/dev/null 2>&1
+COPY_B_UNION_A="$WORK/union-b-then-a"; rm -rf "$COPY_B_UNION_A"; cp -a "$UB" "$COPY_B_UNION_A"
+of_memory_union "$COPY_B_UNION_A" "$UA" >/dev/null 2>&1
+SET1="$(mem_file_entries "$COPY_A_UNION_B/USER.md" | sort)"
+SET2="$(mem_file_entries "$COPY_B_UNION_A/USER.md" | sort)"
+check "union(A,B) and union(B,A) reach the same entry set" "1" "$([[ "$SET1" == "$SET2" ]] && echo 1 || echo 0)"
+check "the resulting set has exactly 2 entries" "2" "$(mem_file_entries "$COPY_A_UNION_B/USER.md" | wc -l | tr -d ' ')"
+
+echo "== case: of_memory_union -- .lock and .mem_*.tmp in src are ignored, .memories_epoch never merged as prose =="
+UDEST2="$WORK/union-dest2"; USRC2="$WORK/union-src2"; rm -rf "$UDEST2" "$USRC2"
+mkdir -p "$UDEST2" "$USRC2"
+mk_mem_file "$USRC2" "MEMORY.md" "real entry"
+printf 'garbage-mid-write' > "$USRC2/MEMORY.md.lock"
+printf 'garbage-tmp' > "$USRC2/.mem_abc123.tmp"
+printf '7\n' > "$USRC2/.memories_epoch"
+of_memory_union "$UDEST2" "$USRC2" >/dev/null 2>&1
+check "real entry copied" "1" "$(mem_file_entries "$UDEST2/MEMORY.md" | grep -c '^real entry$')"
+check ".lock NOT copied into dest" "0" "$(find "$UDEST2" -name '*.lock' | wc -l | tr -d ' ')"
+check ".mem_*.tmp NOT copied into dest" "0" "$(find "$UDEST2" -name '.mem_*.tmp' | wc -l | tr -d ' ')"
+check ".memories_epoch NOT treated as a mergeable entry file" "0" "$([[ -e "$UDEST2/.memories_epoch" ]] && echo 1 || echo 0)"
+
+echo "== MUTANT: of_memory_union -- union becomes substitution (dest_entries no longer kept) =="
+extract_fns "$WORK/union-mut.sh" \
+  's|merged = dest_entries + added|merged = added|'
+if grep -q 'merged = added' "$WORK/union-mut.sh"; then
+  UDEST3="$WORK/union-dest3"; USRC3="$WORK/union-src3"; rm -rf "$UDEST3" "$USRC3"
+  mk_mem_file "$UDEST3" "MEMORY.md" "dest-only entry"
+  mk_mem_file "$USRC3" "MEMORY.md" "src-only entry"
+  (
+    # shellcheck disable=SC1090
+    source "$WORK/union-mut.sh"
+    of_memory_union "$UDEST3" "$USRC3" >/dev/null 2>&1
+  )
+  check "substitution mutant -- dest-only entry LOST (proves union, not overwrite, is load-bearing)" \
+    "0" "$(mem_file_entries "$UDEST3/MEMORY.md" | grep -c '^dest-only entry$')"
+else
+  bad "union-substitution mutation did not apply -- a mutant that does not mutate proves nothing"
+fi
+
+echo "== case: of_memories_snapshot -- writes to its OWN object, never touches HERMES_STATE_OBJECT =="
+reset_stub
+MEM_HOME="$WORK/mem-home1"; rm -rf "$MEM_HOME"; mkdir -p "$MEM_HOME/memories"
+mk_mem_file "$MEM_HOME/memories" "MEMORY.md" "user prefers pt-BR"
+export HERMES_HOME="$MEM_HOME"
+export HERMES_MEMORIES_OBJECT="memories.tar.gz"
+of_memories_generation=42; of_state_epoch=3
+out="$(of_memories_snapshot 2>&1)"; echo "$out" | sed 's/^/    | /'
+check "uploaded to the memories object" "1" "$(grep -c 'uploadType=media&name=memories.tar.gz' "$CALLS")"
+check "never touched the messages object" "0" "$(grep -c 'name=gateway-state.tar.gz' "$CALLS")"
+
+echo "== case: of_memories_restore -- unions the live memories object into a fresh boot =="
+reset_stub
+MEM_HOME2="$WORK/mem-home2"; rm -rf "$MEM_HOME2"; mkdir -p "$MEM_HOME2/memories"
+mk_mem_file "$MEM_HOME2/memories" "MEMORY.md" "carried over from a legacy combined tarball"
+LIVE_MEM_TB="$WORK/live-memories.tar.gz"
+mk_memories_tarball "$LIVE_MEM_TB" 3 "MEMORY.md" "user prefers pt-BR"
+export HERMES_HOME="$MEM_HOME2"
+LIVE="$LIVE_MEM_TB"
+of_memories_restore >/dev/null 2>&1
+check "kept what was already on disk" "1" "$(mem_file_entries "$MEM_HOME2/memories/MEMORY.md" | grep -c '^carried over from a legacy combined tarball$')"
+check "merged in the entry from the memories object" "1" "$(mem_file_entries "$MEM_HOME2/memories/MEMORY.md" | grep -c '^user prefers pt-BR$')"
+
+echo "== case: of_memories_write_with_merge_retry -- epoch guard aborts a resurrection attempt, does not merge =="
+reset_stub
+MEM_HOME3="$WORK/mem-home3"; rm -rf "$MEM_HOME3"; mkdir -p "$MEM_HOME3"
+mk_mem_file "$MEM_HOME3" "MEMORY.md" "entry deliberately removed elsewhere"
+LIVE_MEM_RESET="$WORK/live-memories-reset.tar.gz"
+mk_memories_tarball "$LIVE_MEM_RESET" 9 "MEMORY.md"   # epoch 9: deliberate reset, entry gone
+LIVE="$LIVE_MEM_RESET"; set_upload_codes 412 200; of_memories_generation=42; of_state_epoch=3
+TARBALL_MEM3="$WORK/mem-tb3.tar.gz"; tar czf "$TARBALL_MEM3" -C "$MEM_HOME3" .
+out="$(of_memories_write_with_merge_retry "$MEM_HOME3" "$TARBALL_MEM3" "stub-token" 2>&1)"; echo "$out" | sed 's/^/    | /'
+check "only 1 upload attempt -- the epoch guard aborted, not the retry ceiling" \
+  "1" "$(grep -c 'uploadType=media&name=memories.tar.gz' "$CALLS")"
+check "names the deliberate reset" "1" "$(echo "$out" | grep -c 'deliberate reset happened, NOT merging')"
+check "the removed entry was not resurrected onto the union target" "1" "$(mem_file_entries "$MEM_HOME3/MEMORY.md" | grep -c '^entry deliberately removed elsewhere$')"
+
+echo "== MUTANT: of_memories_write_with_merge_retry -- epoch guard removed, resurrection succeeds =="
+extract_one_fn "$WORK/mem-epoch-mut.sh" of_memories_write_with_merge_retry \
+  's|if \[\[ "\${of_state_epoch:-0}" -lt "\$live_epoch" \]\]; then|if false; then|'
+if grep -q 'if false; then' "$WORK/mem-epoch-mut.sh"; then
+  reset_stub
+  MEM_HOME4="$WORK/mem-home4"; rm -rf "$MEM_HOME4"; mkdir -p "$MEM_HOME4"
+  mk_mem_file "$MEM_HOME4" "MEMORY.md" "entry deliberately removed elsewhere"
+  LIVE="$LIVE_MEM_RESET"; set_upload_codes 412 200; of_memories_generation=42; of_state_epoch=3
+  TARBALL_MEM4="$WORK/mem-tb4.tar.gz"; tar czf "$TARBALL_MEM4" -C "$MEM_HOME4" .
+  (
+    # shellcheck disable=SC1090
+    source "$FN"
+    # shellcheck disable=SC1090
+    source "$WORK/mem-epoch-mut.sh"
+    of_memories_write_with_merge_retry "$MEM_HOME4" "$TARBALL_MEM4" "stub-token" >/dev/null 2>&1
+  )
+  check "guard removed -- 2nd attempt now happens (the merge was NOT skipped)" \
+    "2" "$(grep -c 'uploadType=media&name=memories.tar.gz' "$CALLS")"
+  check "guard removed -- the deliberately-removed entry got resurrected onto the union target" \
+    "1" "$(mem_file_entries "$MEM_HOME4/MEMORY.md" | grep -c '^entry deliberately removed elsewhere$')"
+else
+  bad "epoch-guard mutation did not apply -- a mutant that does not mutate proves nothing"
+fi
+
+echo "== case: of_memories_write_with_merge_retry -- generation carries forward after a successful write =="
+# Without this, the NEXT periodic tick (Passo 3) would still target the generation this
+# instance restored with -- which the GCS object has already moved past -- and every
+# single subsequent cycle would spuriously 412 into a merge it never needed.
+reset_stub
+MEM_HOME5="$WORK/mem-home5"; rm -rf "$MEM_HOME5"; mkdir -p "$MEM_HOME5"
+mk_mem_file "$MEM_HOME5" "MEMORY.md" "entry"
+TARBALL_MEM5="$WORK/mem-tb5.tar.gz"; tar czf "$TARBALL_MEM5" -C "$MEM_HOME5" .
+of_memories_generation=1; LIVE_GEN="77"
+of_memories_write_with_merge_retry "$MEM_HOME5" "$TARBALL_MEM5" "stub-token" >/dev/null 2>&1
+check "of_memories_generation updated to the freshly-read generation after a successful write" \
+  "77" "$of_memories_generation"
+
+echo "== MUTANT: of_memories_write_with_merge_retry -- generation no longer updated after a successful write =="
+extract_one_fn "$WORK/mem-gen-mut.sh" of_memories_write_with_merge_retry \
+  's|of_memories_generation="\$(of_gcs_read_generation.*)"|: # NEUTERED|'
+if grep -q ': # NEUTERED' "$WORK/mem-gen-mut.sh"; then
+  reset_stub
+  MEM_HOME6="$WORK/mem-home6"; rm -rf "$MEM_HOME6"; mkdir -p "$MEM_HOME6"
+  mk_mem_file "$MEM_HOME6" "MEMORY.md" "entry"
+  TARBALL_MEM6="$WORK/mem-tb6.tar.gz"; tar czf "$TARBALL_MEM6" -C "$MEM_HOME6" .
+  of_memories_generation=1; LIVE_GEN="77"
+  (
+    # shellcheck disable=SC1090
+    source "$FN"
+    # shellcheck disable=SC1090
+    source "$WORK/mem-gen-mut.sh"
+    of_memories_write_with_merge_retry "$MEM_HOME6" "$TARBALL_MEM6" "stub-token" >/dev/null 2>&1
+    echo "$of_memories_generation" > "$WORK/mem-gen-mut.out"
+  )
+  check "generation-update removed -- stays stale at the pre-write value (proves the re-read is load-bearing)" \
+    "1" "$(cat "$WORK/mem-gen-mut.out")"
+else
+  bad "generation-update mutation did not apply -- a mutant that does not mutate proves nothing"
+fi
+unset HERMES_HOME HERMES_MEMORIES_OBJECT
+
+# ---------------------------------------------------------------------------
+# of_memories_sync_loop (openfathom-meta ENG-103, Passo 3) -- periodic persistence so a
+# crash (SIGKILL, not graceful SIGTERM) loses at most one interval's worth of memories
+# instead of everything since the last shutdown-triggered snapshot.
+# ---------------------------------------------------------------------------
+echo "== case: of_memories_sync_loop -- runs at least 2 cycles with a short interval =="
+reset_stub
+MEM_HOME7="$WORK/mem-home7"; rm -rf "$MEM_HOME7"; mkdir -p "$MEM_HOME7/memories"
+mk_mem_file "$MEM_HOME7/memories" "MEMORY.md" "entry"
+export HERMES_HOME="$MEM_HOME7"
+export HERMES_MEMORIES_OBJECT="memories.tar.gz"
+export HERMES_MEMORY_SYNC_INTERVAL_SECONDS="0.2"
+of_memories_generation=1; of_state_epoch=0
+LOOP_LOG="$WORK/loop-cycles.log"
+( of_memories_sync_loop > "$LOOP_LOG" 2>&1 ) &
+loop_pid=$!
+sleep 0.9
+kill -TERM "$loop_pid" 2>/dev/null || true
+wait "$loop_pid" 2>/dev/null || true
+cycles="$(grep -c 'snapshot uploaded to gs://test-bucket/memories.tar.gz' "$LOOP_LOG")"
+check "at least 2 sync cycles ran in ~0.9s at a 0.2s interval" "1" "$([[ "$cycles" -ge 2 ]] && echo 1 || echo 0)"
+
+echo "== case: of_memories_sync_loop -- an entry written mid-session survives a HARD kill (SIGKILL, never of_on_term) =="
+reset_stub
+MEM_HOME8="$WORK/mem-home8"; rm -rf "$MEM_HOME8"; mkdir -p "$MEM_HOME8/memories"
+mk_mem_file "$MEM_HOME8/memories" "MEMORY.md" "entry written before boot"
+export HERMES_HOME="$MEM_HOME8"
+export HERMES_MEMORIES_OBJECT="memories.tar.gz"
+export HERMES_MEMORY_SYNC_INTERVAL_SECONDS="0.2"
+of_memories_generation=1; of_state_epoch=0
+( of_memories_sync_loop > /dev/null 2>&1 ) &
+loop8_pid=$!
+sleep 0.3   # let >=1 tick complete
+mk_mem_file "$MEM_HOME8/memories" "MEMORY.md" "entry written before boot" "entry written mid-session, never gracefully shut down"
+sleep 0.3   # let a tick pick up the new entry
+kill -9 "$loop8_pid" 2>/dev/null || true   # SIGKILL -- of_on_term, of_state_snapshot, of_memories_snapshot's final flush NEVER run
+wait "$loop8_pid" 2>/dev/null || true
+mkdir -p "$WORK/crash-extract8"; tar xzf "$UPLOADED" -C "$WORK/crash-extract8" 2>/dev/null
+check "the mid-session entry reached GCS through a periodic tick, with no graceful shutdown at all" \
+  "1" "$(mem_file_entries "$WORK/crash-extract8/MEMORY.md" | grep -c '^entry written mid-session, never gracefully shut down$')"
+
+echo "== case: of_memories_sync_loop -- TERM interrupts immediately, does not wait out the interval =="
+reset_stub
+export HERMES_MEMORY_SYNC_INTERVAL_SECONDS="5"
+of_memories_generation=1; of_state_epoch=0
+( of_memories_sync_loop > /dev/null 2>&1 ) &
+loop_pid=$!
+sleep 0.2   # let it enter its sleep phase
+before="$SECONDS"
+kill -TERM "$loop_pid" 2>/dev/null || true
+wait "$loop_pid" 2>/dev/null || true
+elapsed=$((SECONDS - before))
+check "TERM was honored well under the 5s interval" "1" "$([[ "$elapsed" -le 1 ]] && echo 1 || echo 0)"
+
+# No mutant for the TERM/INT trap itself: measured directly (a probe outside this
+# harness, not kept here) -- bash's DEFAULT disposition for an untrapped SIGTERM already
+# terminates a process blocked in `wait` immediately, so removing the trap does not
+# change the elapsed-time behaviour the two scenarios above check, and asserting
+# otherwise would be exactly the "differs for a reason unrelated to the rule under test"
+# failure this file's own header warns against. The trap's real value is a clean exit
+# code (0, not 143) and no stray "Terminated" message -- neither observable here, since
+# the caller (of_on_term) never `wait`s on this pid or inspects its exit status. Kept in
+# production code as defensive style, consistent with the of_gateway_pid trap pattern.
+unset HERMES_MEMORY_SYNC_INTERVAL_SECONDS
 
 # ---------------------------------------------------------------------------
 # of_plugins_fetch (ADR-052) -- same fail-loud contract as of_skills_fetch: it
