@@ -147,6 +147,10 @@ deleted()   { grep -q "^DELETE " "$CALLS" && echo yes || echo no; }
 
 export HERMES_STATE_BUCKET="test-bucket"
 export HERMES_STATE_OBJECT="gateway-state.tar.gz"
+# Real script declares this `readonly` at file scope (deliberately not an env var --
+# see the comment there); extract_fns only pulls FUNCTION BODIES, not that top-level
+# declaration, so the harness must supply it before sourcing anything that reads it.
+OF_STATE_MERGE_MAX_ATTEMPTS=3
 
 # `set -e` is ON in the real entrypoint. Each scenario runs the function with -e enabled
 # so an unguarded non-zero -- which would abort the real shutdown path mid-way -- shows up

@@ -100,6 +100,14 @@
 #                   messages' much higher write-conflict rate.
 set -euo pipefail
 
+# openfathom-meta ENG-103. Retry ceiling for both CAS merge loops (of_state_snapshot_upload
+# and of_memories_write_with_merge_retry). A hardcoded constant, DELIBERATELY not an env
+# var: this number is a design decision about how much shutdown-budget network work is
+# acceptable before falling back to parking, not a per-deploy tuning knob -- an env var
+# here would invite "just bump the number" as a substitute for understanding why 3
+# attempts stopped being enough.
+readonly OF_STATE_MERGE_MAX_ATTEMPTS=3
+
 # --- State persistence (ENG-45) ---------------------------------------------
 # Why a snapshot to a single object instead of the GCS FUSE volume mount that
 # ADR-003 specifies for Track A: openfathom-meta ADR-041. The short version,
@@ -599,7 +607,7 @@ PY
 # net for genuine, unmergeable contention.
 of_state_snapshot_upload() {
   local stage="$1" tarball="$2" tok="$3"
-  local max_attempts="${OF_STATE_MERGE_MAX_ATTEMPTS:-3}"
+  local max_attempts="$OF_STATE_MERGE_MAX_ATTEMPTS"
   local gen="${of_state_generation:-0}" attempt=0 code
 
   while :; do
@@ -911,7 +919,7 @@ of_memories_restore() {
 # interval's worth of entries is at risk, never the whole session's memory.
 of_memories_write_with_merge_retry() {
   local mem_dir="$1" tarball="$2" tok="$3"
-  local max_attempts="${OF_STATE_MERGE_MAX_ATTEMPTS:-3}"
+  local max_attempts="$OF_STATE_MERGE_MAX_ATTEMPTS"
   local gen="${of_memories_generation:-0}" attempt=0 code
 
   while :; do
