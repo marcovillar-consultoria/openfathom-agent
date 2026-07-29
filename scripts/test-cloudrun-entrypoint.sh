@@ -791,6 +791,7 @@ LIVE_MEM_TB="$WORK/live-memories.tar.gz"
 mk_memories_tarball "$LIVE_MEM_TB" 3 "MEMORY.md" "user prefers pt-BR"
 export HERMES_HOME="$MEM_HOME2"
 LIVE="$LIVE_MEM_TB"
+of_state_epoch=3   # ENG-104: same epoch as the tarball -- the honest boot, guard stays quiet
 of_memories_restore >/dev/null 2>&1
 check "kept what was already on disk" "1" "$(mem_file_entries "$MEM_HOME2/memories/MEMORY.md" | grep -c '^carried over from a legacy combined tarball$')"
 check "merged in the entry from the memories object" "1" "$(mem_file_entries "$MEM_HOME2/memories/MEMORY.md" | grep -c '^user prefers pt-BR$')"
@@ -831,6 +832,67 @@ if grep -q 'if false; then' "$WORK/mem-epoch-mut.sh"; then
     "1" "$(mem_file_entries "$MEM_HOME4/MEMORY.md" | grep -c '^entry deliberately removed elsewhere$')"
 else
   bad "epoch-guard mutation did not apply -- a mutant that does not mutate proves nothing"
+fi
+
+# ---------------------------------------------------------------------------
+# openfathom-meta ENG-104. The RESTORE end of the same round trip. The write path above
+# refuses when the LIVE object is newer than us; this refuses when the DOWNLOADED tarball
+# predates the epoch we just restored. Without it, a reset per
+# openfathom-runbooks/docs/deploy/reset-gateway-state.md removed nothing: the operator
+# curated the state, bumped .state_epoch, and the very next boot unioned every deleted
+# memory straight back in from the untouched memories object.
+# ---------------------------------------------------------------------------
+echo "== case: of_memories_restore -- epoch guard refuses a tarball written before a deliberate reset =="
+reset_stub
+MEM_HOME7="$WORK/mem-home7"; rm -rf "$MEM_HOME7"; mkdir -p "$MEM_HOME7/memories"
+mk_mem_file "$MEM_HOME7/memories" "USER.md" "the one entry the operator chose to keep"
+LIVE_MEM_STALE="$WORK/live-memories-stale.tar.gz"
+mk_memories_tarball "$LIVE_MEM_STALE" 3 "USER.md" "deliberately deleted in the reset"
+export HERMES_HOME="$MEM_HOME7"
+LIVE="$LIVE_MEM_STALE"
+of_state_epoch=4   # the reset bumped .state_epoch to 4; the memories object is still at 3
+out="$(of_memories_restore 2>&1)"; echo "$out" | sed 's/^/    | /'
+check "names the deliberate reset instead of merging silently" \
+  "1" "$(echo "$out" | grep -c 'predates ours')"
+check "the deleted entry was NOT resurrected" \
+  "0" "$(mem_file_entries "$MEM_HOME7/memories/USER.md" | grep -c '^deliberately deleted in the reset$')"
+check "the curated entry survived untouched" \
+  "1" "$(mem_file_entries "$MEM_HOME7/memories/USER.md" | grep -c '^the one entry the operator chose to keep$')"
+
+echo "== case: of_memories_restore -- a tarball NEWER than ours still merges (guard is one-directional) =="
+reset_stub
+MEM_HOME8="$WORK/mem-home8"; rm -rf "$MEM_HOME8"; mkdir -p "$MEM_HOME8/memories"
+mk_mem_file "$MEM_HOME8/memories" "USER.md" "on disk already"
+LIVE_MEM_NEWER="$WORK/live-memories-newer.tar.gz"
+mk_memories_tarball "$LIVE_MEM_NEWER" 7 "USER.md" "written after a reset we have not seen"
+export HERMES_HOME="$MEM_HOME8"
+LIVE="$LIVE_MEM_NEWER"
+of_state_epoch=4
+of_memories_restore >/dev/null 2>&1
+check "a newer tarball is merged, not refused -- only the STALE direction is a resurrection" \
+  "1" "$(mem_file_entries "$MEM_HOME8/memories/USER.md" | grep -c '^written after a reset we have not seen$')"
+
+echo "== MUTANT: of_memories_restore -- restore epoch guard removed, the reset is undone at boot =="
+extract_one_fn "$WORK/mem-restore-epoch-mut.sh" of_memories_restore \
+  's|if \[\[ "\$tar_epoch" -lt "\${of_state_epoch:-0}" \]\]; then|if false; then|'
+if grep -q 'if false; then' "$WORK/mem-restore-epoch-mut.sh"; then
+  reset_stub
+  MEM_HOME9="$WORK/mem-home9"; rm -rf "$MEM_HOME9"; mkdir -p "$MEM_HOME9/memories"
+  mk_mem_file "$MEM_HOME9/memories" "USER.md" "the one entry the operator chose to keep"
+  LIVE="$LIVE_MEM_STALE"
+  export HERMES_HOME="$MEM_HOME9"
+  of_state_epoch=4
+  (
+    # shellcheck disable=SC1090
+    source "$FN"
+    # shellcheck disable=SC1090
+    source "$WORK/mem-restore-epoch-mut.sh"
+    of_memories_restore >/dev/null 2>&1
+  )
+  check "guard removed -- the deleted entry comes back at boot (this is the ENG-104 defect)" \
+    "1" "$(mem_file_entries "$MEM_HOME9/memories/USER.md" | grep -c '^deliberately deleted in the reset$')"
+else
+  bad "restore epoch-guard mutation did not apply -- a mutant that does not mutate proves nothing"
 fi
 
 echo "== case: of_memories_write_with_merge_retry -- generation carries forward after a successful write =="
