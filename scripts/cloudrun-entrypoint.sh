@@ -873,10 +873,17 @@ PY
 # Called AFTER of_state_restore (which may still extract a memories/ directory out of a
 # LEGACY combined tarball written before this split existed) and BEFORE of_write_soul.
 # UNION, never overwrite: whatever of_state_restore already put on disk from a legacy
-# tarball is the destination; what THIS object holds is the source. Union is commutative,
-# so there is no "which one wins" question at boot (unlike
-# of_memories_write_with_merge_retry, where the epoch guard exists precisely because a
-# decision has to be made about resurrection).
+# tarball is the destination; what THIS object holds is the source.
+#
+# openfathom-meta ENG-104. This comment used to end "Union is commutative, so there is no
+# 'which one wins' question at boot" -- true of two unions, and FALSE of a union against a
+# deliberate DELETION. A reset (openfathom-runbooks/docs/deploy/reset-gateway-state.md)
+# curates the state and bumps .state_epoch, but leaves HERMES_MEMORIES_OBJECT untouched;
+# without the guard below the next boot resurrected every memory the operator had just
+# removed, and the periodic loop then laundered that stale content into the NEW epoch.
+# The guard is the mirror of the one in of_memories_write_with_merge_retry: there it
+# refuses when the LIVE object is newer than us, here it refuses when the DOWNLOADED
+# tarball predates the epoch we just restored. Same question, both ends of the round trip.
 #
 # Best-effort by design, same as of_state_restore (Dogma 2): a gateway that boots with
 # fewer memories than it should is degraded, not down.
@@ -895,6 +902,16 @@ of_memories_restore() {
     404) echo "[of-memories] no memories snapshot yet (first boot)"; rm -f "$tarball"; return 0 ;;
     *)   echo "[of-memories] WARN: memories restore failed (HTTP ${code}); starting with restored state only" >&2; rm -f "$tarball"; return 0 ;;
   esac
+
+  # openfathom-meta ENG-104. of_state_restore already ran, so of_state_epoch holds the epoch
+  # the operator wrote. A tarball older than it was written BEFORE a deliberate reset and
+  # must not be merged back in -- see the comment block above.
+  local tar_epoch; tar_epoch="$(of_memories_tarball_epoch "$tarball")"
+  if [[ "$tar_epoch" -lt "${of_state_epoch:-0}" ]]; then
+    echo "[of-memories] NOT merging: tarball epoch ${tar_epoch} predates ours (${of_state_epoch:-0}) -- a deliberate reset happened. Starting with the curated memories only." >&2
+    rm -f "$tarball"
+    return 0
+  fi
 
   local extract_dir; extract_dir="$(mktemp -d)"
   if tar xzf "$tarball" -C "$extract_dir" 2>/dev/null; then
