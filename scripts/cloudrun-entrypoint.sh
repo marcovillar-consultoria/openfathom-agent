@@ -411,9 +411,14 @@ PY
 }
 
 # openfathom-meta ADR-049. Called ONLY after a 412 and ONLY after the conflict has been
-# safely parked. Tries to turn "refused, parked for a human" into "written", for the case
-# the measurement showed to be the common one: the outgoing instance holding strictly MORE
-# than the live object and being refused anyway.
+# safely parked. Tries to turn "refused, parked for a human" into "written" for the case
+# where the outgoing instance holds strictly MORE than the live object and was refused
+# anyway -- but that case is the MINORITY one, measured: 7 days of production logs gave 6
+# genuine divergences (`not a superset`, conflict parked unresolved) for 1 promotion
+# (`PROMOTED`). That is exactly why the parked-conflict queue does not resolve itself and
+# needs a lifecycle rule to expire it by age instead (openfathom-infra ENG-89) -- most
+# parked conflicts never become a superset of the live object, so this function never
+# fires for them.
 #
 # WHY THE ORDER IS THE SAFETY ARGUMENT. Parking happens first, unconditionally. Every way
 # this function can die -- SIGKILL mid-download, a broken tarball, a network fault -- ends
