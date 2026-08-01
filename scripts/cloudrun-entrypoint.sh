@@ -625,6 +625,21 @@ of_state_snapshot_upload() {
 
     if [[ "$code" == "200" ]]; then
       echo "[of-state] snapshot uploaded to gs://${HERMES_STATE_BUCKET}/${HERMES_STATE_OBJECT} (attempt ${attempt}, generation matched ${gen})"
+      # openfathom-meta ENG-132. Carry the new generation forward into the GLOBAL (no
+      # `local` -- same reason of_state_generation is not), so the NEXT tick of
+      # of_state_sync_loop targets it. Exactly the contract
+      # of_memories_write_with_merge_retry already states for its own object: without
+      # this, every periodic cycle after the first would still CAS against the
+      # generation this instance BOOTED with, 412, and pay a full download+merge+re-tar
+      # of a multi-megabyte tarball forever -- correct, but for nothing.
+      #
+      # DOES NOT reach the shutdown flush, and that is not a bug to chase: the loop
+      # runs in a background SUBSHELL, so this assignment is invisible to the parent
+      # shell that of_on_term runs in. That final snapshot therefore still 412s once
+      # and merges -- which is correct (the live object holds this same instance's
+      # earlier tick, so the union is a no-op) and costs one extra round trip at
+      # shutdown. Propagating it would need IPC, for no gain in correctness.
+      of_state_generation="$(of_gcs_read_generation "$HERMES_STATE_BUCKET" "$HERMES_STATE_OBJECT" "$tok")"
       return 0
     fi
     if [[ "$code" != "412" ]]; then
@@ -637,7 +652,12 @@ of_state_snapshot_upload() {
     fi
 
     echo "[of-state] WARN: gs://${HERMES_STATE_BUCKET}/${HERMES_STATE_OBJECT} changed since this instance restored (attempt ${attempt}/${max_attempts}, generation ${gen}) -- merging instead of parking" >&2
-    local live="/tmp/of-state-live-merge.tar.gz" live_code
+    # openfathom-meta ENG-132: mktemp, not the fixed /tmp/of-state-live-merge.tar.gz this
+    # used to be. Once of_state_sync_loop exists, a periodic call and of_on_term's final
+    # flush can be inside this function AT THE SAME TIME, and a shared path would have one
+    # invocation's download land in the other's merge. Same hazard, same fix, and for the
+    # same reason of_memories_snapshot already mktemps its staging dir.
+    local live live_code; live="$(mktemp --suffix=.tar.gz)"
     live_code="$(curl -sS -o "$live" -w '%{http_code}' --max-time 20 \
       -H "Authorization: Bearer ${tok}" \
       "https://storage.googleapis.com/storage/v1/b/${HERMES_STATE_BUCKET}/o/${HERMES_STATE_OBJECT}?alt=media" || echo 000)"
@@ -688,9 +708,17 @@ except Exception: print(0)' 2>/dev/null || echo 0)"
   fi
 }
 
+# openfathom-meta ENG-132. stage/tarball are mktemp'd fresh EVERY call, and that changed
+# the day of_state_sync_loop was added. They used to be the fixed /tmp/of-state-stage and
+# /tmp/of-state-snap.tar.gz, safe ONLY because this function ran exactly once per process
+# -- of_memories_snapshot's own comment already spelled out what happens when that stops
+# being true: the periodic loop and of_on_term's final flush can be in flight together,
+# bash defers a pending trap until the loop's current foreground command returns, and the
+# `rm -rf "$stage"` of one invocation deletes the directory the other is mid-`cp`/`tar`
+# into. The snapshot lost that way is the user's real conversation.
 of_state_snapshot() {
-  local home="${HERMES_HOME:-/opt/data}" stage="/tmp/of-state-stage" tarball="/tmp/of-state-snap.tar.gz" tok code
-  rm -rf "$stage" "$tarball"; mkdir -p "$stage"
+  local home="${HERMES_HOME:-/opt/data}" stage tarball tok code
+  stage="$(mktemp -d)"; tarball="$(mktemp --suffix=.tar.gz)"
   # Consistent copy of each SQLite DB, live-writer-safe.
   local db
   for db in "$home"/*.db; do
@@ -1067,6 +1095,37 @@ of_memories_sync_loop() {
   while true; do
     sleep "$interval" & wait "$!" || true
     of_memories_snapshot || echo "[of-memories] WARN: periodic sync cycle failed" >&2
+  done
+}
+
+# openfathom-meta ENG-132. The messages half of what ENG-103 did for memories, and it
+# closes the asymmetry that loop's comment declared deliberate.
+#
+# WHY IT STOPPED BEING RIGHT TO WAIT FOR SHUTDOWN. The state object only ever moved when
+# the gateway restarted, so the turn series in the bucket was frozen between deploys --
+# measured 2026-08-01: the live object was stamped 2026-07-30T09:19:06Z, eleven seconds
+# after the CURRENT revision went ready, i.e. it was the OUTGOING revision's goodbye, and
+# two days of conversation existed nowhere but the running instance. That is a durability
+# gap on its own, but the sharper cost was measurement: the ADR-042 verdict is decided on
+# turns/day, the weekly alert reads that object, and a window that had not been flushed
+# yet simply looked idle.
+#
+# WHAT MAKES IT SAFE, and none of it is new machinery: of_state_snapshot already copies
+# each SQLite DB with `VACUUM INTO` against a live writer, and of_state_snapshot_upload
+# already resolves a lost CAS by merging (ENG-103) rather than by clobbering or parking.
+# This loop adds a schedule, not a mechanism.
+#
+# INTERVAL, one hour and not the memories loop's 90s. The state tarball is ~5 MB against
+# memories' ~2 KB; at 90s that is ~4.8 GB/day of writes against a bucket with versioning
+# on, to shorten a gap that only matters at the granularity of a weekly report. At one
+# hour it is ~120 MB/day -- decimals of a real against a bill dominated by always-on CPU
+# -- and a crash loses at most an hour instead of everything since the last deploy.
+of_state_sync_loop() {
+  local interval="${HERMES_STATE_SYNC_INTERVAL_SECONDS:-3600}"
+  trap 'exit 0' TERM INT
+  while true; do
+    sleep "$interval" & wait "$!" || true
+    of_state_snapshot || echo "[of-state] WARN: periodic sync cycle failed" >&2
   done
 }
 
@@ -1953,11 +2012,21 @@ PYEOF
     of_memories_sync_loop &
     of_memories_loop_pid=$!
 
+    # openfathom-meta ENG-132. Same ordering constraint as the memories loop above and for
+    # the same reason: started AFTER of_state_restore has run, so this background shell
+    # inherits of_state_generation at the moment of the fork. Reverse that ordering and it
+    # would inherit 0, and every tick would 412 into a merge it never needed.
+    of_state_sync_loop &
+    of_state_loop_pid=$!
+
     of_on_term() {
       trap - TERM INT
       kill -TERM "${of_gateway_pid}" 2>/dev/null || true
       wait "${of_gateway_pid}" 2>/dev/null || true
       kill -TERM "${of_memories_loop_pid:-}" 2>/dev/null || true
+      # BEFORE the final flush, deliberately: a tick that is mid-upload would otherwise
+      # spend the same ~10s shutdown budget the flush below is sized to own.
+      kill -TERM "${of_state_loop_pid:-}" 2>/dev/null || true
       of_state_snapshot
       # AFTER the snapshot, deliberately, and the ordering is the whole safety argument.
       # Cloud Run allocates ~10s of shutdown and the snapshot is sized to own it (see the
@@ -1983,6 +2052,7 @@ PYEOF
     # no signal ever arrives and the gateway simply died on its own.
     wait "${of_gateway_pid}" || true
     kill -TERM "${of_memories_loop_pid:-}" 2>/dev/null || true
+    kill -TERM "${of_state_loop_pid:-}" 2>/dev/null || true
     of_state_snapshot
     of_memories_snapshot
     of_skills_inbox_deposit

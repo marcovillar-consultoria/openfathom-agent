@@ -38,7 +38,7 @@ extract_fns() { # extract_fns <dest> [sed-mutation]
   local dest="$1" mutation="${2:-}"
   : > "$dest"
   local fn
-  for fn in of_state_read_local_epoch of_state_tarball_epoch of_state_messages_superset of_state_try_promote of_state_merge_messages of_state_snapshot_upload of_gcs_read_generation of_memory_union of_memories_tarball_epoch of_memories_restore of_memories_snapshot of_memories_write_with_merge_retry of_memories_sync_loop; do
+  for fn in of_state_read_local_epoch of_state_tarball_epoch of_state_messages_superset of_state_try_promote of_state_merge_messages of_state_snapshot_upload of_state_snapshot of_state_sync_loop of_gcs_read_generation of_memory_union of_memories_tarball_epoch of_memories_restore of_memories_snapshot of_memories_write_with_merge_retry of_memories_sync_loop; do
     awk -v f="$fn" '$0 ~ "^"f"\\(\\) \\{" {p=1} p {print} p && /^\}$/ {exit}' "$ENTRYPOINT" >> "$dest"
     echo >> "$dest"
   done
@@ -1330,6 +1330,166 @@ if grep -q 'frontmatter_name = dirname$' "$WORK/inbox-mut.sh"; then
     "1" "$(grep -c '/mlops/vllm$' <<<"$mut_out")"
 else
   bad "inbox mutant did not apply -- a mutant that does not mutate proves nothing"
+fi
+
+# ---------------------------------------------------------------------------
+# of_state_sync_loop (openfathom-meta ENG-132) -- periodic persistence for MESSAGES,
+# closing the asymmetry of_memories_sync_loop's own comment declared deliberate. The
+# production fact that forced it: on 2026-08-01 the live state object was stamped
+# 2026-07-30T09:19:06Z, eleven seconds after the CURRENT revision went ready -- the
+# outgoing revision's goodbye -- so two days of turns existed nowhere but the instance.
+# ---------------------------------------------------------------------------
+mk_state_home() { # mk_state_home <dir> <epoch> <msg specs...>
+  local home="$1" epoch="$2"; shift 2
+  rm -rf "$home"; mkdir -p "$home"
+  printf '%s\n' "$epoch" > "$home/.state_epoch"
+  python3 - "$home/state.db" "$@" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("create table messages (id integer primary key, session_id text, role text, "
+            "content text, timestamp real)")
+for spec in sys.argv[2:]:
+    mid, sess, role, ts, content = spec.split(":", 4)
+    con.execute("insert into messages (id, session_id, role, content, timestamp) "
+                "values (?,?,?,?,?)", (int(mid), sess, role, content, float(ts)))
+con.commit(); con.close()
+PY
+}
+
+echo "== case: of_state_snapshot_upload -- carries the new generation forward after a 200 =="
+reset_stub
+STAGE_G="$WORK/upload-stage-gen"; rm -rf "$STAGE_G"
+mk_upload_stage "$STAGE_G" 3 "s1" "1:s1:user:100:hello"
+TARBALL_G="$WORK/upload-tb-gen.tar.gz"
+tar czf "$TARBALL_G" -C "$STAGE_G" .
+LIVE_GEN="99"; of_state_generation=42; of_state_epoch=3
+of_state_snapshot_upload "$STAGE_G" "$TARBALL_G" "stub-token" >/dev/null 2>&1
+check "of_state_generation advanced to the live generation, not left at boot's" \
+  "99" "${of_state_generation}"
+
+echo "== case: of_state_snapshot -- a fresh staging dir per call, never a shared fixed path =="
+reset_stub
+SNAP_HOME="$WORK/snap-home"; mk_state_home "$SNAP_HOME" 3 "1:s1:user:100:hello"
+export HERMES_HOME="$SNAP_HOME"
+MKTEMP_LOG="$WORK/mktemp-calls.log"; : > "$MKTEMP_LOG"
+# Wrap mktemp so the test can see WHETHER a per-call path was allocated at all. A fixed
+# path is invisible to any assertion on the uploaded bytes -- the damage it does needs two
+# invocations overlapping in time, which a unit test cannot schedule deterministically.
+# What IS deterministic, and is the property the fix actually adds, is that each call
+# allocates its own.
+mktemp() { local p; p="$(command mktemp "$@")"; echo "$p" >> "$MKTEMP_LOG"; echo "$p"; }
+of_state_generation=0; of_state_epoch=3
+of_state_snapshot >/dev/null 2>&1
+of_state_snapshot >/dev/null 2>&1
+unset -f mktemp
+check "two calls allocated 4 temp paths (a stage + a tarball each)" \
+  "4" "$(wc -l < "$MKTEMP_LOG")"
+check "every allocated path is distinct -- no call reuses another's" \
+  "4" "$(sort -u "$MKTEMP_LOG" | wc -l)"
+
+echo "== case: of_state_sync_loop -- runs at least 2 cycles with a short interval =="
+reset_stub
+SYNC_HOME="$WORK/sync-home"; mk_state_home "$SYNC_HOME" 3 "1:s1:user:100:hello"
+export HERMES_HOME="$SYNC_HOME"
+export HERMES_STATE_SYNC_INTERVAL_SECONDS="0.2"
+of_state_generation=0; of_state_epoch=3
+STATE_LOOP_LOG="$WORK/state-loop.log"
+( of_state_sync_loop > "$STATE_LOOP_LOG" 2>&1 ) &
+state_loop_pid=$!
+sleep 0.9
+kill -TERM "$state_loop_pid" 2>/dev/null || true
+wait "$state_loop_pid" 2>/dev/null || true
+state_cycles="$(grep -c 'snapshot uploaded to gs://test-bucket/gateway-state.tar.gz' "$STATE_LOOP_LOG")"
+check "at least 2 state sync cycles ran in ~0.9s at a 0.2s interval" \
+  "1" "$([[ "$state_cycles" -ge 2 ]] && echo 1 || echo 0)"
+
+echo "== case: of_state_sync_loop -- a turn written mid-session survives a HARD kill (SIGKILL) =="
+reset_stub
+CRASH_HOME="$WORK/crash-home"; mk_state_home "$CRASH_HOME" 3 "1:s1:user:100:before boot"
+export HERMES_HOME="$CRASH_HOME"
+export HERMES_STATE_SYNC_INTERVAL_SECONDS="0.2"
+of_state_generation=0; of_state_epoch=3
+( of_state_sync_loop > /dev/null 2>&1 ) &
+crash_loop_pid=$!
+sleep 0.3
+python3 - "$CRASH_HOME/state.db" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("insert into messages (id, session_id, role, content, timestamp) "
+            "values (2, 's1', 'user', 'mid-session, never gracefully shut down', 200.0)")
+con.commit(); con.close()
+PY
+sleep 0.3
+kill -9 "$crash_loop_pid" 2>/dev/null || true   # of_on_term and its final flush NEVER run
+wait "$crash_loop_pid" 2>/dev/null || true
+mkdir -p "$WORK/state-crash-extract"; tar xzf "$UPLOADED" -C "$WORK/state-crash-extract" 2>/dev/null
+check "the mid-session turn reached GCS through a periodic tick, with no graceful shutdown at all" \
+  "1" "$(python3 -c "
+import sqlite3
+con = sqlite3.connect('$WORK/state-crash-extract/state.db')
+print(con.execute(\"select count(*) from messages where content='mid-session, never gracefully shut down'\").fetchone()[0])
+" 2>/dev/null)"
+
+echo "== case: of_state_sync_loop -- TERM interrupts immediately, does not wait out the interval =="
+reset_stub
+export HERMES_STATE_SYNC_INTERVAL_SECONDS="5"
+of_state_generation=0; of_state_epoch=3
+( of_state_sync_loop > /dev/null 2>&1 ) &
+term_loop_pid=$!
+sleep 0.2
+term_start="$(date +%s%N)"
+kill -TERM "$term_loop_pid" 2>/dev/null || true
+wait "$term_loop_pid" 2>/dev/null || true
+term_ms=$(( ( $(date +%s%N) - term_start ) / 1000000 ))
+check "TERM returned in well under the 5s interval (bare \`sleep\` would have run to completion)" \
+  "1" "$([[ "$term_ms" -lt 2000 ]] && echo 1 || echo 0)"
+
+echo "== MUTANT: of_state_snapshot_upload without the generation write-back =="
+# Reverts to the pre-ENG-132 behaviour: gen read once at boot and never advanced. Every
+# periodic tick after the first would then CAS against a generation the object has moved
+# past, 412, and pay a full download+merge+re-tar of a multi-megabyte tarball forever.
+extract_one_fn "$WORK/gen-mut.sh" of_state_snapshot_upload \
+  '/of_state_generation="\$(of_gcs_read_generation/d'
+if ! grep -q 'of_state_generation="\$(of_gcs_read_generation' "$WORK/gen-mut.sh"; then
+  reset_stub
+  STAGE_M="$WORK/upload-stage-mut"; rm -rf "$STAGE_M"
+  mk_upload_stage "$STAGE_M" 3 "s1" "1:s1:user:100:hello"
+  TARBALL_M="$WORK/upload-tb-mut.tar.gz"
+  tar czf "$TARBALL_M" -C "$STAGE_M" .
+  LIVE_GEN="99"; of_state_epoch=3
+  mut_gen="$( ( # shellcheck disable=SC1090
+    source "$WORK/gen-mut.sh"
+    of_state_generation=42
+    of_state_snapshot_upload "$STAGE_M" "$TARBALL_M" "stub-token" >/dev/null 2>&1
+    echo "$of_state_generation" ) )"
+  check "write-back removed -> the generation is stuck at boot's 42 (proves the fix is load-bearing)" \
+    "42" "$mut_gen"
+else
+  bad "generation mutant did not apply -- a mutant that does not mutate proves nothing"
+fi
+
+echo "== MUTANT: of_state_snapshot back on the shared fixed staging path =="
+# Reverts to the pre-ENG-132 `stage=/tmp/of-state-stage`, safe only while this function
+# ran exactly once per process. With of_state_sync_loop alive it no longer does, and the
+# `rm -rf "$stage"` of one invocation deletes what the other is mid-tar into.
+extract_one_fn "$WORK/stage-mut.sh" of_state_snapshot \
+  's|stage="\$(mktemp -d)"; tarball="\$(mktemp --suffix=.tar.gz)"|stage="/tmp/of-state-stage-mut"; tarball="/tmp/of-state-snap-mut.tar.gz"; rm -rf "$stage" "$tarball"; mkdir -p "$stage"|'
+if grep -q '/tmp/of-state-stage-mut' "$WORK/stage-mut.sh"; then
+  reset_stub
+  MUT_HOME="$WORK/stage-mut-home"; mk_state_home "$MUT_HOME" 3 "1:s1:user:100:hello"
+  export HERMES_HOME="$MUT_HOME"
+  MUT_MKTEMP_LOG="$WORK/mktemp-mut.log"; : > "$MUT_MKTEMP_LOG"
+  mut_paths="$( ( # shellcheck disable=SC1090
+    source "$WORK/stage-mut.sh"
+    mktemp() { local p; p="$(command mktemp "$@")"; echo "$p" >> "$MUT_MKTEMP_LOG"; echo "$p"; }
+    of_state_generation=0; of_state_epoch=3
+    of_state_snapshot >/dev/null 2>&1
+    of_state_snapshot >/dev/null 2>&1
+    wc -l < "$MUT_MKTEMP_LOG" ) )"
+  check "fixed path restored -> both calls share one staging dir, 0 per-call allocations (proves the fix is load-bearing)" \
+    "0" "$(echo "$mut_paths" | tr -d ' ')"
+else
+  bad "staging-path mutant did not apply -- a mutant that does not mutate proves nothing"
 fi
 
 echo
