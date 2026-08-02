@@ -613,7 +613,7 @@ PY
 of_state_snapshot_upload() {
   local stage="$1" tarball="$2" tok="$3"
   local max_attempts="$OF_STATE_MERGE_MAX_ATTEMPTS"
-  local gen="${of_state_generation:-0}" attempt=0 code
+  local gen="${of_state_generation:-0}" attempt=0 code merged=0
 
   while :; do
     attempt=$((attempt + 1))
@@ -633,13 +633,35 @@ of_state_snapshot_upload() {
       # generation this instance BOOTED with, 412, and pay a full download+merge+re-tar
       # of a multi-megabyte tarball forever -- correct, but for nothing.
       #
+      # ONLY WHEN THIS CALL DID NOT MERGE, and openfathom-meta ENG-136 is the production
+      # measurement that added the condition. of_state_merge_messages writes into
+      # $stage/state.db -- a mktemp'd staging copy that is discarded here -- and NEVER
+      # into $HERMES_HOME/state.db. So a merged union exists only in the object that was
+      # just uploaded. Carry the generation forward after a merge and the next tick
+      # re-stages from $HERMES_HOME (which never saw the union), CASes successfully
+      # against that same generation, gets a 200 instead of a 412, and OVERWRITES the
+      # union with the smaller local state. Measured in production on 2026-08-01: the
+      # 18:09Z tick merged and wrote 3 sessions / 135 messages; the 19:09Z tick wrote 2
+      # sessions / 46 messages, and session 20260730_071029_cc5c4281 (89 messages,
+      # 07-30T10:10Z -> 07-31T23:13Z) was gone for 20 consecutive ticks after it.
+      #
+      # Before of_state_sync_loop this was unreachable: one upload per instance lifetime
+      # means a merge is never followed by another write from the same instance. THE
+      # PERIODICITY IS WHAT TURNS THE MERGE INTO A LOSS. Leaving the generation at its
+      # pre-merge value makes the next tick 412 and merge again, which is the only way
+      # the union survives while it lives nowhere but the object. That costs one extra
+      # round trip per tick, permanently, once contention has happened once -- and the
+      # comment above weighed exactly that cost, against a benefit it did not have.
+      #
       # DOES NOT reach the shutdown flush, and that is not a bug to chase: the loop
       # runs in a background SUBSHELL, so this assignment is invisible to the parent
       # shell that of_on_term runs in. That final snapshot therefore still 412s once
       # and merges -- which is correct (the live object holds this same instance's
-      # earlier tick, so the union is a no-op) and costs one extra round trip at
+      # earlier tick, so the union subsumes it) and costs one extra round trip at
       # shutdown. Propagating it would need IPC, for no gain in correctness.
-      of_state_generation="$(of_gcs_read_generation "$HERMES_STATE_BUCKET" "$HERMES_STATE_OBJECT" "$tok")"
+      if [[ "$merged" -eq 0 ]]; then
+        of_state_generation="$(of_gcs_read_generation "$HERMES_STATE_BUCKET" "$HERMES_STATE_OBJECT" "$tok")"
+      fi
       return 0
     fi
     if [[ "$code" != "412" ]]; then
@@ -677,6 +699,11 @@ of_state_snapshot_upload() {
       rm -f "$live"; break
     fi
     rm -f "$live"
+    # openfathom-meta ENG-136. The union now exists ONLY in $stage/state.db and in the
+    # object this loop is about to write -- not in $HERMES_HOME. The 200 branch reads
+    # this to decide whether carrying the generation forward is safe; see the comment
+    # there for the production measurement that made the flag necessary.
+    merged=1
 
     tar czf "$tarball" -C "$stage" . || { echo "[of-state] ERROR: re-tar after merge failed; SESSION LOST" >&2; return 0; }
 
