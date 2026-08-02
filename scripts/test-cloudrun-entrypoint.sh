@@ -102,6 +102,28 @@ UPLOADED="$WORK/uploaded.tar.gz"
 UPLOAD_CODES_FILE="$WORK/upload_codes"
 set_upload_codes() { printf '%s\n' "$@" > "$UPLOAD_CODES_FILE"; }
 
+# openfathom-meta ENG-136. Opt-in emulation of the REAL compare-and-swap, for the one
+# property a scripted code queue cannot express: whether a 412 happens is a CONSEQUENCE
+# of the generation the caller sent, not of what the test primed. A queue that hands out
+# `412 200 412 200` passes against code that lost the union and against code that kept
+# it, because the second 412 arrives no matter what the caller did -- exactly the shape
+# of test the ENG-133 post-mortem calls "passing by coincidence".
+#
+# File-backed for the same reason UPLOAD_CODES_FILE is: the real code calls curl inside
+# `code="$(curl ...)"`, a command-substitution subshell, so any variable this stub writes
+# there evaporates. Reads of LIVE/LIVE_GEN survive; writes do not.
+#
+# Off unless a test calls cas_enable, so every existing case keeps the queue semantics.
+CAS_GEN_FILE="$WORK/cas_gen"
+CAS_LIVE="$WORK/cas_live.tar.gz"
+CAS_ENFORCED=""
+cas_enable() { # cas_enable <current generation> <tarball the live object holds>
+  CAS_ENFORCED=1
+  printf '%s\n' "$1" > "$CAS_GEN_FILE"
+  cp -f "$2" "$CAS_LIVE"
+}
+cas_generation() { cat "$CAS_GEN_FILE"; }
+
 of_metadata_token() { echo "stub-token"; }
 
 curl() {
@@ -118,14 +140,27 @@ curl() {
   echo "${method} ${url}" >> "$CALLS"
 
   if [[ "$url" == *"?alt=media"* ]]; then
-    if [[ -n "$LIVE" && -f "$LIVE" ]]; then
-      [[ -n "$out" ]] && cp -f "$LIVE" "$out"; echo "200"
+    local served="$LIVE"
+    [[ -n "$CAS_ENFORCED" ]] && served="$CAS_LIVE"
+    if [[ -n "$served" && -f "$served" ]]; then
+      [[ -n "$out" ]] && cp -f "$served" "$out"; echo "200"
     else
       echo "404"
     fi
     return 0
   fi
   if [[ "$method" == "DELETE" ]]; then echo "204"; return 0; fi
+  # ENG-136. A conditional write under CAS mode: 412 unless the caller's generation is
+  # the one the object actually carries. On success the object MOVES -- new bytes, new
+  # generation -- which is what makes a second tick's stale generation fail.
+  if [[ -n "$CAS_ENFORCED" && "$url" == *"uploadType=media"* && "$url" == *"ifGenerationMatch="* ]]; then
+    local want="${url##*ifGenerationMatch=}"; want="${want%%&*}"
+    if [[ "$want" != "$(cat "$CAS_GEN_FILE")" ]]; then echo "412"; return 0; fi
+    if [[ -n "$data" ]]; then cp -f "$data" "$UPLOADED"; cp -f "$data" "$CAS_LIVE"; fi
+    printf '%s\n' "$(( $(cat "$CAS_GEN_FILE") + 1 ))" > "$CAS_GEN_FILE"
+    echo "200"
+    return 0
+  fi
   if [[ "$url" == *"uploadType=media"* ]]; then
     [[ -n "$data" ]] && cp -f "$data" "$UPLOADED"
     if [[ -s "$UPLOAD_CODES_FILE" ]]; then
@@ -138,10 +173,14 @@ curl() {
     return 0
   fi
   # Object metadata GET -> generation.
-  printf '{"generation":"%s"}\n' "$LIVE_GEN"
+  if [[ -n "$CAS_ENFORCED" ]]; then
+    printf '{"generation":"%s"}\n' "$(cat "$CAS_GEN_FILE")"
+  else
+    printf '{"generation":"%s"}\n' "$LIVE_GEN"
+  fi
 }
 
-reset_stub() { : > "$CALLS"; rm -f "$UPLOADED"; LIVE=""; LIVE_GEN="42"; : > "$UPLOAD_CODES_FILE"; }
+reset_stub() { : > "$CALLS"; rm -f "$UPLOADED"; LIVE=""; LIVE_GEN="42"; CAS_ENFORCED=""; : > "$UPLOAD_CODES_FILE"; }
 promoted()  { [[ -f "$UPLOADED" ]] && echo yes || echo no; }
 deleted()   { grep -q "^DELETE " "$CALLS" && echo yes || echo no; }
 
@@ -1367,6 +1406,80 @@ of_state_snapshot_upload "$STAGE_G" "$TARBALL_G" "stub-token" >/dev/null 2>&1
 check "of_state_generation advanced to the live generation, not left at boot's" \
   "99" "${of_state_generation}"
 
+# ---------------------------------------------------------------------------
+# openfathom-meta ENG-136. The case above is the UNCONTENDED path and stays true. This
+# one is the contended path, and it is where carrying the generation forward destroys
+# data: of_state_merge_messages writes the union into the mktemp'd STAGING copy, never
+# into $HERMES_HOME, so the union exists only in the object just written. Advance the
+# generation and the next tick re-stages from $HERMES_HOME, matches the CAS, gets a 200
+# instead of a 412, and overwrites the union with the smaller local state.
+#
+# Production, 2026-08-01: 18:09:34Z wrote 3 sessions / 135 messages after a merge;
+# 19:09:35Z wrote 2 sessions / 46 messages, and session 20260730_071029_cc5c4281 stayed
+# gone for 20 consecutive hourly ticks. Two ticks is the smallest thing that reproduces
+# it, and one tick can never show it -- which is why every ENG-132 test passed.
+# ---------------------------------------------------------------------------
+e136_object_has() { # e136_object_has <content> -> 1 if present in the live object
+  local d; d="$(mktemp -d -p "$WORK")"
+  tar xzf "$CAS_LIVE" -C "$d" 2>/dev/null
+  python3 - "$d/state.db" "$1" <<'PY'
+import sqlite3, sys
+try:
+    con = sqlite3.connect(sys.argv[1])
+    print(con.execute("select count(*) from messages where content = ?", (sys.argv[2],)).fetchone()[0])
+except Exception:
+    print(-1)
+PY
+}
+
+echo "== case: ENG-136 -- a merged union survives the NEXT tick =="
+reset_stub
+E136_HOME="$WORK/eng136-home"; rm -rf "$E136_HOME"; mkdir -p "$E136_HOME"
+printf '3\n' > "$E136_HOME/.state_epoch"
+mk_full_db "$E136_HOME/state.db" "s1" "1:s1:user:100:local-only"
+export HERMES_HOME="$E136_HOME"
+E136_LIVE="$WORK/eng136-live.tar.gz"
+mk_full_state "$E136_LIVE" 3 "s1,s2" "1:s1:user:100:local-only" "2:s2:user:200:only-in-the-object"
+# Generation 77 in the object, 42 in this instance: the boot race of of-09.md section 11,
+# which is what puts turns in the object that were never in $HERMES_HOME.
+cas_enable 77 "$E136_LIVE"
+of_state_generation=42; of_state_epoch=3
+of_state_snapshot >/dev/null 2>&1
+check "tick 1 -- the 412 merged, and the union reached the object" \
+  "1" "$(e136_object_has 'only-in-the-object')"
+check "tick 1 -- the generation was NOT carried forward past a merge" \
+  "42" "${of_state_generation}"
+of_state_snapshot >/dev/null 2>&1
+check "tick 2 -- the union SURVIVED (this is the whole item: 89 real messages did not)" \
+  "1" "$(e136_object_has 'only-in-the-object')"
+check "tick 2 -- and the instance's own state is still there, so nothing was traded away" \
+  "1" "$(e136_object_has 'local-only')"
+
+echo "== MUTANT: ENG-136 -- the merge is not recorded, so the generation advances anyway =="
+# Exactly the code that ran in production between 2026-08-01 and this fix: the write-back
+# is unconditional because nothing ever tells it a merge happened. Tick 2 then CASes
+# successfully and the union is gone -- silently, with a 200 and a cheerful log line.
+extract_fns "$WORK/e136-mut.sh" '/^    merged=1$/d'
+if ! grep -q '^    merged=1$' "$WORK/e136-mut.sh" && bash -n "$WORK/e136-mut.sh" 2>/dev/null; then
+  reset_stub
+  E136M_HOME="$WORK/eng136-mut-home"; rm -rf "$E136M_HOME"; mkdir -p "$E136M_HOME"
+  printf '3\n' > "$E136M_HOME/.state_epoch"
+  mk_full_db "$E136M_HOME/state.db" "s1" "1:s1:user:100:local-only"
+  export HERMES_HOME="$E136M_HOME"
+  E136M_LIVE="$WORK/eng136-mut-live.tar.gz"
+  mk_full_state "$E136M_LIVE" 3 "s1,s2" "1:s1:user:100:local-only" "2:s2:user:200:only-in-the-object"
+  cas_enable 77 "$E136M_LIVE"
+  ( # shellcheck disable=SC1090
+    source "$WORK/e136-mut.sh"
+    of_state_generation=42; of_state_epoch=3
+    of_state_snapshot >/dev/null 2>&1
+    of_state_snapshot >/dev/null 2>&1 )
+  check "merge flag removed -> tick 2 destroyed the union (proves the fix is load-bearing)" \
+    "0" "$(e136_object_has 'only-in-the-object')"
+else
+  bad "ENG-136 mutant did not apply -- a mutant that does not mutate proves nothing"
+fi
+
 echo "== case: of_state_snapshot -- a fresh staging dir per call, never a shared fixed path =="
 reset_stub
 SNAP_HOME="$WORK/snap-home"; mk_state_home "$SNAP_HOME" 3 "1:s1:user:100:hello"
@@ -1448,9 +1561,14 @@ echo "== MUTANT: of_state_snapshot_upload without the generation write-back =="
 # Reverts to the pre-ENG-132 behaviour: gen read once at boot and never advanced. Every
 # periodic tick after the first would then CAS against a generation the object has moved
 # past, 412, and pay a full download+merge+re-tar of a multi-megabyte tarball forever.
+# ENG-136 made the write-back conditional, so the mutation deletes the whole `if` block
+# (3 lines) rather than the assignment alone -- deleting the assignment on its own leaves
+# a dangling `fi` and the mutant dies of a SYNTAX error, which proves nothing about the
+# behaviour under test. A mutant that fails to parse is not a mutant.
 extract_one_fn "$WORK/gen-mut.sh" of_state_snapshot_upload \
-  '/of_state_generation="\$(of_gcs_read_generation/d'
-if ! grep -q 'of_state_generation="\$(of_gcs_read_generation' "$WORK/gen-mut.sh"; then
+  '/if \[\[ "\$merged" -eq 0 \]\]; then/,+2d'
+if ! grep -q 'of_state_generation="\$(of_gcs_read_generation' "$WORK/gen-mut.sh" \
+   && bash -n "$WORK/gen-mut.sh" 2>/dev/null; then
   reset_stub
   STAGE_M="$WORK/upload-stage-mut"; rm -rf "$STAGE_M"
   mk_upload_stage "$STAGE_M" 3 "s1" "1:s1:user:100:hello"
