@@ -14,11 +14,21 @@
 #   docker build -t of-agent:base .
 #   docker build -f Dockerfile.cloudrun -t of-agent:cloudrun .
 #
-# ENTRYPOINT is intentionally NOT redeclared here -- it stays `["/init",
-# "/opt/hermes/docker/main-wrapper.sh"]`, inherited from BASE_IMAGE.
-# docker-compose.yml's own warning applies: bypassing /init skips the
-# stage2-hook.sh UID/GID remap and venv seed, which cloudrun-entrypoint.sh
-# still needs even for a single Cloud Run Job invocation.
+# ENTRYPOINT is intentionally NOT redeclared here -- whatever BASE_IMAGE
+# declares is inherited verbatim. This comment used to assert that value was
+# `["/init", "/opt/hermes/docker/main-wrapper.sh"]`; the upstream sync of
+# 2026-08-03 (#48) changed it to `["/opt/hermes/docker/entrypoint-dispatch.sh"]`
+# (upstream #38349) and the comment outlived the fact. Asserting the inherited
+# value here is what went stale, so it is not asserted again: read it from the
+# base image's own `Dockerfile`.
+#
+# What DOES matter to this file, and is stable across that change: the boot
+# must go through `/init`. The dispatcher preserves it when the container owns
+# PID 1 -- the Cloud Run case -- by exec'ing `/init main-wrapper.sh "$@"`; its
+# non-PID-1 fallback (Fly Machines, `docker run --init`) skips s6 supervision
+# and does not apply to us. docker-compose.yml's own warning is the reason:
+# bypassing /init skips the stage2-hook.sh UID/GID remap and venv seed, which
+# cloudrun-entrypoint.sh still needs even for a single Cloud Run Job invocation.
 ARG BASE_IMAGE=of-agent:base
 FROM ${BASE_IMAGE}
 
