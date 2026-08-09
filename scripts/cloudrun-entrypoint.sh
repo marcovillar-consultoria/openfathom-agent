@@ -1863,12 +1863,29 @@ PYEOF
     # `tools.57.custom.input_schema: JSON schema is invalid` -- measured in production, the
     # gateway was down for tool-use. The bug is in hermes core (`_normalize_mcp_input_schema`
     # applies only the nullable-union sanitizer, not the multi-type-array one), which
-    # ADR-002 forbids us to patch in this fork; the fix went upstream as
-    # NousResearch/hermes-agent#68241 and returns via the weekly sync.
+    # ADR-002 forbids us to patch in this fork; the fix has to land upstream first.
+    #
+    # DO NOT FLIP THIS ON A SYNC. That is what this comment used to say, and by
+    # 2026-08-09 it had become false in the direction that breaks production. The
+    # history, because the short version misleads: the fix was first proposed as
+    # NousResearch/hermes-agent#68241, which was CLOSED without merging -- their
+    # automated review found a real defect in it (routing MCP ingestion through
+    # `_sanitize_node` also renames property keys, so the registry would hold
+    # sanitized keys and `unrename_tool_args` would dispatch with the wrong ones).
+    # It was reopened, narrowed, as #75591, still OPEN as of 2026-08-09. Meanwhile
+    # the weekly sync DID start working (openfathom-meta ENG-62, first green
+    # `schedule` run 2026-08-03) and an image built from it IS in production --
+    # without the fix. A sync landing is therefore NOT evidence that the fix landed.
+    #
+    # THE CONDITION IS THE CODE, NOT THE CALENDAR. Re-enable only after checking, in
+    # the image being deployed, that `_normalize_mcp_input_schema` in tools/mcp_tool.py
+    # collapses multi-type `type` arrays -- today it calls only `strip_nullable_unions`
+    # (verified on cloudrun HEAD, 2026-08-09). Flipping to True before that 400s EVERY
+    # Claude-backed turn, which is exactly the outage this bridge ended.
     #
     # Config, secret and IAM stay fully wired -- flipping `enabled` back to True re-enables
     # everything with no other change -- so this is a pause, not a teardown of the OF-15
-    # work. Re-enable once the upstream fix lands in our image.
+    # work. Tracked in openfathom-meta ENG-78 (the pause) and ENG-121 (the upstream PR).
     if [[ -n "${MCP_GITHUB_API_KEY:-}" ]]; then
       python3 - <<'PYEOF'
 from hermes_cli.config import get_config_path, fast_safe_load, ensure_hermes_home, _set_nested
@@ -1878,7 +1895,7 @@ cfg = (fast_safe_load(open(p)) or {}) if p.exists() else {}
 _set_nested(cfg, "mcp_servers.github", {
     "url": "https://api.githubcopilot.com/mcp/",
     "headers": {"Authorization": "Bearer ${MCP_GITHUB_API_KEY}"},
-    "enabled": False,  # bridge: see comment above (upstream#68241). Flip to True on sync.
+    "enabled": False,  # bridge: see comment above. NOT flipped by a sync -- check the code.
 })
 ensure_hermes_home()
 atomic_yaml_write(p, cfg, sort_keys=False)
