@@ -25,6 +25,8 @@ Usage:
     result = file_ops.search("TODO", path=".", file_glob="*.py")
 """
 
+import base64
+import binascii
 import os
 import re
 import difflib
@@ -464,8 +466,13 @@ class FileOperations(ABC):
         """
         ...
 
+    def read_file_bytes(self, path: str, max_bytes: Optional[int] = None) -> ReadResult:
+        """Read complete binary content as base64 across the backend boundary."""
+        return ReadResult(error="Binary reads are not implemented for this backend")
+
     @abstractmethod
-    def write_file(self, path: str, content: str) -> WriteResult:
+    def write_file(self, path: str, content: str,
+                   pre_content: Optional[str] = None) -> WriteResult:
         """Write content to a file, creating directories as needed."""
         ...
 
@@ -660,14 +667,8 @@ def _lint_yaml_inproc(content: str) -> tuple[bool, str]:
 
 def _lint_toml_inproc(content: str) -> tuple[bool, str]:
     """In-process TOML syntax check (stdlib tomllib, Python 3.11+)."""
-    try:
-        import tomllib as _toml
-    except ImportError:
-        # Pre-3.11 fallback via tomli, if installed.
-        try:
-            import tomli as _toml  # type: ignore[no-redef]
-        except ImportError:
-            return True, "__SKIP__"
+    import tomllib as _toml
+
     try:
         _toml.loads(content)
         return True, ""
@@ -875,9 +876,16 @@ class ShellFileOperations(FileOperations):
         # Fall through to init-time self.cwd only if the env doesn't track cwd.
         effective_cwd = cwd or getattr(self.env, 'cwd', None) or self.cwd
         result = self.env.execute(command, cwd=effective_cwd, **kwargs)
+        exit_code = result.get("returncode", 0)
+        # A stdin write failure with an otherwise-clean child exit is still
+        # a failure: the child never received the intended input. write_file
+        # rejects such content up front (Task 3); this mapping is
+        # defense-in-depth for any other stdin caller.
+        if result.get("stdin_error") and exit_code == 0:
+            exit_code = 1
         return ExecuteResult(
             stdout=result.get("output", ""),
-            exit_code=result.get("returncode", 0)
+            exit_code=exit_code
         )
     
     def _has_command(self, cmd: str) -> bool:
@@ -887,6 +895,72 @@ class ShellFileOperations(FileOperations):
             self._command_cache[cmd] = result.stdout.strip() == 'yes'
         return self._command_cache[cmd]
     
+    def _sample_file_bytes(self, path: str, length: int = 1000):
+        """Fetch the first ``length`` raw bytes of a file through the terminal.
+
+        File operations run through a terminal backend (possibly remote), so
+        raw bytes cannot cross the transport directly — the terminal decodes
+        stdout with ``errors="replace"`` and manufactures U+FFFD at every
+        byte it cannot decode, including a multibyte character cut in half by
+        ``head -c``. Wrapping the sample in base64 lets the original bytes
+        survive the transport, so binary detection can happen at the byte
+        layer where it is well-defined (#80308 and friends).
+
+        Returns the sample bytes, or ``None`` when the transport could not
+        produce clean base64 (exotic shells without ``base64``); callers fall
+        back to the legacy text-sample heuristic in that case.
+        """
+        result = self._exec(
+            f"head -c {length} {self._escape_shell_arg(path)} 2>/dev/null | base64"
+        )
+        if result.exit_code != 0:
+            return None
+        encoded = _strip_terminal_fence_leaks(result.stdout)
+        encoded = "".join(encoded.split())
+        if not encoded:
+            return b""
+        if not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", encoded):
+            return None
+        try:
+            return base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            return None
+
+    @staticmethod
+    def _is_likely_binary_bytes(sample: bytes) -> bool:
+        """Byte-layer binary detection (the boundary for the #80308 class).
+
+        Contract: a file is text when its sample is valid UTF-8, allowing one
+        incomplete multibyte sequence at the very end (an artifact of cutting
+        the sample at a byte boundary, not a property of the file). Anything
+        else — NUL bytes, mid-stream invalid UTF-8 such as latin-1 or true
+        binaries — stays read-only, preserving the anti-mojibake guarantee
+        the old U+FFFD check existed for: a read→edit→write round-trip must
+        never rewrite undecodable bytes with replacement characters.
+
+        A file that legitimately *contains* U+FFFD (EF BF BD — e.g. logs of
+        lossy output) is valid UTF-8 and reads as text; the old text-layer
+        check misclassified it because it could not tell a stored replacement
+        character from a transport-manufactured one.
+        """
+        if not sample:
+            return False
+        if b"\x00" in sample:
+            return True
+        try:
+            sample.decode("utf-8")
+            return False
+        except UnicodeDecodeError as exc:
+            # UTF-8 sequences are at most 4 bytes: an error starting in the
+            # last 3 bytes with a clean prefix is a boundary cut, not binary.
+            if exc.start >= len(sample) - 3:
+                try:
+                    sample[: exc.start].decode("utf-8")
+                    return False
+                except UnicodeDecodeError:
+                    pass
+            return True
+
     def _is_likely_binary(self, path: str, content_sample: str = None) -> bool:
         """
         Check if a file is likely binary.
@@ -1012,6 +1086,9 @@ class ShellFileOperations(FileOperations):
         ``.hermes-tmp`` file next to the user's data, and the original file
         is left untouched. Content rides stdin so there is no ARG_MAX limit.
 
+        ``mkdir -p`` for the parent directory is folded into this script
+        (one fewer subprocess vs. a separate ``mkdir -p`` call).
+
         Returns an :class:`ExecuteResult`; ``exit_code == 0`` means the file
         was swapped into place atomically. A non-zero exit means nothing was
         renamed and the original (if any) is intact.
@@ -1025,6 +1102,9 @@ class ShellFileOperations(FileOperations):
         tmpl = self._escape_shell_arg(".hermes-tmp.XXXXXX")
 
         # One shell script, fully quoted. Notes:
+        #  - `mkdir -p "$d"` is folded in here so the parent directory is
+        #    created in the same subprocess that writes the temp file —
+        #    saves one entire subprocess spawn vs. a separate mkdir call.
         #  - `mktemp` lands the temp in the target's own dir (-p) so `mv` is
         #    same-FS atomic; we fall back to a PID-stamped name if the
         #    backend lacks mktemp (rare; busybox/macOS/Linux all ship it).
@@ -1058,6 +1138,11 @@ class ShellFileOperations(FileOperations):
             'rt="$(readlink -f "$t" 2>/dev/null || realpath "$t" 2>/dev/null || true)"; '
             '[ -n "$rt" ] && { t="$rt"; d="$(dirname "$t")"; }; '
             "fi; "
+            # Create the parent dir in the SAME subprocess that writes the
+            # temp file (one fewer exec vs. a separate mkdir call). Runs
+            # AFTER symlink resolution so a resolved target's directory is
+            # the one created/confirmed.
+            'mkdir -p "$d"; '
             'tmp="$(mktemp -p "$d" ' + tmpl + ' 2>/dev/null '
             '|| mktemp "$d/.hermes-tmp.$$.XXXXXX" 2>/dev/null '
             '|| { tmp="$d/.hermes-tmp.$$"; : > "$tmp" && echo "$tmp"; })"; '
@@ -1102,13 +1187,16 @@ class ShellFileOperations(FileOperations):
     def _file_has_bom(self, path: str, pre_content: Optional[str] = None) -> bool:
         """Whether the file on disk starts with a UTF-8 BOM.
 
-        Uses ``pre_content`` if we already read the file (zero extra exec
-        calls); otherwise issues a tiny ``head -c 3`` to sample just the
-        marker. A missing/empty file returns False (new writes get no BOM
+        Always probes the first 3 bytes on disk — do NOT trust
+        ``pre_content`` for BOM detection because the most common
+        provider (``read_file_raw``) deliberately strips BOMs so the
+        agent never sees U+FEFF glyphs.  Passing BOM-stripped content
+        through ``pre_content`` would cause a false-negative and
+        silently remove the marker on rewrite.
+
+        A missing/empty file returns False (new writes get no BOM
         unless the caller explicitly includes one).
         """
-        if pre_content is not None:
-            return _has_bom(pre_content)
         head_cmd = f"head -c 3 {self._escape_shell_arg(path)} 2>/dev/null"
         head_result = self._exec(head_cmd)
         if head_result.exit_code != 0 or not head_result.stdout:
@@ -1179,12 +1267,19 @@ class ShellFileOperations(FileOperations):
                 ),
             )
         
-        # Read a sample to check for binary content
-        sample_cmd = f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
-        sample_result = self._exec(sample_cmd)
-        sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
-        
-        if self._is_likely_binary(path, sample_output):
+        # Read a sample to check for binary content — at the byte layer when
+        # the transport allows, falling back to the legacy text heuristic.
+        sample_bytes = self._sample_file_bytes(path)
+        if sample_bytes is not None:
+            ext_binary = os.path.splitext(path)[1].lower() in BINARY_EXTENSIONS
+            is_binary = ext_binary or self._is_likely_binary_bytes(sample_bytes)
+        else:
+            sample_cmd = f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
+            sample_result = self._exec(sample_cmd)
+            sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
+            is_binary = self._is_likely_binary(path, sample_output)
+
+        if is_binary:
             return ReadResult(
                 is_binary=True,
                 file_size=file_size,
@@ -1298,9 +1393,15 @@ class ShellFileOperations(FileOperations):
             file_size = 0
         if self._is_image(path):
             return ReadResult(is_image=True, is_binary=True, file_size=file_size)
-        sample_result = self._exec(f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null")
-        sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
-        if self._is_likely_binary(path, sample_output):
+        sample_bytes = self._sample_file_bytes(path)
+        if sample_bytes is not None:
+            ext_binary = os.path.splitext(path)[1].lower() in BINARY_EXTENSIONS
+            is_binary = ext_binary or self._is_likely_binary_bytes(sample_bytes)
+        else:
+            sample_result = self._exec(f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null")
+            sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
+            is_binary = self._is_likely_binary(path, sample_output)
+        if is_binary:
             return ReadResult(
                 is_binary=True, file_size=file_size,
                 error="Binary file — cannot display as text."
@@ -1317,6 +1418,38 @@ class ShellFileOperations(FileOperations):
         return ReadResult(
             content=raw_content,
             file_size=file_size,
+        )
+
+    def read_file_bytes(self, path: str, max_bytes: Optional[int] = None) -> ReadResult:
+        """Read binary-safe bytes from any shell-backed environment."""
+        path = self._expand_path(path)
+        stat_result = self._exec(
+            f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
+        )
+        if stat_result.exit_code != 0:
+            return ReadResult(error=f"File not found: {path}")
+        try:
+            file_size = int(_strip_terminal_fence_leaks(stat_result.stdout).strip())
+        except ValueError:
+            return ReadResult(error=f"Could not determine file size: {path}")
+        if max_bytes is not None and file_size > max_bytes:
+            return ReadResult(
+                file_size=file_size,
+                error=f"File is too large ({file_size:,} bytes, limit is {max_bytes:,})",
+            )
+
+        encoded = self._exec(f"base64 < {self._escape_shell_arg(path)}")
+        if encoded.exit_code != 0:
+            return ReadResult(error=f"Failed to read binary file: {encoded.stdout}")
+        compact = "".join(_strip_terminal_fence_leaks(encoded.stdout).split())
+        try:
+            base64.b64decode(compact, validate=True)
+        except (ValueError, base64.binascii.Error):
+            return ReadResult(error=f"Backend returned invalid binary data for: {path}")
+        return ReadResult(
+            base64_content=compact,
+            file_size=file_size,
+            is_binary=True,
         )
 
     def delete_file(self, path: str) -> WriteResult:
@@ -1400,7 +1533,8 @@ class ShellFileOperations(FileOperations):
     # WRITE Implementation
     # =========================================================================
 
-    def write_file(self, path: str, content: str) -> WriteResult:
+    def write_file(self, path: str, content: str,
+                   pre_content: Optional[str] = None) -> WriteResult:
         """
         Write content to a file, creating parent directories as needed.
 
@@ -1427,6 +1561,15 @@ class ShellFileOperations(FileOperations):
         Args:
             path: File path to write
             content: Content to write
+            pre_content: Pre-edit file content if the caller already has it
+                (e.g. patch_replace read the file for fuzzy matching).
+                When provided, skips a redundant ``cat`` subprocess to
+                re-read the file for lint baseline / line-ending
+                detection. BOM detection always probes disk (the most
+                common provider — ``read_file_raw`` — strips BOMs, so
+                trusting ``pre_content`` for BOM would cause false
+                negatives and silent marker loss on rewrite). When
+                None, reads from disk as before.
 
         Returns:
             WriteResult with bytes written, lint summary, or error.
@@ -1438,6 +1581,22 @@ class ShellFileOperations(FileOperations):
         denied = get_write_denied_error(path)
         if denied:
             return WriteResult(error=denied)
+
+        # Reject lone surrogates up front with a regex scan (no encode, no
+        # subprocess). surrogateescape-decoded content (U+DC80–U+DCFF)
+        # round-trips through the pipe fine, but surrogates outside that
+        # range cannot be encoded at all — and letting them reach the pipe
+        # would spawn a child that then hangs, or truncates the target via
+        # empty-stdin `cat`. Refuse synchronously before any subprocess.
+        m = re.search(r"[\ud800-\udc7f\udd00-\udfff]", content)
+        if m:
+            return WriteResult(
+                error=(
+                    f"Refusing to write '{path}': content contains a lone "
+                    f"surrogate character ({m.group(0)!r}) that cannot be "
+                    "encoded as UTF-8. The file was NOT created or modified."
+                )
+            )
 
         # ── Fail-closed pre-write syntax gate ───────────────────────────
         # Validate the CANDIDATE content BEFORE any bytes touch disk —
@@ -1492,17 +1651,21 @@ class ShellFileOperations(FileOperations):
         # the UNION of in-process lint coverage and LSP coverage.  For
         # extensions outside both sets (binaries, opaque formats),
         # skipping the read keeps the hot path fast.
-        pre_content: Optional[str] = None
         want_pre = ext in LINTERS_INPROC or self._lsp_handles_extension(ext)
         if want_pre:
-            # Best-effort read; failure (file missing, permission) leaves
-            # pre_content as None which makes both downstream consumers
-            # degrade gracefully (lint reports all errors; LSP skips the
-            # shift map).
-            read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
-            read_result = self._exec(read_cmd)
-            if read_result.exit_code == 0 and read_result.stdout:
-                pre_content = read_result.stdout
+            if pre_content is not None:
+                # Caller already has file content (e.g. patch_replace read it
+                # for fuzzy matching) — reuse directly, skip redundant cat.
+                pass
+            else:
+                # Best-effort read; failure (file missing, permission) leaves
+                # pre_content as None which makes both downstream consumers
+                # degrade gracefully (lint reports all errors; LSP skips the
+                # shift map).
+                read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
+                read_result = self._exec(read_cmd)
+                if read_result.exit_code == 0 and read_result.stdout:
+                    pre_content = read_result.stdout
 
         # ── Line-ending preservation (Roo Code pattern) ──────────────
         # If the file existed with CRLF endings and the agent's content
@@ -1534,15 +1697,15 @@ class ShellFileOperations(FileOperations):
         # rather than an external IDE.
         self._snapshot_lsp_baseline(path)
 
-        # Create parent directories
+        # Write atomically.  ``mkdir -p`` is folded into _atomic_write
+        # (one fewer subprocess vs. a separate mkdir call).
+        # ``dirs_created`` has always meant "parent dirs ensured" —
+        # ``mkdir -p`` exits 0 even when the dirs pre-exist, so the old
+        # separate-mkdir code reported True in exactly the same cases.
+        # A mkdir failure now surfaces as the atomic-write error return
+        # below, before this field is ever emitted.
         parent = os.path.dirname(path)
-        dirs_created = False
-
-        if parent:
-            mkdir_cmd = f"mkdir -p {self._escape_shell_arg(parent)}"
-            mkdir_result = self._exec(mkdir_cmd)
-            if mkdir_result.exit_code == 0:
-                dirs_created = True
+        dirs_created = bool(parent)
 
         # Write atomically: stream into a temp file in the SAME directory,
         # then ``mv`` it over the target. The rename is atomic on POSIX
@@ -1559,19 +1722,33 @@ class ShellFileOperations(FileOperations):
         # the atomic swap doesn't silently widen or narrow permissions, and
         # clean the temp up on any failure so we never leak a ``.hermes-tmp``
         # turd next to the user's file.
+        # Encode once for byte count + sha256. surrogateescape is the exact
+        # inverse of the decode that may have produced this content, so these
+        # are the bytes the pipe transmits and the bytes on disk. The early
+        # rejection above guarantees this cannot raise; the try/except is
+        # defense for future callers that bypass it.
+        try:
+            content_bytes = content.encode("utf-8", "surrogateescape")
+        except UnicodeEncodeError as exc:
+            return WriteResult(
+                error=(
+                    f"Refusing to write '{path}': content contains a lone "
+                    f"surrogate character ({exc}) that cannot be encoded as "
+                    "UTF-8. The file was NOT created or modified."
+                )
+            )
         write_result = self._atomic_write(path, content)
 
         if write_result.exit_code != 0:
             return WriteResult(error=f"Failed to write file: {write_result.stdout}")
 
-        # Get bytes written (wc -c is POSIX, works on Linux + macOS)
-        stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
-        stat_result = self._exec(stat_cmd)
-
-        try:
-            bytes_written = int(stat_result.stdout.strip())
-        except ValueError:
-            bytes_written = len(content.encode('utf-8'))
+        # Bytes written — computed from the exact bytes we just wrote (len
+        # matches wc -c) instead of spawning a ``wc -c`` subprocess. The
+        # encode happened up front with surrogateescape — the inverse of the
+        # decode that produces surrogate content — so content_bytes == what
+        # rode stdin == what is on disk, and the sha256 below compares like
+        # with like.
+        bytes_written = len(content_bytes)
 
         # Post-write content verification (cheap, one shell call): compare
         # the on-disk sha256 to the intended content's hash. Production
@@ -1586,7 +1763,7 @@ class ShellFileOperations(FileOperations):
             hash_result = self._exec(hash_cmd)
             if hash_result.exit_code == 0 and hash_result.stdout.strip():
                 disk_sha = hash_result.stdout.strip().split()[0]
-                expected_sha = hashlib.sha256(content.encode("utf-8", "surrogatepass")).hexdigest()
+                expected_sha = hashlib.sha256(content_bytes).hexdigest()
                 content_verified = disk_sha == expected_sha
                 if not content_verified:
                     return WriteResult(
@@ -1659,6 +1836,9 @@ class ShellFileOperations(FileOperations):
             return PatchResult(error=f"Failed to read file: {path}")
         
         content = read_result.stdout
+        # Preserve raw content (including BOM) for write_file's pre_content
+        # so write_file can detect/restore BOM correctly.
+        raw_content = content
         # Strip a leading UTF-8 BOM before matching so the fuzzy matcher and
         # the diff operate on clean content (a phantom U+FEFF before line 1
         # defeats an exact first-line match). write_file restores the BOM on
@@ -1711,8 +1891,11 @@ class ShellFileOperations(FileOperations):
         if file_ending:
             new_content = _normalize_line_endings(new_content, file_ending)
 
-        # Write back
-        write_result = self.write_file(path, new_content)
+        # Write back — pass pre_content (original read, with BOM) to avoid
+        # a redundant cat subprocess inside write_file.  Must be the raw
+        # content (before _strip_bom) so write_file can detect/restore BOM.
+        write_result = self.write_file(path, new_content,
+                                       pre_content=raw_content)
         if write_result.error:
             return PatchResult(error=f"Failed to write changes: {write_result.error}")
 
@@ -2653,7 +2836,7 @@ class ShellFileOperations(FileOperations):
     def _search_with_grep(self, pattern: str, path: str, file_glob: Optional[str],
                           limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
         """Fallback search using grep."""
-        cmd_parts = ["grep", "-rnH"]  # -H forces filename even for single-file searches
+        cmd_parts = ["grep", "-rnHE"]  # -H forces filenames; -E matches rg regex behavior
         
         # Exclude hidden directories (matching ripgrep's default behavior).
         # This prevents searching inside .hub/index-cache/, .git/, etc.

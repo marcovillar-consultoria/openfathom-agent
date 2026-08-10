@@ -13,7 +13,9 @@ late-binding seam in :mod:`hermes_cli.web_deps` so tests that
 """
 
 import asyncio  # noqa: F401 — used by handlers
+import json
 import logging
+import re
 import subprocess  # noqa: F401
 import sys  # noqa: F401
 import time  # noqa: F401
@@ -26,15 +28,37 @@ from hermes_cli.web_deps import late
 from hermes_cli.web_models import (
     ProfileCreate,
     ProfileActiveUpdate,
+    ProfileExport,
+    ProfileImport,
     ProfileRename,
     ProfileSoulUpdate,
     ProfileDescriptionUpdate,
     ProfileModelUpdate,
     ProfileDescribeAuto,
+    SessionPrScanBody,
 )
 
 # Same logger the handlers used before extraction (identical logger object).
 _log = logging.getLogger("hermes_cli.web_server")
+
+# Per-profile session reads report failures in the response's ``errors``
+# array, which the desktop sidebar does not currently surface — during the
+# stale-schema incident that made an empty sidebar look healthy while
+# /api/sessions (which logs) was the only diagnosable trace. Warn once per
+# (profile, message) per process so a persistent failure is loud in
+# errors.log without turning every sidebar poll into log spam.
+_profile_read_warned: set = set()
+
+
+def _warn_profile_read_error(profile: str, exc: Exception) -> None:
+    key = (profile, str(exc))
+    if key in _profile_read_warned:
+        return
+    _profile_read_warned.add(key)
+    _log.warning(
+        "profile session read failed for %r (reported only in the response "
+        "errors array): %s", profile, exc,
+    )
 
 sessions_router = APIRouter()
 router = APIRouter()
@@ -45,6 +69,7 @@ _cron_profile_home = late("_cron_profile_home")
 _disable_unselected_skills = late("_disable_unselected_skills")
 _fallback_profile_dicts = late("_fallback_profile_dicts")
 _hub_action_name = late("_hub_action_name")
+_open_session_db_at_path = late("_open_session_db_at_path")
 _profile_setup_command = late("_profile_setup_command")
 _profile_to_dict = late("_profile_to_dict")
 _resolve_profile_dir = late("_resolve_profile_dir")
@@ -56,7 +81,13 @@ _write_profile_model = late("_write_profile_model")
 
 @sessions_router.get("/api/profiles/sessions")
 def get_profiles_sessions(
-    limit: int = Query(20, ge=0),
+    # ``le=500`` caps the per-request page size (idea from #39200) — this
+    # endpoint fans the query out across EVERY profile's state.db, so an
+    # unbounded limit multiplies the damage. 500 (not 100) because real
+    # desktop callers use limit=200 (sessions-settings ARCHIVED_FETCH_LIMIT,
+    # command palette) and the electron remote-merge over-fetches
+    # ``limit + offset``.
+    limit: int = Query(20, ge=0, le=500),
     offset: int = Query(0, ge=0),
     min_messages: int = 0,
     archived: str = "exclude",
@@ -84,7 +115,6 @@ def get_profiles_sessions(
     if order not in ("created", "recent"):
         raise HTTPException(status_code=400, detail="order must be one of: created, recent")
 
-    from hermes_state import SessionDB
     from hermes_cli import profiles as profiles_mod
 
     targets: List[Tuple[str, Path]] = []
@@ -124,11 +154,17 @@ def get_profiles_sessions(
         if not db_path.exists():
             continue
         try:
-            # Read-only: this loop runs on every sidebar refresh, so it must
-            # never DDL/write-lock another profile's live DB (see SessionDB
-            # read_only docstring).
-            db = SessionDB(db_path=db_path, read_only=True)
+            # Read-only on the healthy path: this loop runs on every sidebar
+            # refresh, so it must not routinely DDL/write-lock another
+            # profile's live DB (see SessionDB read_only docstring). The
+            # helper's stale-schema probe performs a ONE-TIME writable open
+            # when the store predates a schema addition — the same reconcile
+            # that profile's own backend runs at startup — because read-only
+            # opens skip column reconciliation and would otherwise fail here
+            # on every refresh until something else opened the DB writable.
+            db = _open_session_db_at_path(db_path, read_only=True)
         except Exception as exc:
+            _warn_profile_read_error(name, exc)
             errors.append({"profile": name, "error": str(exc)})
             continue
         try:
@@ -168,6 +204,7 @@ def get_profiles_sessions(
                 s["pinned"] = bool(s.get("pinned"))
                 merged.append(s)
         except Exception as exc:
+            _warn_profile_read_error(name, exc)
             errors.append({"profile": name, "error": str(exc)})
         finally:
             db.close()
@@ -218,7 +255,6 @@ def get_profiles_sessions_sidebar(
     ``min_messages=1`` / ``archived=exclude`` / recency order, matching the
     desktop's per-slice calls.
     """
-    from hermes_state import SessionDB
     from hermes_cli import profiles as profiles_mod
 
     # cron + messaging are cross-profile; recents is scoped to recents_profile.
@@ -282,8 +318,12 @@ def get_profiles_sessions_sidebar(
         if not db_path.exists():
             continue
         try:
-            db = SessionDB(db_path=db_path, read_only=True)
+            # Read-only with the stale-schema heal — same contract as the
+            # per-slice endpoint above (one-time writable reconcile when the
+            # store predates a schema addition, plain read-only otherwise).
+            db = _open_session_db_at_path(db_path, read_only=True)
         except Exception as exc:
+            _warn_profile_read_error(name, exc)
             errors.append({"profile": name, "error": str(exc)})
             continue
         try:
@@ -302,6 +342,7 @@ def get_profiles_sessions_sidebar(
                 _tag(_slice(db, exclude=messaging_exclude_list, cap=messaging_cap), name)
             )
         except Exception as exc:
+            _warn_profile_read_error(name, exc)
             errors.append({"profile": name, "error": str(exc)})
         finally:
             db.close()
@@ -330,6 +371,83 @@ def get_profiles_sessions_sidebar(
         },
         "errors": errors,
     }
+
+
+# `gh pr create` prints the PR url and nothing else, so a tool result whose
+# whole output IS a PR url means this session opened that PR. Anything looser —
+# a url inside prose, a `gh pr view` payload, an issue link — is a session
+# TALKING about a PR, which is not the same claim.
+_PR_URL_RE = re.compile(r"^https://github\.com/[\w.-]+/[\w.-]+/pull/(\d+)/?$")
+
+
+def _pr_url_from_tool_output(content: str) -> Optional[Tuple[int, str]]:
+    """The (number, url) a tool result announces, or None."""
+    try:
+        output = (json.loads(content) or {}).get("output")
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return None
+    if not isinstance(output, str):
+        return None
+    match = _PR_URL_RE.match(output.strip())
+    return (int(match.group(1)), match.group(0)) if match else None
+
+
+@sessions_router.post("/api/profiles/sessions/pull-requests")
+def post_profiles_sessions_pull_requests(body: SessionPrScanBody):
+    """The PR each of these sessions opened, recovered from its own transcript.
+
+    A session records the branch it started on, so the sidebar can join a row to
+    its PR — but a session that starts in the main checkout and does its work in
+    a worktree has no branch of its own, and its PR is invisible to that join.
+    The evidence is in the conversation: ``gh pr create`` ran, and its output is
+    a bare PR url. Scanning for exactly that shape recovers the link with no
+    inference (see ``_pr_url_from_tool_output``).
+
+    Read-only across every profile, and the caller is expected to ask once per
+    session and remember the answer — a session's transcript does not grow a
+    second PR.
+    """
+    from hermes_cli import profiles as profiles_mod
+
+    wanted = list(dict.fromkeys(s for s in (body.ids or []) if s))[:2000]
+    if not wanted:
+        return {"pull_requests": {}, "scanned": []}
+
+    try:
+        targets = [(info.name, info.path) for info in profiles_mod.list_profiles()]
+    except Exception:
+        _log.exception("POST /api/profiles/sessions/pull-requests: list_profiles failed")
+        targets = []
+    if not targets:
+        targets.append(("default", profiles_mod.get_profile_dir("default")))
+
+    found: Dict[str, Dict[str, Any]] = {}
+    for name, home in targets:
+        db_path = Path(home) / "state.db"
+        if not db_path.exists():
+            continue
+        try:
+            db = _open_session_db_at_path(db_path, read_only=True)
+        except Exception as exc:
+            _warn_profile_read_error(name, exc)
+            continue
+        try:
+            for pr in db.find_pr_url_messages(wanted):
+                parsed = _pr_url_from_tool_output(pr["content"])
+                if parsed:
+                    number, url = parsed
+                    # Ordered oldest-first, so a later `gh pr create` in the
+                    # same conversation wins — a reopened/replacement PR is the
+                    # one the session ended on.
+                    found[pr["session_id"]] = {"number": number, "url": url}
+        except Exception as exc:
+            _warn_profile_read_error(name, exc)
+        finally:
+            db.close()
+
+    # Every id we looked at, so the caller can remember "asked, nothing there"
+    # and never scan this session again.
+    return {"pull_requests": found, "scanned": wanted}
 
 
 @router.get("/api/profiles")
@@ -605,7 +723,25 @@ async def get_profile_soul(name: str):
 async def update_profile_soul(name: str, body: ProfileSoulUpdate):
     soul_path = _resolve_profile_dir(name) / "SOUL.md"
     try:
-        soul_path.write_text(body.content, encoding="utf-8")
+        from utils import atomic_write_text
+
+        # PUT replaces the whole persona document from the dashboard editor.
+        # A bare write_text() truncates SOUL.md before the new body lands, and
+        # the paired GET above reports an unreadable file as
+        # ``{"content": "", "exists": False}`` -- so an interrupted save shows
+        # up as "your persona was never set" and the editor's next Save
+        # persists that empty document over it.
+        #
+        # preserve_mode carries an existing file's permission bits and owner
+        # across the replace. create_mode=0o644 covers the first save: named
+        # profiles seed SOUL.md at the umask default (hermes_cli.profiles
+        # chmods only .env to 0600), and SOUL.md is not a secret. (The default
+        # profile's runtime seeder does run it through _secure_file, but that
+        # seeder fires on every load_config, so the file already exists there
+        # and preserve_mode keeps whatever mode it set.)
+        atomic_write_text(
+            soul_path, body.content, preserve_mode=True, create_mode=0o644
+        )
     except OSError as e:
         _log.exception("PUT /api/profiles/%s/soul failed", name)
         raise HTTPException(status_code=500, detail=f"Could not write SOUL.md: {e}")
@@ -681,3 +817,105 @@ async def describe_profile_auto_endpoint(name: str, body: ProfileDescribeAuto):
         # auto-generated.
         "description_auto": bool(outcome.ok),
     }
+
+
+# ── Export / Import ──────────────────────────────────────────────────────────
+# Profile sharing for the desktop: wraps hermes_cli.profiles.export_profile /
+# import_profile (the same machinery behind `hermes profile export|import`).
+# Paths are exchanged, not bytes — the desktop's local and pooled backends
+# share the filesystem with the native save/open dialogs that produce them.
+
+
+@router.post("/api/profiles/{name}/export")
+async def export_profile_endpoint(name: str, body: ProfileExport):
+    from hermes_cli import profiles as profiles_mod
+
+    output = (body.output or "").strip()
+    if not output:
+        from hermes_constants import get_hermes_home
+        staging = get_hermes_home() / "profile-exports"
+        try:
+            staging.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"Could not create export directory: {exc}")
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        output = str(staging / f"{profiles_mod.normalize_profile_name(name)}-{stamp}.tar.gz")
+
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            None,
+            lambda: profiles_mod.export_profile(name, output, extra_files=body.extra_files or None),
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        _log.exception("POST /api/profiles/%s/export failed", name)
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"ok": True, "archive": str(result)}
+
+
+@router.post("/api/profiles/import")
+async def import_profile_endpoint(body: ProfileImport):
+    from hermes_cli import profiles as profiles_mod
+
+    archive = (body.archive or "").strip()
+    if not archive:
+        raise HTTPException(status_code=400, detail="archive path is required")
+
+    loop = asyncio.get_running_loop()
+    try:
+        profile_dir = await loop.run_in_executor(
+            None,
+            lambda: profiles_mod.import_profile(archive, name=(body.name or "").strip() or None),
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except (ValueError, FileExistsError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        _log.exception("POST /api/profiles/import failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    imported = profile_dir.name
+    # Match the CLI import flow: create the wrapper alias when it's safe.
+    try:
+        if not profiles_mod.check_alias_collision(imported):
+            profiles_mod.create_wrapper_script(imported)
+    except Exception:
+        _log.exception("Creating wrapper for imported profile %s failed", imported)
+
+    # Surface the bundled desktop appearance overlay (if the archive carried
+    # one) so the desktop can apply theme/interface prefs without re-reading
+    # the file over another round-trip.
+    desktop_overlay = None
+    overlay_path = profile_dir / "desktop.json"
+    if overlay_path.is_file():
+        try:
+            import json as _json
+            desktop_overlay = _json.loads(overlay_path.read_text(encoding="utf-8"))
+        except Exception:
+            _log.exception("Reading desktop.json from imported profile %s failed", imported)
+
+    return {
+        "ok": True,
+        "name": imported,
+        "path": str(profile_dir),
+        "desktop": desktop_overlay,
+    }
+
+
+@router.get("/api/profiles/{name}/desktop-overlay")
+async def get_profile_desktop_overlay(name: str):
+    """The desktop appearance/interface overlay bundled with an imported
+    profile (``desktop.json`` at the profile root), or ``exists: false``."""
+    overlay_path = _resolve_profile_dir(name) / "desktop.json"
+    if not overlay_path.is_file():
+        return {"exists": False, "desktop": None}
+    try:
+        import json as _json
+        return {"exists": True, "desktop": _json.loads(overlay_path.read_text(encoding="utf-8"))}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not read desktop.json: {e}")
