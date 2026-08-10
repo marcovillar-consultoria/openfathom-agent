@@ -52,6 +52,32 @@ _activity_callback_local = threading.local()
 _UNBOUNDED_CAPTURE_CHARS = 2**63 - 1
 
 
+class EnvironmentConnectionError(RuntimeError):
+    """Infrastructure/connection-class failure of a terminal backend.
+
+    Raised when the backend itself is unreachable (SSH host down, Docker
+    daemon not running, remote file sync failing on a dead link) — never
+    for a command that merely exited nonzero.  Subclassing RuntimeError
+    keeps every existing ``except RuntimeError`` catcher working.
+
+    ``terminal_tool`` turns this into a structured ``status: "degraded"``
+    tool result (config gate ``terminal.degraded_mode: warn|fail``) so the
+    model gets an actionable reason + retry hint instead of a traceback.
+    The failed backend is never cached, so a later call retries from
+    scratch and simply works once the backend is reachable again.
+    """
+
+    def __init__(self, reason: str, *, retry_hint: str = ""):
+        super().__init__(reason)
+        self.reason = reason
+        self.retry_hint = retry_hint or (
+            "This is an infrastructure failure, not a command failure. "
+            "Verify the backend is reachable (network, service running, "
+            "credentials), then retry the same command — recovery is "
+            "automatic once the backend is back."
+        )
+
+
 class _BoundedOutputCollector:
     """Retain a bounded 40/60 head-tail window of streamed text.
 
@@ -281,23 +307,51 @@ def _pipe_stdin(proc: subprocess.Popen, data: str) -> None:
     newline translation entirely on every platform.  No behaviour change
     on POSIX — the byte sequence is identical to what text-mode would
     produce there.
+
+    Encoding uses ``errors="surrogateescape"`` — the exact inverse of the
+    surrogateescape decode, so original bytes are restored.  For
+    surrogate-free strings it is byte-identical to strict UTF-8.
+    Surrogates outside the round-trip range U+DC80–U+DCFF raise and are
+    recorded on ``proc._hermes_stdin_errors`` while stdin is still closed
+    in ``finally`` so the child sees EOF instead of hanging;
+    ``_wait_for_process`` reads the recorded error and surfaces it as
+    ``stdin_error`` on the result.
     """
 
-    def _write():
-        try:
-            # proc.stdin is a TextIOWrapper when text=True was set on the
-            # Popen.  Its ``.buffer`` attribute is the raw BufferedWriter
-            # that bypasses newline translation.  When Popen was created
-            # in byte mode, proc.stdin is already a BufferedWriter with
-            # no ``.buffer`` attribute — fall back to .write() directly.
-            raw = data.encode("utf-8") if isinstance(data, str) else data
-            target = getattr(proc.stdin, "buffer", proc.stdin)
-            target.write(raw)
-            target.close()
-        except (BrokenPipeError, OSError):
-            pass
+    errors: list[BaseException] = []
+    proc._hermes_stdin_errors = errors
 
-    threading.Thread(target=_write, daemon=True).start()
+    def _write():
+        if proc.stdin is None:
+            errors.append(RuntimeError("process stdin unavailable"))
+            return
+        # Resolve the target BEFORE encoding: a failed encode must still
+        # reach the finally-close, or the child hangs on EOF forever.
+        target = getattr(proc.stdin, "buffer", proc.stdin)
+        try:
+            raw = data.encode("utf-8", "surrogateescape") if isinstance(data, str) else data
+            written = target.write(raw)
+            if written != len(raw):
+                # Buffered writers normally complete or raise; a short write
+                # is a real failure and must be surfaced, not swallowed.
+                raise RuntimeError(f"short stdin write: {written} of {len(raw)} bytes")
+        except (BrokenPipeError, OSError):
+            pass  # child closed stdin early — normal
+        except Exception as exc:
+            # Only reachable with surrogates outside the surrogateescape
+            # round-trip range (e.g. a literal U+D800). Record it so
+            # _wait_for_process can surface it instead of a silent false
+            # success.
+            errors.append(exc)
+        finally:
+            try:
+                target.close()
+            except Exception:
+                pass
+
+    thread = threading.Thread(target=_write, daemon=True)
+    proc._hermes_stdin_thread = thread
+    thread.start()
 
 
 def _popen_bash(
@@ -491,12 +545,12 @@ def _export_dump_excluding_session_vars(
     lines. ``|| true`` keeps the success contract for callers that chain on it.
 
     The dump MUST be wrapped in a brace group with the redirection applied to
-    the group. *tmp_path* typically embeds ``$BASHPID`` for concurrency-safe
-    temp names; a redirection attached to a pipeline segment would expand
-    ``$BASHPID`` inside that segment's subshell (a different PID than the
-    parent that expands the follow-up ``mv``), silently orphaning the dump.
-    The brace-group redirect is expanded in the current shell, keeping both
-    expansions consistent.
+    the group. *tmp_path* is typically a shell-variable expansion (a
+    mktemp-allocated per-writer temp name); a redirection attached to a
+    pipeline segment would expand it inside that segment's subshell,
+    potentially inconsistently with the parent that expands the follow-up
+    ``mv``. The brace-group redirect is expanded in the current shell,
+    keeping both expansions consistent.
     """
     # ${!PREFIX*} is bash 3.2+ name-prefix expansion; empty matches are fine
     # because ``unset`` with only missing names is ignored under 2>/dev/null.
@@ -668,14 +722,19 @@ class BaseEnvironment(ABC):
         # calls run) ``$$`` stays the *parent* shell's PID — so two concurrent
         # writers would pick the SAME temp name, clobber each other's temp
         # mid-write, and mv would then publish a torn file (the corruption is
-        # only narrowed, not closed).  ``$BASHPID`` is the actual subshell PID
-        # and is genuinely unique per writer, which closes the race.  The
-        # static path is shell-quoted (Windows/Git-Bash drive letters, spaces)
-        # with ``$BASHPID`` left outside the quotes so it still expands.
-        _snap_tmp = self._quote_shell_path(self._snapshot_path + ".tmp.") + "$BASHPID"
+        # only narrowed, not closed).  ``$BASHPID`` would be unique per writer,
+        # but macOS ships bash 3.2 which does NOT provide it — the name expands
+        # empty there, so every writer shares one temp path and the race is
+        # back.  ``mktemp`` allocates a per-writer unique path portably across
+        # bash versions.  The template is shell-quoted (Windows/Git-Bash drive
+        # letters, spaces) and the resulting path lives in a shell variable so
+        # every later expansion is consistent.
+        _snap_tmp_template = self._quote_shell_path(self._snapshot_path + ".tmp.XXXXXXXXXX")
+        _snap_tmp = '"$__hermes_snap_tmp"'
         snapshot_excluded = self._snapshot_excluded_passthrough_names()
         bootstrap = (
             f"umask 077\n"
+            f"__hermes_snap_tmp=$(mktemp {_snap_tmp_template}) || exit 1\n"
             f"{_export_dump_excluding_session_vars(_snap_tmp, snapshot_excluded)}\n"
             # Dump function definitions, filtering out private (``_``-prefixed)
             # helpers — mainly bash-completion internals (``_git``, ``_make``…)
@@ -784,11 +843,13 @@ class BaseEnvironment(ABC):
         # Use atomic file replacement for env snapshot updates (issue #38249).
         # Assemble into a per-writer-unique temp file, then mv to atomically
         # replace the snapshot so concurrent source() calls never read a
-        # truncated/half-written file.  ``$BASHPID`` (not ``$$``) is the actual
-        # subshell PID — unique per concurrent ``&``-launched writer — so two
-        # writers never share a temp name and clobber each other before the mv.
-        # Static path shell-quoted (Windows/spaces); ``$BASHPID`` left to expand.
-        _snap_tmp = self._quote_shell_path(self._snapshot_path + ".tmp.") + "$BASHPID"
+        # truncated/half-written file.  ``mktemp`` is used instead of
+        # ``$BASHPID``/``$$`` because macOS bash 3.2 lacks ``$BASHPID`` (it
+        # expands empty, collapsing every writer onto one temp name) and ``$$``
+        # is shared by ``&``-launched subshells.  Template shell-quoted
+        # (Windows/spaces); the allocated path lives in a shell variable.
+        _snap_tmp_template = self._quote_shell_path(self._snapshot_path + ".tmp.XXXXXXXXXX")
+        _snap_tmp = '"$__hermes_snap_tmp"'
 
         parts = []
         passthrough_names = self._snapshot_excluded_passthrough_names()
@@ -842,13 +903,13 @@ class BaseEnvironment(ABC):
         # Chain mv on the export succeeding so a failed/partial dump never
         # replaces a good snapshot; drop the temp on failure so it isn't
         # orphaned (cleaned up wholesale in LocalEnvironment.cleanup too).
-        # NOTE: the redirection must be attached to a brace group — ``_snap_tmp``
-        # embeds ``$BASHPID``, and a redirect on a pipeline segment expands
-        # inside that segment's subshell (a different PID than the parent that
-        # expands the ``mv`` operand), silently orphaning the dump. See
-        # _export_dump_excluding_session_vars.
+        # NOTE: the temp path is allocated with mktemp into a shell variable
+        # first — the redirection inside _export_dump_excluding_session_vars is
+        # attached to a brace group so the variable expands in the same shell
+        # that later expands the ``mv`` operand, keeping both consistent.
         if self._snapshot_ready:
             parts.append(
+                f"__hermes_snap_tmp=$(mktemp {_snap_tmp_template}) && "
                 f"{{ {_export_dump_excluding_session_vars(_snap_tmp, passthrough_names)} "
                 f"&& mv -f {_snap_tmp} {_quoted_snap}; }} "
                 f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true"
@@ -1200,7 +1261,22 @@ class BaseEnvironment(ABC):
                 proc.returncode,
             )
 
-        return self._finalize_wait_result(output, output.render(), proc.returncode)
+        # Join the stdin writer thread before reading its error list: a child
+        # that exits without reading stdin can otherwise race ahead of a
+        # recorded encode failure, silently dropping it. The thread cannot
+        # block long after child exit (write raises BrokenPipeError once the
+        # pipe closes); the timeout is a pure safety net.
+        stdin_thread = getattr(proc, "_hermes_stdin_thread", None)
+        if stdin_thread is not None:
+            stdin_thread.join(timeout=5)
+        rendered = output.render()
+        result = self._finalize_wait_result(output, rendered, proc.returncode)
+        stdin_errors = getattr(proc, "_hermes_stdin_errors", None)
+        if stdin_errors:
+            err = str(stdin_errors[0])
+            result["stdin_error"] = err
+            result["output"] = rendered + f"\n[stdin write failed: {err}]"
+        return result
 
     @staticmethod
     def _finalize_wait_result(collector: "_BoundedOutputCollector",
