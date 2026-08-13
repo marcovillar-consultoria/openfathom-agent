@@ -365,7 +365,7 @@ jobs:
           git config user.name "openfathom-bot"
           git config user.email "openfathom-bot@users.noreply.github.com"
 
-          branch="test/app-token-pr-${{ github.run_id }}"
+          branch="probe/eng157-app-token-pr-${{ github.run_id }}"
           git checkout -b "$branch"
           # A trivial, reversible change inside the 8-file allow-list -- this branch is
           # never merged, but validate-scope still runs on it if a human opens the PR
