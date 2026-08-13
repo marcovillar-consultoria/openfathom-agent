@@ -39,6 +39,19 @@ on:
   schedule:
     - cron: '0 3 * * 1' # Monday 03:00 UTC
   workflow_dispatch:
+    inputs:
+      test_pr_creation:
+        description: >-
+          THROWAWAY (openfathom-meta ENG-157/ADR-059 Fase 0). Skips the real sync and
+          instead spends the App token on a disposable branch+PR in THIS repo, to settle
+          empirically whether an `openfathom-fork-sync` installation token can open a PR
+          at all -- the "Push sync branch" step below has said no since 2026-07-20, but
+          that diagnosis (org policy for GITHUB_TOKEN) may not even apply to an App
+          token, and it has never been re-tested since. Remove this whole input and the
+          `test-pr-creation` job once Fase 0 has an answer -- it does not belong in the
+          weekly sync permanently.
+        type: boolean
+        default: false
 
 # `permissions:` here governs the default GITHUB_TOKEN. The push+PR path does NOT
 # use it -- it uses the App installation token minted below. `issues: write` USED
@@ -58,6 +71,7 @@ permissions:
 
 jobs:
   sync:
+    if: inputs.test_pr_creation != true
     runs-on: ubuntu-latest
     steps:
       # openfathom-meta ADR-051. The FOURTH blocker ENG-62 found: GITHUB_TOKEN cannot
@@ -314,3 +328,108 @@ jobs:
             echo "See ADR-002 (openfathom-meta) for the fork-scope rule this branch must keep obeying while resolving. Direct push to \`cloudrun\` is rejected by branch protection -- open a PR."
           } | tee -a "$GITHUB_STEP_SUMMARY"
           echo "::error title=upstream-sync conflict::Weekly merge of upstream/main into cloudrun failed -- see job summary for the resolve-manually steps"
+
+  # THROWAWAY -- openfathom-meta ENG-157/ADR-059 Fase 0. Only runs on a manual dispatch
+  # with test_pr_creation=true. Settles, empirically, whether the openfathom-fork-sync
+  # App's installation token can open a PR at all. "Push sync branch" above has said no
+  # since 2026-07-20 (`gh pr create` -> `Resource not accessible by integration`), diagnosed
+  # there as the org's "Allow GitHub Actions to create and approve pull requests" policy
+  # being off. That diagnosis was never re-examined against the one fact that matters here:
+  # GitHub documents that org policy as governing the default GITHUB_TOKEN, not an
+  # installation token minted from a GitHub App -- and this workflow has used an App token
+  # for the push half of that same step the whole time. Two paths are tried, in order,
+  # because `gh pr create` goes through the GraphQL `createPullRequest` mutation while
+  # `gh api --method POST .../pulls` is the REST path, and the two are not always gated
+  # identically for App tokens. Whatever this job finds, self-cleans: closes the PR if one
+  # opened, deletes the disposable branch either way. Remove this job (and the
+  # test_pr_creation input above) once ENG-157's Fase 0 has its answer.
+  test-pr-creation:
+    if: inputs.test_pr_creation == true
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          app-id: ${{ secrets.SYNC_APP_ID }}
+          private-key: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Push a disposable branch, then try REST, then GraphQL
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          git config user.name "openfathom-bot"
+          git config user.email "openfathom-bot@users.noreply.github.com"
+
+          branch="test/app-token-pr-${{ github.run_id }}"
+          git checkout -b "$branch"
+          # A trivial, reversible change inside the 8-file allow-list -- this branch is
+          # never merged, but validate-scope still runs on it if a human opens the PR
+          # by hand, and staying in-scope means it reports the true, unrelated result.
+          printf '\n<!-- ENG-157 Fase 0 throwaway probe, run %s, deleted after -->\n' \
+            "${{ github.run_id }}" >> README.openfathom.md
+          git add README.openfathom.md
+          git commit -m "test: disposable probe for ENG-157 Fase 0 (not for merge)"
+          git push origin "$branch"
+
+          title="ENG-157 Fase 0 probe (auto-closed) -- run ${{ github.run_id }}"
+          body="Disposable. Proves whether the openfathom-fork-sync App token can open a PR. Closed by the same job that opened it."
+
+          rest_ok=false
+          if gh api --method POST "repos/${{ github.repository }}/pulls" \
+               -f title="$title" -f head="$branch" -f base=cloudrun -f body="$body" \
+               > /tmp/rest_result.json 2> /tmp/rest_error.txt; then
+            rest_ok=true
+            echo "::notice title=REST PR creation SUCCEEDED::$(cat /tmp/rest_result.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["html_url"])')"
+          else
+            echo "::warning title=REST PR creation FAILED::$(cat /tmp/rest_error.txt)"
+          fi
+
+          graphql_ok=false
+          if [ "$rest_ok" = "false" ]; then
+            if gh pr create --repo "${{ github.repository }}" --base cloudrun --head "$branch" \
+                 --title "$title" --body "$body" > /tmp/graphql_result.txt 2> /tmp/graphql_error.txt; then
+              graphql_ok=true
+              echo "::notice title=GraphQL (gh pr create) PR creation SUCCEEDED::$(cat /tmp/graphql_result.txt)"
+            else
+              echo "::warning title=GraphQL (gh pr create) PR creation FAILED::$(cat /tmp/graphql_error.txt)"
+            fi
+          else
+            echo "::notice title=GraphQL path skipped::REST already succeeded, no need to also test GraphQL"
+          fi
+
+          {
+            echo "## ENG-157 Fase 0 — resultado"
+            echo
+            echo "| caminho | resultado |"
+            echo "|---|---|"
+            echo "| REST (\`gh api --method POST .../pulls\`) | $([ "$rest_ok" = "true" ] && echo '✅ abriu PR' || echo '❌ recusado') |"
+            echo "| GraphQL (\`gh pr create\`) | $([ "$rest_ok" = "true" ] && echo '— (não testado, REST já resolveu)' || { [ "$graphql_ok" = "true" ] && echo '✅ abriu PR' || echo '❌ recusado'; }) |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+          echo "rest_ok=$rest_ok" >> "$GITHUB_OUTPUT"
+          echo "graphql_ok=$graphql_ok" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+        id: probe
+
+      - name: Self-clean -- close any PR that opened, delete the disposable branch
+        if: always()
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          branch="${{ steps.probe.outputs.branch }}"
+          pr_number=$(gh pr list --repo "${{ github.repository }}" --head "$branch" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$pr_number" ]; then
+            gh pr close "$pr_number" --repo "${{ github.repository }}" --delete-branch --comment "ENG-157 Fase 0 probe complete -- self-closing, this branch was never meant to merge."
+          else
+            git push origin --delete "$branch" || true
+          fi
+
+          if [ "${{ steps.probe.outputs.rest_ok }}" != "true" ] && [ "${{ steps.probe.outputs.graphql_ok }}" != "true" ]; then
+            echo "::error title=ENG-157 Fase 0: neither path can open a PR::See job summary. ADR-059's design falls back to push-branch-and-print-link."
+            exit 1
+          fi
