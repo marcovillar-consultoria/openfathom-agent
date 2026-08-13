@@ -77,6 +77,14 @@ jobs:
     if: github.event_name == 'push'
     needs: test-entrypoint
     runs-on: ubuntu-latest
+    # ADR-059 (openfathom-meta). `digest` crosses to `promote` as a job output, not by
+    # re-authenticating to GCP there -- `promote` needs no WIF and no code from this repo
+    # at all. This job builds `docker build .` over code the weekly upstream sync merged
+    # in (a PR one human skims); it must never hold the App token that can write to
+    # openfathom-infra. Separate job, separate runner.
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      digest: ${{ steps.push.outputs.digest }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
@@ -103,8 +111,265 @@ jobs:
         run: docker build -f Dockerfile.cloudrun -t of-agent:cloudrun --build-arg BASE_IMAGE=of-agent:base .
 
       - name: Tag and push
+        id: push
         run: |
           image_uri="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/${IMAGE}:${{ steps.tag.outputs.tag }}"
           docker tag of-agent:cloudrun "$image_uri"
           docker push "$image_uri"
           echo "Pushed $image_uri"
+
+          # ENG-115's own verb: ask the REGISTRY what it stored, not the tag and not the
+          # push output. openfathom-infra/scripts/check_pinned_images_exist.py runs this
+          # exact command, so the promotion and the check that guards it agree on what
+          # "the digest" means.
+          digest=$(gcloud artifacts docker images describe "$image_uri" \
+            --project="${PROJECT_ID}" \
+            --format='value(image_summary.digest)')
+          case "$digest" in
+            sha256:*) ;;
+            *) echo "::error title=digest lookup failed::describe returned '${digest}', not a sha256 reference"; exit 1 ;;
+          esac
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+  # ADR-059 (openfathom-meta). Closes ADR-047's "Alternativa D": build is automatic and
+  # promotion was a manual tfvars bump, so drift was the DEFAULT state after every merge,
+  # not the exception -- three times production silently ran old code for days (this repo
+  # twice: ENG-115, ENG-149), and the scheduled drift check that watches for it has never
+  # once been the thing that closed the window (ENG-110): both real occurrences closed
+  # because an unrelated PR happened to bump the pin, never because anyone read the alert.
+  #
+  # This does NOT deploy. It opens a PR against openfathom-infra; merging that PR is what
+  # applies to production (terraform-plan-apply.yml, `push` to `main` with
+  # `environments/**` in its paths filter, `-auto-approve`) -- exactly how every manual
+  # bump already works. No new risk class; the Tech Lead's review stays where it always was.
+  #
+  # TRUST BOUNDARY, since this repo is PUBLIC. This job runs only on `push` to `cloudrun`,
+  # never on `pull_request` -- and GitHub never exposes `secrets.*` to fork-PR runs anyway.
+  # Reaching `cloudrun` requires a merged PR (org ruleset "PR obrigatorio na branch
+  # default", ~DEFAULT_BRANCH, bypass_actors empty). So "can mint a token that writes to
+  # openfathom-infra" == "can merge to cloudrun" -- the same boundary of-upstream-sync.yml
+  # has operated under since 2026-07-20 (ADR-051).
+  #
+  # PR creation is REST (`gh api --method POST .../pulls`), not `gh pr create` -- verified
+  # 2026-08-13 (ENG-157 Fase 0, run 31699495995, PR openfathom-agent#53, opened then
+  # self-closed): `gh pr create` uses the GraphQL `createPullRequest` mutation, which this
+  # same App's token was measured refusing on 2026-07-20 (`Resource not accessible by
+  # integration`, see "Push sync branch" above); REST succeeded on the first try with the
+  # same installation. If REST ever regresses, this falls back to push-branch-and-link (the
+  # `sync` job's own long-standing pattern) and ends the job RED -- a promotion that
+  # silently didn't happen is exactly the defect this workflow exists to delete.
+  promote:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions: {} # everything here authenticates with the App token, not GITHUB_TOKEN
+    env:
+      INFRA_REPO: marcovillar-consultoria/openfathom-infra
+      TFVARS: environments/prod/terraform.tfvars
+      TFVAR_NAME: hermes_agent_image
+      IMAGE_PATH: us-central1-docker.pkg.dev/openfathom-prod/openfathom-images/of-agent
+      NEW_DIGEST: ${{ needs.build.outputs.digest }}
+      IMAGE_TAG: ${{ needs.build.outputs.tag }}
+    steps:
+      # A missing secret must say WHY, not fail deep inside a JWT-signing error that
+      # names nothing actionable -- this is the first consumer of these secrets besides
+      # of-upstream-sync.yml.
+      - name: The App credentials exist in this repo
+        env:
+          APP_ID: ${{ secrets.SYNC_APP_ID }}
+          APP_KEY: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$APP_ID" ] || [ -z "$APP_KEY" ]; then
+            echo "::error title=promotion credentials missing::SYNC_APP_ID / SYNC_APP_PRIVATE_KEY are not set on this repository. The image was built and pushed; only the infra PR is missing."
+            exit 1
+          fi
+
+      # Scoped twice, deliberately narrower than of-upstream-sync.yml's mint: `repositories:`
+      # scopes WHERE (only openfathom-infra, not this repo), `permission-*` scopes WHAT
+      # (contents+pull-requests, NOT the `workflows: write` the installation carries as a
+      # whole). openfathom-infra's required checks (`conventions`/`fmt`/`plan`) are matched
+      # by CONTEXT NAME, required approvals are ZERO, and `bypass_actors` is empty -- a
+      # token with `workflows: write` there could open a PR that rewrites
+      # terraform-plan-apply.yml so `plan` always reports green while doing nothing, and
+      # nothing in the ruleset would catch it. Dropping that permission from the token
+      # closes the path structurally instead of relying on this job's own good behaviour.
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          app-id: ${{ secrets.SYNC_APP_ID }}
+          private-key: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+          owner: marcovillar-consultoria
+          repositories: openfathom-infra
+          permission-contents: write
+          permission-pull-requests: write
+
+      # openfathom-infra, NOT this repo -- nothing from openfathom-agent is checked out
+      # or executed in this job.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: marcovillar-consultoria/openfathom-infra
+          ref: main
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Bump the pinned digest
+        id: bump
+        env:
+          SRC_REPO: ${{ github.repository }}
+          SRC_SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re, sys
+
+          tfvars = pathlib.Path(os.environ["TFVARS"])
+          var    = os.environ["TFVAR_NAME"]
+          image  = os.environ["IMAGE_PATH"]
+          digest = os.environ["NEW_DIGEST"]
+
+          # Read the file DIRECTLY -- *.tfvars is gitignored in openfathom-infra while
+          # THIS file is force-tracked, so a git-aware search is the wrong instrument.
+          text = tfvars.read_text(encoding="utf-8")
+
+          # Anchored on the variable name AND the full registry path: a repository or
+          # image rename must fail loudly here, never silently rewrite the wrong pin.
+          pat = re.compile(
+              r'^(?P<lead>[ \t]*' + re.escape(var) + r'[ \t]*=[ \t]*")'
+              r'(?P<ref>' + re.escape(image) + r'@sha256:[0-9a-f]{64})'
+              r'(?P<tail>"[ \t]*)$',
+              re.MULTILINE,
+          )
+          ms = list(pat.finditer(text))
+          if len(ms) != 1:
+              sys.exit(
+                  f"promote: expected EXACTLY ONE `{var}` pin on `{image}` in {tfvars}, "
+                  f"found {len(ms)}. Refusing to guess -- a silent no-op here is the exact "
+                  f"failure this automation exists to remove."
+              )
+
+          m   = ms[0]
+          old = m.group("ref").split("@", 1)[1]
+
+          out = pathlib.Path(os.environ["GITHUB_OUTPUT"])
+          if old == digest:
+              print(f"promote: {var} is already pinned to {digest} -- nothing to promote")
+              with out.open("a") as fh:
+                  fh.write("changed=false\n")
+              sys.exit(0)
+
+          new = f"{image}@{digest}"
+
+          # A machine-owned stanza, regenerated (never accumulated) immediately above the
+          # pin. The line alone is not enough: the comment block above each pin in this
+          # file is a hand-written promotion dossier (what the image brings, the boot
+          # chain checked, the post-apply confirmation protocol, the rollback candidate)
+          # -- a bot that only swaps the digest leaves that dossier describing the
+          # PREVIOUS promotion. The PR body also asks, as a checklist item, for a human
+          # to rewrite or delete it before merge.
+          BEGIN = "# >>> promote-bot: generated, do not hand-edit between these markers"
+          END   = "# <<< promote-bot"
+          text = re.sub(re.escape(BEGIN) + r".*?" + re.escape(END) + r"\n", "", text, flags=re.DOTALL)
+          ms = list(pat.finditer(text))  # offsets moved if a stanza was just removed
+          m  = ms[0]
+
+          stanza = "\n".join([
+              BEGIN,
+              "# Promovido automaticamente (ADR-059).",
+              f"#   tag      {os.environ['IMAGE_TAG']}",
+              f"#   origem   {os.environ['SRC_REPO']}@{os.environ['SRC_SHA']}",
+              f"#   build    {os.environ['RUN_URL']}",
+              f"#   digest   {old}",
+              f"#         -> {digest}",
+              "# Digest lido do Artifact Registry com `gcloud artifacts docker images",
+              "# describe`, nao suposto da tag (ENG-115).",
+              "# ATENCAO ao revisar: o comentario ACIMA deste bloco descreve a promocao",
+              "# ANTERIOR -- reescreva-o ou apague-o antes do merge.",
+              END,
+              "",
+          ])
+
+          text = text[:m.start()] + stanza + m.group("lead") + new + m.group("tail") + text[m.end():]
+          tfvars.write_text(text, encoding="utf-8")
+
+          with out.open("a") as fh:
+              fh.write("changed=true\n")
+              fh.write(f"old_digest={old}\n")
+          print(f"promote: {var}\n  {old}\n  -> {digest}")
+          PY
+
+      - name: Commit, push, open the PR
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          OLD_DIGEST: ${{ steps.bump.outputs.old_digest }}
+        run: |
+          sha_short=$(echo "${{ github.sha }}" | cut -c1-8)
+          branch="promote/of-agent-${sha_short}"
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          src_url="${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}"
+
+          git config user.name  "openfathom-bot"
+          git config user.email "openfathom-bot@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add "$TFVARS"
+          git commit -m "deploy(promote): of-agent ${IMAGE_TAG} -- bump automatico do digest (ADR-059)" \
+                     -m "Origem: ${{ github.repository }}@${{ github.sha }}" \
+                     -m "Build: ${run_url}"
+
+          # Branch name is SHA-derived, so a re-run of the same build targets a ref that
+          # may already exist. --force-with-lease, never --force: if a human pushed a
+          # correction onto this branch, this must FAIL rather than discard it.
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            git fetch origin "+refs/heads/${branch}:refs/remotes/origin/${branch}"
+          fi
+          git push --force-with-lease origin "HEAD:refs/heads/${branch}"
+
+          existing=$(gh pr list --repo "$INFRA_REPO" --head "$branch" --state open \
+                       --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            echo "::notice title=promotion PR already open::#${existing} -- branch re-pushed, no second PR"
+            exit 0
+          fi
+
+          title="deploy(promote): of-agent ${IMAGE_TAG}"
+          body=$(cat <<EOF
+          Promocao automatica (ADR-059). **Nao aplicado ainda** -- o merge deste PR e o apply.
+
+          | | |
+          |---|---|
+          | imagem | \`of-agent\` |
+          | tag | \`${IMAGE_TAG}\` |
+          | origem | [\`${{ github.repository }}@${sha_short}\`](${src_url}) |
+          | build | [run ${{ github.run_id }}](${run_url}) |
+          | digest anterior | \`${OLD_DIGEST}\` |
+          | digest novo | \`${NEW_DIGEST}\` |
+
+          Digest lido do Artifact Registry com \`gcloud artifacts docker images describe\`, nao suposto da tag (ENG-115).
+
+          Antes de mergear:
+          - [ ] o bloco de comentario ACIMA da linha \`${TFVAR_NAME}\` ainda descreve a promocao ANTERIOR -- reescreva-o ou apague-o
+          - [ ] \`plan\` verde (roda \`check_pinned_images_exist.py\`; um \`plan\` verde de dias atras NAO reexecuta -- \`strict_required_status_checks_policy\` e false)
+          - [ ] o que a imagem nova traz, e como confirmar depois do apply
+          EOF
+          )
+
+          # REST, not `gh pr create` -- verified 2026-08-13 (ENG-157 Fase 0), see the job
+          # header comment. If this is ever refused, fall back to the push-branch-and-link
+          # pattern `sync` already uses in production, and end RED -- never a silent no-op.
+          if gh api --method POST "repos/${INFRA_REPO}/pulls" \
+               -f title="$title" -f head="$branch" -f base=main -f body="$body"; then
+            echo "::notice title=promotion PR opened::${INFRA_REPO} <- ${branch}"
+            exit 0
+          fi
+
+          title_enc=$(jq -nr --arg v "$title" '$v|@uri')
+          body_enc=$(jq -nr --arg v "$body" '$v|@uri')
+          compare="${{ github.server_url }}/${INFRA_REPO}/compare/main...${branch}?expand=1&title=${title_enc}&body=${body_enc}"
+          {
+            echo "## promocao NAO abriu o PR"
+            echo
+            echo "O branch \`${branch}\` foi empurrado para \`${INFRA_REPO}\`. Abra o PR:"
+            echo
+            echo "  ${compare}"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "::error title=promotion PR not created::branch pushed, PR refused -- see job summary for the link"
+          exit 1
