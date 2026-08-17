@@ -1610,6 +1610,100 @@ else
   bad "staging-path mutant did not apply -- a mutant that does not mutate proves nothing"
 fi
 
+# ---------------------------------------------------------------------------
+# of_reconcile_api_server_key (openfathom-meta ENG-167) -- the upstream sync of
+# 2026-08-17 made docker/stage2-hook.sh generate an API_SERVER_KEY into
+# $HERMES_HOME/.env, and env_loader.load_hermes_dotenv() loads that file with
+# override=True. Without this reconcile the gateway runs on a container-generated key
+# while Secret Manager holds a different one -- silently, because the gateway still boots.
+# ---------------------------------------------------------------------------
+echo "== case: of_reconcile_api_server_key =="
+RECON_FN="$WORK/recon.sh"
+extract_one_fn "$RECON_FN" of_reconcile_api_server_key
+# shellcheck disable=SC1090
+source "$RECON_FN"
+
+mk_env_file() { # <dir> <line>...
+  local d="$1"; shift; mkdir -p "$d"
+  : > "$d/.env"; local l
+  for l in "$@"; do printf '%s\n' "$l" >> "$d/.env"; done
+  chmod 600 "$d/.env"
+}
+env_key() { grep '^API_SERVER_KEY=' "$1/.env" | sed 's/^API_SERVER_KEY=//'; }
+
+# The generated-key case: exactly what the new stage2 block leaves behind.
+RH1="$WORK/recon1"
+mk_env_file "$RH1" "ANTHROPIC_API_KEY=sk-from-dotenv" "API_SERVER_KEY=deadbeefgenerated0123456789abcdef"
+HERMES_HOME="$RH1" API_SERVER_KEY="canonical-from-secret-manager-000" of_reconcile_api_server_key >/dev/null 2>&1
+check "generated key replaced by the Secret Manager value" \
+  "canonical-from-secret-manager-000" "$(env_key "$RH1")"
+check "exactly ONE assignment remains (dotenv keeps the last -- a leftover would shadow us)" \
+  "1" "$(grep -c '^API_SERVER_KEY=' "$RH1/.env")"
+check "unrelated lines survive untouched" \
+  "1" "$(grep -c '^ANTHROPIC_API_KEY=sk-from-dotenv$' "$RH1/.env")"
+check "mode stayed 0600 (cat > preserves it; mv would not)" \
+  "600" "$(stat -c '%a' "$RH1/.env")"
+
+# Two assignments: generator ran, then someone appended. dotenv honors the LAST one, so
+# leaving either behind is a live defect.
+RH2="$WORK/recon2"
+mk_env_file "$RH2" "API_SERVER_KEY=first-value-000000000" "OTHER=x" "API_SERVER_KEY=second-value-00000000"
+HERMES_HOME="$RH2" API_SERVER_KEY="canonical-000000000000" of_reconcile_api_server_key >/dev/null 2>&1
+check "both stale assignments dropped, ours is the only one" \
+  "1" "$(grep -c '^API_SERVER_KEY=' "$RH2/.env")"
+check "the surviving value is ours, not the file's last one" \
+  "canonical-000000000000" "$(env_key "$RH2")"
+
+# Steady state must be silent AND must not rewrite: a boot line that says "nothing to do"
+# every time is the noise that trains people to skip boot logs.
+RH3="$WORK/recon3"
+mk_env_file "$RH3" "API_SERVER_KEY=already-identical-00000"
+out3="$(HERMES_HOME="$RH3" API_SERVER_KEY="already-identical-00000" of_reconcile_api_server_key 2>&1)"
+check "already-identical -> says nothing" "0" "$(printf '%s' "$out3" | grep -c .)"
+
+# No .env at all (job mode, or an image that never seeded one) -> no-op, no error.
+RH4="$WORK/recon4"; mkdir -p "$RH4"
+HERMES_HOME="$RH4" API_SERVER_KEY="whatever-0000000000000" of_reconcile_api_server_key >/dev/null 2>&1
+check "no .env -> no file created (we reconcile, we do not seed)" "0" "$([[ -f "$RH4/.env" ]] && echo 1 || echo 0)"
+
+# A .env whose ONLY line is the key: `grep -v` legitimately exits 1 on empty output, and
+# without the `|| true` the function would abort under `set -e` before appending.
+RH5="$WORK/recon5"
+mk_env_file "$RH5" "API_SERVER_KEY=the-only-line-00000000"
+( set -e; HERMES_HOME="$RH5" API_SERVER_KEY="canonical-solo-0000000" of_reconcile_api_server_key >/dev/null 2>&1 )
+check "single-line .env still reconciled (grep -v exiting 1 does not abort us)" \
+  "canonical-solo-0000000" "$(env_key "$RH5")"
+
+echo "== MUTANT: of_reconcile_api_server_key -- stale assignments no longer dropped =="
+# Reverts to a bare append. dotenv keeps the LAST occurrence, so appending after the
+# generated line looks correct and IS correct by luck of ordering -- but the file then
+# carries two, and any later append (operator, or a second boot of a future generator)
+# silently wins. Asserts the specific wrong state, not merely "differs".
+extract_one_fn "$WORK/recon-mut.sh" of_reconcile_api_server_key \
+  "s|grep -v '\\^API_SERVER_KEY=' \"\\\$env_file\" > \"\\\$tmp\" |cat \"\$env_file\" > \"\$tmp\" |"
+if grep -q 'cat "$env_file" > "$tmp"' "$WORK/recon-mut.sh"; then
+  RHM="$WORK/recon-mut-home"
+  mk_env_file "$RHM" "API_SERVER_KEY=generated-stale-000000"
+  ( # shellcheck disable=SC1090
+    source "$WORK/recon-mut.sh"
+    HERMES_HOME="$RHM" API_SERVER_KEY="canonical-000000000000" of_reconcile_api_server_key >/dev/null 2>&1 )
+  check "filter removed -> the stale generated assignment is still in the file (2 lines)" \
+    "2" "$(grep -c '^API_SERVER_KEY=' "$RHM/.env")"
+  check "filter removed -> the generated value survives alongside ours" \
+    "1" "$(grep -c '^API_SERVER_KEY=generated-stale-000000$' "$RHM/.env")"
+else
+  bad "reconcile filter mutation did not apply -- a mutant that does not mutate proves nothing"
+fi
+
+echo "== MUTANT: of_reconcile_api_server_key -- never called at all (the pre-ENG-167 state) =="
+# The regression itself: with the reconcile absent, the .env keeps the generated key and
+# dotenv's override=True hands it to the gateway. Simulated by simply not calling it.
+RHN="$WORK/recon-none"
+mk_env_file "$RHN" "API_SERVER_KEY=generated-by-stage2-00"
+check "no reconcile -> the container-generated key is what dotenv would load" \
+  "generated-by-stage2-00" "$(env_key "$RHN")"
+unset HERMES_HOME
+
 echo
 echo "passed: $pass   failed: $fail"
 [[ "$fail" -eq 0 ]]
