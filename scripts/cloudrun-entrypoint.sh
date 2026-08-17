@@ -1591,6 +1591,50 @@ of_write_soul() {
   echo "[of-soul] wrote declared SOUL.md (${#HERMES_SOUL} chars, capabilities block: $([[ -n "$capabilities" ]] && echo yes || echo no)) to $home/SOUL.md"
 }
 
+# openfathom-meta ENG-167. The upstream sync of 2026-08-17 added a block to
+# docker/stage2-hook.sh that GENERATES an API_SERVER_KEY into $HERMES_HOME/.env whenever
+# that file carries no non-empty value for it -- and `seed_one ".env" ".env.example"`,
+# which has always run one screen above it, creates that file from an example that does
+# not carry the key at all. So on this image the generated value is the NORMAL case, not
+# an edge one.
+#
+# Why that is not harmless here: hermes_cli/env_loader.py's load_hermes_dotenv() loads
+# $HERMES_HOME/.env with `override=True`, and its own docstring says it "overrides stale
+# shell-exported values". Our key arrives as a container env var out of Secret Manager
+# (hermes-gateway-api-key) -- precisely what that override replaces. The gateway would
+# still START, because a 64-char key does exist, so nothing fails loudly; what breaks is
+# that the key in USE stops being the key Secret Manager holds, which makes the rotation
+# runbook (openfathom-meta ENG-105) rotate a value nobody reads.
+#
+# This reconciles instead of pre-writing because we cannot get ahead of the generator:
+# stage2-hook runs in cont-init, BEFORE this script. Measured in production on revision
+# hermes-gateway-00070-nr2, not assumed -- "[stage2] Setup complete" at 13:59:33Z, this
+# script's first state line at 13:59:56Z. What we CAN do is make the file agree with the
+# env var before `hermes gateway run` (later in this same script) ever reads it.
+of_reconcile_api_server_key() {
+  local home="${HERMES_HOME:-/opt/data}" env_file tmp
+  env_file="$home/.env"
+  # No .env and no key mean there is nothing that could override us. Both are `return 0`
+  # rather than an error: the caller already refuses an empty API_SERVER_KEY in service
+  # mode, and job mode legitimately has neither.
+  [[ -f "$env_file" ]] || return 0
+  [[ -n "${API_SERVER_KEY:-}" ]] || return 0
+  # Steady state: already identical. Say nothing -- a line on every boot that reports
+  # "nothing to do" is the noise that trains people to skip boot logs.
+  grep -qxF "API_SERVER_KEY=${API_SERVER_KEY}" "$env_file" && return 0
+  tmp="$(mktemp)" || { echo "[of-apikey] WARN: mktemp failed; .env may still override API_SERVER_KEY" >&2; return 0; }
+  # Drop EVERY existing assignment before appending the canonical one, so a file that
+  # accumulated more than one (generator ran, then an operator edited) cannot leave a
+  # later line shadowing ours -- dotenv keeps the last occurrence.
+  grep -v '^API_SERVER_KEY=' "$env_file" > "$tmp" || true
+  printf 'API_SERVER_KEY=%s\n' "$API_SERVER_KEY" >> "$tmp"
+  # `cat >` and not `mv`: it preserves the inode, owner and 0600 mode that stage2-hook
+  # deliberately tightened. A `mv` would land a fresh file with the default umask.
+  cat "$tmp" > "$env_file" || { echo "[of-apikey] WARN: could not rewrite $env_file; the dotenv value stays in force" >&2; rm -f "$tmp"; return 0; }
+  rm -f "$tmp"
+  echo "[of-apikey] reconciled API_SERVER_KEY in $env_file with the Secret Manager value (dotenv override=True would otherwise win)"
+}
+
 case "${HERMES_MODE:-service}" in
   service)
     # Same command docker-compose.yml already runs today (`gateway: command:
@@ -1615,6 +1659,9 @@ case "${HERMES_MODE:-service}" in
       echo "ERROR: API_SERVER_KEY must be set when HERMES_MODE=service (>=16 chars, e.g. \`openssl rand -hex 32\` from Secret Manager)" >&2
       exit 1
     fi
+    # Must run BEFORE `hermes gateway run` below: that is what loads the dotenv that
+    # would otherwise override this key. See the function header for the measurement.
+    of_reconcile_api_server_key
     export HERMES_GATEWAY_NO_SUPERVISE=1
     export API_SERVER_ENABLED=true
     export API_SERVER_HOST="0.0.0.0"
