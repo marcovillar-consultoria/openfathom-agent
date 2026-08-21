@@ -35,6 +35,18 @@ FROM ${BASE_IMAGE}
 COPY scripts/cloudrun-entrypoint.sh /opt/hermes/scripts/cloudrun-entrypoint.sh
 RUN chmod +x /opt/hermes/scripts/cloudrun-entrypoint.sh
 
+# hermes-plugins/document-reader (openfathom-bridges) reads PDF/DOCX/XLSX
+# attachments -- openfathom-meta ADR-062/ADR-063. pypdf and openpyxl are the
+# deliberate stdlib-only exception those ADRs register (parsing a document
+# format is not something the standard library does); both confirmed
+# pure-Python via PyPI's JSON API on 2026-08-21 (py3-none-any wheel, no
+# compiled dependency) -- python-docx was rejected for requiring lxml, a
+# compiled extension, so DOCX extracts via stdlib zipfile+ElementTree
+# instead and needs nothing installed here. Pinned, not a caret range, same
+# discipline as openfathom-bridges' provider pins.
+RUN uv pip install --python /opt/hermes/.venv/bin/python --no-cache-dir \
+    pypdf==6.16.1 openpyxl==3.1.5
+
 # Cloud Run Service injects $PORT at runtime (see cloudrun-entrypoint.sh);
 # 8080 is only the documented default for local `docker run -p`.
 EXPOSE 8080
