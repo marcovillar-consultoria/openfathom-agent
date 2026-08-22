@@ -1509,11 +1509,23 @@ of_state_generation=0; of_state_epoch=3
 STATE_LOOP_LOG="$WORK/state-loop.log"
 ( of_state_sync_loop > "$STATE_LOOP_LOG" 2>&1 ) &
 state_loop_pid=$!
-sleep 0.9
+# Wait for the EFFECT (two cycles logged), never for a fixed slice of wall clock.
+# The old form slept 0.9s and asked how much work fitted inside it, which measures
+# the runner's scheduler as much as it measures the loop -- and it turned CI red
+# twice on 2026-08-21 while the loop itself was fine, blocking an image build both
+# times (openfathom-meta ENG-174). The ceiling below is deliberately generous: a
+# slow runner must come out SLOW here, never RED. What still fails, and must, is a
+# loop that does not iterate -- the ceiling then expires with cycles still at 0/1.
+state_cycles=0
+for _ in $(seq 1 200); do   # up to ~20s, 100x the 0.2s interval
+  state_cycles="$(grep -c 'snapshot uploaded to gs://test-bucket/gateway-state.tar.gz' "$STATE_LOOP_LOG")"
+  [[ "$state_cycles" -ge 2 ]] && break
+  sleep 0.1
+done
 kill -TERM "$state_loop_pid" 2>/dev/null || true
 wait "$state_loop_pid" 2>/dev/null || true
-state_cycles="$(grep -c 'snapshot uploaded to gs://test-bucket/gateway-state.tar.gz' "$STATE_LOOP_LOG")"
-check "at least 2 state sync cycles ran in ~0.9s at a 0.2s interval" \
+[[ "$state_cycles" -ge 2 ]] || echo "  diag: only $state_cycles cycle(s) logged before the 20s ceiling"
+check "at least 2 state sync cycles ran at a 0.2s interval (waited up to 20s)" \
   "1" "$([[ "$state_cycles" -ge 2 ]] && echo 1 || echo 0)"
 
 echo "== case: of_state_sync_loop -- a turn written mid-session survives a HARD kill (SIGKILL) =="
@@ -1522,9 +1534,15 @@ CRASH_HOME="$WORK/crash-home"; mk_state_home "$CRASH_HOME" 3 "1:s1:user:100:befo
 export HERMES_HOME="$CRASH_HOME"
 export HERMES_STATE_SYNC_INTERVAL_SECONDS="0.2"
 of_state_generation=0; of_state_epoch=3
-( of_state_sync_loop > /dev/null 2>&1 ) &
+CRASH_LOOP_LOG="$WORK/crash-loop.log"
+( of_state_sync_loop > "$CRASH_LOOP_LOG" 2>&1 ) &
 crash_loop_pid=$!
-sleep 0.3
+# Wait until the loop has demonstrably ticked once before writing the mid-session
+# turn. "sleep 0.3 and hope" is half of why this case flapped on 2026-08-21.
+for _ in $(seq 1 200); do
+  [[ "$(grep -c 'snapshot uploaded to' "$CRASH_LOOP_LOG")" -ge 1 ]] && break
+  sleep 0.1
+done
 python3 - "$CRASH_HOME/state.db" <<'PY'
 import sqlite3, sys
 con = sqlite3.connect(sys.argv[1])
@@ -1532,16 +1550,39 @@ con.execute("insert into messages (id, session_id, role, content, timestamp) "
             "values (2, 's1', 'user', 'mid-session, never gracefully shut down', 200.0)")
 con.commit(); con.close()
 PY
-sleep 0.3
-kill -9 "$crash_loop_pid" 2>/dev/null || true   # of_on_term and its final flush NEVER run
-wait "$crash_loop_pid" 2>/dev/null || true
-mkdir -p "$WORK/state-crash-extract"; tar xzf "$UPLOADED" -C "$WORK/state-crash-extract" 2>/dev/null
-check "the mid-session turn reached GCS through a periodic tick, with no graceful shutdown at all" \
-  "1" "$(python3 -c "
+# Now wait for the EFFECT, and do NOT swallow the errors on the way to it. With
+# `2>/dev/null` on both the extract and the query, three different worlds printed
+# the same empty string -- "no tarball was ever uploaded", "the query blew up" and
+# "the tick simply has not run yet" -- so a real regression in the periodic merge
+# was indistinguishable from a slow runner. That is exactly the failure mode
+# openfathom-meta ENG-136 cost us: 89 real messages lost, no error in any log.
+# Each branch below records WHY it has not succeeded yet.
+crash_rows=""
+crash_diag="no attempt completed"
+for _ in $(seq 1 200); do   # up to ~20s
+  if [[ ! -s "$UPLOADED" ]]; then
+    crash_diag="no tarball uploaded yet"; sleep 0.1; continue
+  fi
+  rm -rf "$WORK/state-crash-extract"; mkdir -p "$WORK/state-crash-extract"
+  if ! tar_err="$(tar xzf "$UPLOADED" -C "$WORK/state-crash-extract" 2>&1)"; then
+    crash_diag="tar failed: $tar_err"; sleep 0.1; continue
+  fi
+  if ! crash_rows="$(python3 -c "
 import sqlite3
 con = sqlite3.connect('$WORK/state-crash-extract/state.db')
 print(con.execute(\"select count(*) from messages where content='mid-session, never gracefully shut down'\").fetchone()[0])
-" 2>/dev/null)"
+" 2>&1)"; then
+    crash_diag="query failed: $crash_rows"; crash_rows=""; sleep 0.1; continue
+  fi
+  [[ "$crash_rows" == "1" ]] && { crash_diag="ok"; break; }
+  crash_diag="tarball reached, but it holds $crash_rows matching row(s)"
+  sleep 0.1
+done
+kill -9 "$crash_loop_pid" 2>/dev/null || true   # of_on_term and its final flush NEVER run
+wait "$crash_loop_pid" 2>/dev/null || true
+[[ "$crash_rows" == "1" ]] || echo "  diag: $crash_diag"
+check "the mid-session turn reached GCS through a periodic tick, with no graceful shutdown at all" \
+  "1" "$crash_rows"
 
 echo "== case: of_state_sync_loop -- TERM interrupts immediately, does not wait out the interval =="
 reset_stub
