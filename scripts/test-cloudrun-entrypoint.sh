@@ -1746,23 +1746,41 @@ check "no reconcile -> the container-generated key is what dotenv would load" \
 unset HERMES_HOME
 
 # ---------------------------------------------------------------------------
-# openfathom-meta ENG-167 -- the guard above is INERT today, and this case exists so it
-# cannot stop being inert in silence.
+# openfathom-meta ENG-167 -- the guard above was INERT until 2026-08-24. It is LIVE now,
+# and this case exists so that state cannot change again in silence, in either direction.
 #
-# WHAT WAS MEASURED, 2026-08-17, and it corrected this item's own central claim. The
-# reconcile was shipped believing the generated key was the NORMAL case. It is not: the
-# boot of revision hermes-gateway-00071-7wm shows neither `[stage2] Generated
-# API_SERVER_KEY` nor `[of-apikey] reconciled` -- both absent, with the filter proven
-# against a case it had to catch (the same query returned the `[of-state]` lines). The
-# chain never starts because /opt/hermes/.env.example DOES NOT EXIST in the image:
-# .dockerignore excludes it, so upstream's `seed_one ".env" ".env.example"` fails its own
-# `[ -f ]`, no $HERMES_HOME/.env is ever born, and stage2's generator block -- guarded by
-# `[ -f "$HERMES_HOME/.env" ]` -- never fires.
+# WHAT WAS MEASURED, 2026-08-17. The reconcile shipped believing the generated key was the
+# NORMAL case. It was not: the boot of revision hermes-gateway-00071-7wm showed neither
+# `[stage2] Generated API_SERVER_KEY` nor `[of-apikey] reconciled` -- both absent, with the
+# filter proven against a case it had to catch (the same query returned the `[of-state]`
+# lines). The chain never started because /opt/hermes/.env.example DID NOT EXIST in the
+# image: .dockerignore excluded it, so upstream's `seed_one ".env" ".env.example"` failed
+# its own `[ -f ]`, no $HERMES_HOME/.env was ever born, and stage2's generator block --
+# guarded by `[ -f "$HERMES_HOME/.env" ]` -- never fired.
 #
-# SO THE RECONCILE IS A CONTINGENCY, NOT A FIX, and the risk it leaves behind is not that
-# it is wrong: it is that a future upstream sync flips one line of .dockerignore and arms
-# the whole chain with nothing announcing it. The reconcile would then start acting, which
-# is what we want, but nobody would know the premise changed. THAT is what this checks.
+# WHAT CHANGED, 2026-08-24, and this case is what caught it. The upstream sync
+# `sync/upstream-20260824` (upstream/main@6ed8bcee8) re-included the template ON PURPOSE:
+#
+#     .env
+#     .env.*
+#    +# ...but keep the template: docker/stage2-hook.sh seeds $HERMES_HOME/.env from
+#    +# /opt/hermes/.env.example on first boot (OOF-285 -- excluding it silently broke
+#    +# first-boot .env seeding and the API_SERVER_KEY generation that depends on it).
+#    +!.env.example
+#     @@
+#    -.env.example
+#
+# Upstream fixed THEIR side of the same mechanism and, in doing so, armed OUR chain. This
+# assertion failed on that sync -- expected [disarmed-excluded], got [armed] -- which is
+# exactly the future the 2026-08-17 version of this comment was written to catch, and the
+# `!` re-inclusion mutant below had already named the shape of it.
+#
+# SO THE RECONCILE IS NO LONGER A CONTINGENCY: it is now the live path, exercised on every
+# boot, and ENG-167's exit criterion (`[of-apikey] reconciled` in the boot log) became
+# satisfiable for the first time. The risk that remains is the MIRROR of the old one -- a
+# future sync silently disarming the chain again, which would make the reconcile inert and
+# the exit criterion unsatisfiable once more, with nothing announcing it. THAT is what this
+# checks now. The verdict flipped; the reason for watching did not.
 #
 # WHY IT IS NOT A CHECK IN openfathom-meta: the fact lives in THIS repo, in a file
 # (.dockerignore) the fork is forbidden to edit (ADR-002/035/050 -- 8 files, this test is
@@ -1796,16 +1814,20 @@ eng167_trigger_state() { # <repo-root> -> no-dockerignore|disarmed-absent|disarm
   [[ "$verdict" == "excluded" ]] && echo "disarmed-excluded" || echo "armed"
 }
 
-check "the trigger is disarmed, and by exclusion rather than by absence" \
-  "disarmed-excluded" "$(eng167_trigger_state "$REPO_ROOT")"
+check "the trigger is ARMED -- upstream re-included the template on 2026-08-24" \
+  "armed" "$(eng167_trigger_state "$REPO_ROOT")"
 
-# POSITIVE CONTROL. A negative conclusion needs proof that the query can return anything
-# else -- otherwise a function hardwired to say "disarmed-excluded" would pass the line
-# above forever. This is the same edge openfathom-meta ENG-123 pays for repeatedly.
-E167_POS="$WORK/eng167-armed"; mkdir -p "$E167_POS"; touch "$E167_POS/.env.example"
-printf 'node_modules\n*.pyc\n' > "$E167_POS/.dockerignore"
-check "control -- a .dockerignore that does not exclude it reads as ARMED" \
-  "armed" "$(eng167_trigger_state "$E167_POS")"
+# POSITIVE CONTROL, and it INVERTED with the verdict above on 2026-08-24. The control must
+# always prove the query can return something OTHER than what the live assertion expects --
+# otherwise a function hardwired to the expected value passes that line forever. While the
+# live verdict was "disarmed-excluded" this fixture proved the function could say "armed";
+# now that the live verdict IS "armed", it has to prove the opposite. Leaving the old
+# control in place would have made the pair tautological. Same edge openfathom-meta ENG-123
+# pays for repeatedly.
+E167_POS="$WORK/eng167-excluded"; mkdir -p "$E167_POS"; touch "$E167_POS/.env.example"
+printf 'node_modules\n*.pyc\n.env.example\n' > "$E167_POS/.dockerignore"
+check "control -- a .dockerignore that DOES exclude it still reads as disarmed" \
+  "disarmed-excluded" "$(eng167_trigger_state "$E167_POS")"
 
 echo "== MUTANT: ENG-167 -- upstream re-includes .env.example with a negation =="
 # The subtle arming, and the reason this walks the file instead of grepping for the
@@ -1817,9 +1839,12 @@ check "a later '!' re-inclusion arms the trigger, and the guard says so" \
   "armed" "$(eng167_trigger_state "$E167_NEG")"
 
 echo "== MUTANT: ENG-167 -- the exclusions are dropped from .dockerignore =="
-# The blunt arming: a sync rewrites .dockerignore without the .env rules. Today TWO lines
-# cover the file (`.env.*` at 42 and `.env.example` at 101), so this also documents that
-# losing only one of them is NOT enough to arm it.
+# The blunt arming: a sync rewrites .dockerignore without the .env rules. This fixture is
+# synthetic on purpose, so it keeps documenting that the `.env.*` glob ALONE disarms the
+# file and that losing only one exclusion line is NOT enough to arm it -- a fact that
+# outlives the real file's layout. (Before 2026-08-24 the live file carried two exclusions,
+# `.env.*` and a by-name `.env.example`; the sync dropped the by-name line and added a `!`
+# re-inclusion instead. Line numbers are deliberately not cited here -- they rot.)
 E167_ONE="$WORK/eng167-glob-only"; mkdir -p "$E167_ONE"; touch "$E167_ONE/.env.example"
 printf '.env\n.env.*\n' > "$E167_ONE/.dockerignore"
 check "the glob alone still disarms it -- dropping the by-name line is not enough" \
