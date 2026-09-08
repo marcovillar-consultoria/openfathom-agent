@@ -166,6 +166,7 @@ jobs:
     env:
       INFRA_REPO: marcovillar-consultoria/openfathom-infra
       TFVARS: environments/prod/terraform.tfvars
+      PROMOTIONS: docs/promotions.md
       TFVAR_NAME: hermes_agent_image
       IMAGE_PATH: us-central1-docker.pkg.dev/openfathom-prod/openfathom-images/of-agent
       NEW_DIGEST: ${{ needs.build.outputs.digest }}
@@ -259,12 +260,10 @@ jobs:
           new = f"{image}@{digest}"
 
           # A machine-owned stanza, regenerated (never accumulated) immediately above the
-          # pin. The line alone is not enough: the comment block above each pin in this
-          # file is a hand-written promotion dossier (what the image brings, the boot
-          # chain checked, the post-apply confirmation protocol, the rollback candidate)
-          # -- a bot that only swaps the digest leaves that dossier describing the
-          # PREVIOUS promotion. The PR body also asks, as a checklist item, for a human
-          # to rewrite or delete it before merge.
+          # pin. It used to be followed by a line asking a human to rewrite the prose
+          # dossier that sat above it -- and across five consecutive promotions not one
+          # did (openfathom-meta ENG-236). The dossier now lives in docs/promotions.md,
+          # which is append-only, and a later step appends this promotion's facts to it.
           BEGIN = "# >>> promote-bot: generated, do not hand-edit between these markers"
           END   = "# <<< promote-bot"
           text = re.sub(re.escape(BEGIN) + r".*?" + re.escape(END) + r"\n", "", text, flags=re.DOTALL)
@@ -281,8 +280,8 @@ jobs:
               f"#         -> {digest}",
               "# Digest lido do Artifact Registry com `gcloud artifacts docker images",
               "# describe`, nao suposto da tag (ENG-115).",
-              "# ATENCAO ao revisar: o comentario ACIMA deste bloco descreve a promocao",
-              "# ANTERIOR -- reescreva-o ou apague-o antes do merge.",
+              "# O dossie desta promocao -- o que a imagem traz, o que conferir depois do",
+              "# apply -- fica em docs/promotions.md, que e append-only (ENG-236).",
               END,
               "",
           ])
@@ -294,6 +293,67 @@ jobs:
               fh.write("changed=true\n")
               fh.write(f"old_digest={old}\n")
           print(f"promote: {var}\n  {old}\n  -> {digest}")
+          PY
+
+      # ENG-236. The dossier used to live as prose ABOVE the pin in terraform.tfvars,
+      # where nothing ever updated it: the generated stanza carried a line asking a
+      # human to rewrite it before merging, and across FIVE consecutive of-bridges
+      # promotions (22/08, 29/08, 02/09, 04/09, 08/09) not one did. Twenty-seven days
+      # describing an image that was not in production, with a "CONFIRMACAO apos o
+      # apply" section pointing at the wrong check. The defect was not indiscipline --
+      # a warning with 0% uptake is noise -- it was PLACE: dated prose in a LIVING
+      # document. So the bot appends the facts to an append-only file, where growing
+      # old is the correct behaviour, and the human adds judgement there or nowhere.
+      - name: Append this promotion to the dossier
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          SRC_REPO: ${{ github.repository }}
+          SRC_SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          OLD_DIGEST: ${{ steps.bump.outputs.old_digest }}
+        run: |
+          python3 - <<'PY'
+          import datetime, os, pathlib
+
+          doc = pathlib.Path(os.environ["PROMOTIONS"])
+          # Fail closed: this file is created by a human PR (ENG-236) and its header
+          # explains the whole convention. A bot that creates it on the fly would
+          # produce a headerless file that reads like an accident.
+          if not doc.exists():
+              raise SystemExit(
+                  f"promote: {doc} does not exist. It is the append-only home of the "
+                  f"promotion dossier (openfathom-meta ENG-236) and is NOT created here "
+                  f"-- creating it would lose the header that explains the convention."
+              )
+
+          # -03:00, never UTC, for anything a human reads (openfathom-meta AGENTS.md).
+          now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-3)))
+          entry = "\n".join([
+              "",
+              "---",
+              "",
+              f"## {now:%Y-%m-%d} — `{os.environ['TFVAR_NAME']}` → `{os.environ['IMAGE_TAG']}`",
+              "",
+              "**Entrada automática (ADR-059). O julgamento ainda não foi escrito** — o que "
+              "esta imagem muda em runtime, o que conferir depois do apply e o que ela NÃO "
+              "conserta é o que nenhuma máquina sabe. Quem mergear a promoção acrescenta "
+              "abaixo, ou deixa dito que não havia nada a dizer.",
+              "",
+              "| | |",
+              "|---|---|",
+              f"| tag | `{os.environ['IMAGE_TAG']}` |",
+              f"| origem | `{os.environ['SRC_REPO']}@{os.environ['SRC_SHA']}` |",
+              f"| build | {os.environ['RUN_URL']} |",
+              f"| digest anterior | `{os.environ['OLD_DIGEST']}` |",
+              f"| digest novo | `{os.environ['NEW_DIGEST']}` |",
+              "",
+              "Digest lido do Artifact Registry com `gcloud artifacts docker images "
+              "describe`, não suposto da tag (ENG-115).",
+              "",
+          ])
+          with doc.open("a", encoding="utf-8") as fh:
+              fh.write(entry)
+          print(f"promote: appended one entry to {doc}")
           PY
 
       - name: Commit, push, open the PR
@@ -310,7 +370,7 @@ jobs:
           git config user.name  "openfathom-bot"
           git config user.email "openfathom-bot@users.noreply.github.com"
           git checkout -b "$branch"
-          git add "$TFVARS"
+          git add "$TFVARS" "$PROMOTIONS"
           git commit -m "deploy(promote): of-agent ${IMAGE_TAG} -- bump automatico do digest (ADR-059)" \
                      -m "Origem: ${{ github.repository }}@${{ github.sha }}" \
                      -m "Build: ${run_url}"
@@ -346,7 +406,7 @@ jobs:
           Digest lido do Artifact Registry com \`gcloud artifacts docker images describe\`, nao suposto da tag (ENG-115).
 
           Antes de mergear:
-          - [ ] o bloco de comentario ACIMA da linha \`${TFVAR_NAME}\` ainda descreve a promocao ANTERIOR -- reescreva-o ou apague-o
+          - [ ] a entrada nova em \`${PROMOTIONS}\` recebeu o julgamento: o que esta imagem muda em runtime, ou a frase dizendo que nao muda nada
           - [ ] \`plan\` verde (roda \`check_pinned_images_exist.py\`; um \`plan\` verde de dias atras NAO reexecuta -- \`strict_required_status_checks_policy\` e false)
           - [ ] o que a imagem nova traz, e como confirmar depois do apply
           EOF
