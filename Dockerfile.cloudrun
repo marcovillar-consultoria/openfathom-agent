@@ -57,6 +57,24 @@ RUN chmod +x /opt/hermes/scripts/cloudrun-entrypoint.sh
 RUN uv pip install --python /opt/hermes/.venv/bin/python --no-cache-dir \
     pypdf==6.15.0 openpyxl==3.1.5
 
+# hermes-plugins/youtube-transcript (openfathom-bridges) reads a video's
+# caption track -- openfathom-meta ENG-231. The bundled upstream skill
+# `youtube-content` is competent but its workflow shells out to
+# `uv run python .../fetch_transcript.py`, and terminal/code_execution are
+# disabled (ENG-51, ADR-043); measured 2026-09-07, the model fell back to
+# web_extract, which returns the YouTube page and no captions. Same
+# third-party exception ADR-062 registers for pypdf/openpyxl.
+#
+# Verified on PyPI 2026-09-08, and the date is the check that matters, not
+# the version number: 1.2.4 was published 2026-01-29, far outside the
+# `exclude-newer = "14 days"` window that made a pypdf pin unbuildable BY
+# CONSTRUCTION above. It is pure-Python (py3-none-any), and its only
+# non-stdlib dependencies -- requests and defusedxml 0.7.1 -- are already
+# pinned in pyproject.toml at exactly those versions, so this resolves
+# without moving anything else.
+RUN uv pip install --python /opt/hermes/.venv/bin/python --no-cache-dir \
+    youtube-transcript-api==1.2.4
+
 # Cloud Run Service injects $PORT at runtime (see cloudrun-entrypoint.sh);
 # 8080 is only the documented default for local `docker run -p`.
 EXPOSE 8080
