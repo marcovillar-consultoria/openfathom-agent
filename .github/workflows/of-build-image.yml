@@ -295,6 +295,32 @@ jobs:
           print(f"promote: {var}\n  {old}\n  -> {digest}")
           PY
 
+      # The bot rewrites ONE line and preserves the whitespace it captured, so
+      # it cannot know that the line's alignment GROUP changed. Measured
+      # 2026-09-08: openfathom-meta ENG-236 pruned ~70 lines of prose from
+      # between the two pins, leaving them adjacent -- and `terraform fmt` then
+      # aligns both `=` as one group, which the bot's untouched `bridges_image`
+      # line no longer satisfied. The promotion PR went red on `fmt -check`
+      # (exit 3) for a whitespace change it did not make, and would have done
+      # so on EVERY promotion from both repos.
+      #
+      # `fmt`, not `fmt -check`: this step exists to fix, and the diff is
+      # reviewed in the PR like any other. Scoped to the one file the bump
+      # touched -- a repo-wide `-recursive` here would sweep unrelated drift
+      # into a promotion PR, which is how an apply gets a surprise in it.
+      #
+      # setup-terraform and not the runner's own binary: `terraform` happens to
+      # be on ubuntu-latest today, and a promotion silently going red the month
+      # GitHub drops it from the image is not a failure mode worth inheriting.
+      # Same pinned SHA the openfathom-infra workflow already uses.
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        if: steps.bump.outputs.changed == 'true'
+        with:
+          terraform_wrapper: false
+      - name: Keep the tfvars formatted
+        if: steps.bump.outputs.changed == 'true'
+        run: terraform fmt "$TFVARS"
+
       # ENG-236. The dossier used to live as prose ABOVE the pin in terraform.tfvars,
       # where nothing ever updated it: the generated stanza carried a line asking a
       # human to rewrite it before merging, and across FIVE consecutive of-bridges
