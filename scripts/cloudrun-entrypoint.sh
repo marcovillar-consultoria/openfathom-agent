@@ -127,12 +127,69 @@ readonly OF_STATE_MERGE_MAX_ATTEMPTS=3
 #
 # No gcloud/gsutil/google-cloud-storage in this image (checked: uv.lock has
 # google-auth but not google-cloud-storage; the Dockerfile installs neither CLI).
-# curl + the metadata server is the whole dependency.
+# curl + the metadata server is the whole dependency INSIDE GCP.
+#
+# openfathom-meta ENG-244 / ADR-067 Decision 3. Off GCP -- the Hetzner VPS the Sonda
+# migrates to, and the local Phase 1 rehearsal that precedes it -- metadata.google.internal
+# does not resolve, and every caller below loses its token at once: of_skills_fetch and
+# of_plugins_fetch log "starting WITHOUT", and of_state_restore gets curl's 000 instead of
+# the 404 it treats as a normal first boot. Those are exactly the negative signals the
+# rehearsal's exit criteria name, so a rehearsal without this reads as a refutation of
+# ADR-067 when all it measures is the absence of the metadata server.
+#
+# Order is load-bearing: metadata server FIRST. While the Worker Pool exists it is what
+# production authenticates with, and it needs no long-lived key. GOOGLE_APPLICATION_CREDENTIALS
+# is the fallback, never the preference -- a test below fails if that order is swapped.
+#
+# Scope is what these callers actually exercise: read AND write, because
+# of_state_snapshot_upload, of_memories_snapshot and the inbox sweep all upload. Narrowing
+# further would break the snapshot. The minimum that does the real work is the IAM role
+# bound to the key, which is not this file's decision.
+#
+# NOT VERIFIED HERE, deliberately: that `google.oauth2` imports at runtime inside the image.
+# uv.lock carries google-auth, requests and cryptography -- but a lock entry is not an
+# installed package, and reading a lock file is not running the import. The rehearsal is
+# what turns this into a fact; until it runs, this branch is a hypothesis.
 of_metadata_token() {
-  curl -fsS --retry 2 --max-time 10 \
+  local tok=""
+  tok="$(curl -fsS --retry 2 --max-time 10 \
     -H "Metadata-Flavor: Google" \
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])'
+    2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])' 2>/dev/null)" || tok=""
+  if [[ -n "$tok" ]]; then
+    printf '%s\n' "$tok"
+    return 0
+  fi
+
+  [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" && -r "${GOOGLE_APPLICATION_CREDENTIALS}" ]] || return 1
+
+  # Say it ONCE per container. A boot that quietly authenticates with the key when it should
+  # have reached the metadata server is a degradation nobody sees -- inside GCP that means
+  # the metadata server broke and the key is covering for it. Announcing on EVERY call would
+  # be the other failure: the sync loops call this on a timer, and a line that repeats
+  # forever is the noise that trains people to skip boot logs.
+  #
+  # The flag cannot be a shell variable: every caller invokes this inside "$(...)", a
+  # command-substitution subshell, so any assignment here evaporates with it. Same reason
+  # the test harness keeps its stubs file-backed.
+  local announced="${TMPDIR:-/tmp}/.of-token-fallback-announced"
+  if [[ ! -e "$announced" ]]; then
+    : > "$announced" 2>/dev/null || true
+    echo "[of-token] metadata server unreachable -- authenticating with GOOGLE_APPLICATION_CREDENTIALS" >&2
+  fi
+
+  python3 - "$GOOGLE_APPLICATION_CREDENTIALS" <<'PYEOF'
+import sys
+
+from google.oauth2 import service_account
+import google.auth.transport.requests
+
+creds = service_account.Credentials.from_service_account_file(
+    sys.argv[1], scopes=["https://www.googleapis.com/auth/devstorage.read_write"]
+)
+creds.refresh(google.auth.transport.requests.Request())
+print(creds.token)
+PYEOF
 }
 
 # OF-08. Fetch the OpenFathom skills tarball and extract it into $1. Returns non-zero

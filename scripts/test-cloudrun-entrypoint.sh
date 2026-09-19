@@ -1862,6 +1862,159 @@ E167_GONE="$WORK/eng167-no-di"; mkdir -p "$E167_GONE"; touch "$E167_GONE/.env.ex
 check "no .dockerignore -> shouts instead of vouching for a state it cannot see" \
   "no-dockerignore" "$(eng167_trigger_state "$E167_GONE")"
 
+# ---------------------------------------------------------------------------
+# of_metadata_token (openfathom-meta ENG-244, ADR-067 Decision 3) -- the token path off
+# GCP. metadata.google.internal does not resolve outside GCP, so on the Hetzner VPS (and
+# in the local Phase 1 rehearsal that precedes the migration) every caller of this function
+# loses its token at once. That produces the rehearsal's own negative signals -- zero
+# skills, a lost first turn -- which would read as a refutation of ADR-067 while only
+# measuring the absence of the metadata server.
+#
+# WHAT THIS CASE CAN AND CANNOT PROVE. It proves the BRANCH SELECTION: which source is
+# consulted, in which order, and what happens when neither answers. It does NOT prove that
+# google-auth imports inside the image or that a real service-account key mints a real
+# token -- the python3 heredoc is stubbed, because google-auth is not installed on a dev
+# box or on this runner. That is the boundary of what a fake can assert; only the rehearsal
+# closes it, and the entrypoint comment says so too.
+#
+# Everything here runs in subshells: sourcing the real function at top level would clobber
+# the `of_metadata_token() { echo "stub-token"; }` stub the rest of this file depends on.
+# ---------------------------------------------------------------------------
+echo "== case: of_metadata_token -- GOOGLE_APPLICATION_CREDENTIALS fallback =="
+
+MDT_FN="$WORK/mdt.sh"
+extract_one_fn "$MDT_FN" of_metadata_token
+
+MDT_CALLS="$WORK/mdt-calls"
+MDT_SA="$WORK/sa-key.json"
+printf '{"type":"service_account","client_email":"x@y.iam.gserviceaccount.com"}\n' > "$MDT_SA"
+
+# curl stands in for the metadata server, switchable by MDT_MD. python3 is stubbed ONLY on
+# the heredoc form (`python3 - <file>`, the fallback); the `-c` form that parses the
+# metadata JSON keeps running for real, so the happy path is not faked into passing.
+mdt_env() {
+  curl() {
+    echo "CURL" >> "$MDT_CALLS"
+    case "$MDT_MD" in
+      up)    printf '{"access_token":"token-from-metadata"}\n'; return 0 ;;
+      empty) printf '{"expires_in":3599}\n'; return 0 ;;          # 200, but no token in it
+      *)     return 7 ;;                                          # curl: could not connect
+    esac
+  }
+  python3() {
+    if [[ "${1:-}" == "-" ]]; then
+      echo "FALLBACK ${2:-}" >> "$MDT_CALLS"
+      cat > /dev/null
+      printf 'token-from-sa-key\n'
+      return 0
+    fi
+    command python3 "$@"
+  }
+}
+
+mdt_run() { # mdt_run <fn-file> <metadata-state: up|empty|down> <GOOGLE_APPLICATION_CREDENTIALS or "">
+  : > "$MDT_CALLS"
+  local t; t="$(mktemp -d -p "$WORK")"   # a fresh TMPDIR = a fresh container, so the
+  ( # shellcheck disable=SC1090          # once-per-container announcement starts unfired
+    source "$1"
+    MDT_MD="$2"
+    mdt_env
+    export TMPDIR="$t"
+    if [[ -n "$3" ]]; then export GOOGLE_APPLICATION_CREDENTIALS="$3"; else unset GOOGLE_APPLICATION_CREDENTIALS; fi
+    of_metadata_token 2>/dev/null || echo "__NONZERO__"
+  )
+}
+
+# Two consecutive calls inside ONE container (one TMPDIR), counting the announcements. The
+# sync loops call of_metadata_token on a timer, so "announces" and "announces every time"
+# are different behaviours and only one of them is wanted.
+mdt_twice() { # mdt_twice <fn-file> <metadata-state> <GOOGLE_APPLICATION_CREDENTIALS>
+  local t; t="$(mktemp -d -p "$WORK")"
+  ( # shellcheck disable=SC1090
+    source "$1"
+    MDT_MD="$2"
+    mdt_env
+    export TMPDIR="$t"
+    export GOOGLE_APPLICATION_CREDENTIALS="$3"
+    of_metadata_token >/dev/null
+    of_metadata_token >/dev/null
+  ) 2>&1 | grep -c 'metadata server unreachable'
+}
+
+# Order, and it is the case that protects production: with the metadata server answering,
+# the fallback must not be consulted AT ALL -- even with a key sitting right there.
+check "metadata server answering -> its token is the one returned" \
+  "token-from-metadata" "$(mdt_run "$MDT_FN" up "$MDT_SA")"
+check "metadata server answering -> the key file is never read (fallback not consulted)" \
+  "0" "$(grep -c '^FALLBACK' "$MDT_CALLS")"
+
+check "metadata server unreachable + key present -> the fallback mints the token" \
+  "token-from-sa-key" "$(mdt_run "$MDT_FN" down "$MDT_SA")"
+check "the fallback is handed exactly the path GOOGLE_APPLICATION_CREDENTIALS names" \
+  "FALLBACK $MDT_SA" "$(grep '^FALLBACK' "$MDT_CALLS")"
+check "the metadata server is still TRIED first, not skipped" \
+  "1" "$(grep -c '^CURL' "$MDT_CALLS")"
+
+# A 200 that carries no access_token is not success. Before this change the python3 -c would
+# raise and the function returned empty-but-zero-ish through the pipe; now it must fall back.
+check "metadata answers 200 without an access_token -> falls back rather than returning empty" \
+  "token-from-sa-key" "$(mdt_run "$MDT_FN" empty "$MDT_SA")"
+
+# No key, no token: all seven callers branch on a non-zero return, so this must stay
+# non-zero rather than print an empty string and look like success.
+check "metadata unreachable and no key configured -> non-zero, nothing on stdout" \
+  "__NONZERO__" "$(mdt_run "$MDT_FN" down "")"
+check "metadata unreachable and the key path does not exist -> non-zero, not a crash" \
+  "__NONZERO__" "$(mdt_run "$MDT_FN" down "$WORK/no-such-key.json")"
+
+# Falling back must be VISIBLE. Inside GCP it means the metadata server broke and the key is
+# covering for it, which is a degradation that would otherwise boot green and say nothing.
+check "falling back announces itself EXACTLY once across two calls in one container" \
+  "1" "$(mdt_twice "$MDT_FN" down "$MDT_SA")"
+check "the metadata server answering announces nothing -- silence is the healthy path" \
+  "0" "$(mdt_twice "$MDT_FN" up "$MDT_SA")"
+
+echo "== MUTANT: of_metadata_token -- the announcement fires on every call =="
+# The noise failure, which is how a real signal stops being read. Asserts the specific wrong
+# count (2 for two calls), not merely "differs".
+extract_one_fn "$WORK/mdt-noisy.sh" of_metadata_token \
+  's|if \[\[ ! -e "$announced" \]\]; then|if true; then|'
+if grep -q 'if true; then' "$WORK/mdt-noisy.sh"; then
+  check "guard removed -> both calls announce, which is the line people learn to skip" \
+    "2" "$(mdt_twice "$WORK/mdt-noisy.sh" down "$MDT_SA")"
+else
+  bad "announcement-guard mutation did not apply -- a mutant that does not mutate proves nothing"
+fi
+
+echo "== MUTANT: of_metadata_token -- the fallback is removed (the pre-ENG-244 state) =="
+# The regression this change exists to prevent: off GCP there is no second source, so the
+# rehearsal produces its own negative signals and ADR-067 Decision 3 looks refuted.
+extract_one_fn "$WORK/mdt-nofb.sh" of_metadata_token \
+  's|^  \[\[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}".*|  return 1|'
+if grep -q '^  return 1$' "$WORK/mdt-nofb.sh"; then
+  check "fallback removed -> no token at all, even with a valid key present" \
+    "__NONZERO__" "$(mdt_run "$WORK/mdt-nofb.sh" down "$MDT_SA")"
+  check "fallback removed -> the key file is never consulted" \
+    "0" "$(grep -c '^FALLBACK' "$MDT_CALLS")"
+else
+  bad "fallback-removal mutation did not apply -- a mutant that does not mutate proves nothing"
+fi
+
+echo "== MUTANT: of_metadata_token -- the metadata token is discarded, so the key wins =="
+# The inverse defect, and the one that would hurt PRODUCTION rather than the rehearsal:
+# preferring the long-lived key over the metadata server. The Worker Pool would start
+# authenticating with a key it does not need, and nothing in a boot log would say so.
+extract_one_fn "$WORK/mdt-order.sh" of_metadata_token \
+  's|if \[\[ -n "$tok" \]\]; then|if [[ -n "" ]]; then|'
+if grep -q 'if \[\[ -n "" \]\]; then' "$WORK/mdt-order.sh"; then
+  check "metadata result ignored -> the key's token is returned although the server answered" \
+    "token-from-sa-key" "$(mdt_run "$WORK/mdt-order.sh" up "$MDT_SA")"
+  check "metadata result ignored -> the fallback ran on a boot that never needed it" \
+    "1" "$(grep -c '^FALLBACK' "$MDT_CALLS")"
+else
+  bad "token-order mutation did not apply -- a mutant that does not mutate proves nothing"
+fi
+
 echo
 echo "passed: $pass   failed: $fail"
 [[ "$fail" -eq 0 ]]
