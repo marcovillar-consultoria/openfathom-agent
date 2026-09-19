@@ -1914,13 +1914,31 @@ mdt_env() {
 
 mdt_run() { # mdt_run <fn-file> <metadata-state: up|empty|down> <GOOGLE_APPLICATION_CREDENTIALS or "">
   : > "$MDT_CALLS"
+  local t; t="$(mktemp -d -p "$WORK")"   # a fresh TMPDIR = a fresh container, so the
+  ( # shellcheck disable=SC1090          # once-per-container announcement starts unfired
+    source "$1"
+    MDT_MD="$2"
+    mdt_env
+    export TMPDIR="$t"
+    if [[ -n "$3" ]]; then export GOOGLE_APPLICATION_CREDENTIALS="$3"; else unset GOOGLE_APPLICATION_CREDENTIALS; fi
+    of_metadata_token 2>/dev/null || echo "__NONZERO__"
+  )
+}
+
+# Two consecutive calls inside ONE container (one TMPDIR), counting the announcements. The
+# sync loops call of_metadata_token on a timer, so "announces" and "announces every time"
+# are different behaviours and only one of them is wanted.
+mdt_twice() { # mdt_twice <fn-file> <metadata-state> <GOOGLE_APPLICATION_CREDENTIALS>
+  local t; t="$(mktemp -d -p "$WORK")"
   ( # shellcheck disable=SC1090
     source "$1"
     MDT_MD="$2"
     mdt_env
-    if [[ -n "$3" ]]; then export GOOGLE_APPLICATION_CREDENTIALS="$3"; else unset GOOGLE_APPLICATION_CREDENTIALS; fi
-    of_metadata_token 2>/dev/null || echo "__NONZERO__"
-  )
+    export TMPDIR="$t"
+    export GOOGLE_APPLICATION_CREDENTIALS="$3"
+    of_metadata_token >/dev/null
+    of_metadata_token >/dev/null
+  ) 2>&1 | grep -c 'metadata server unreachable'
 }
 
 # Order, and it is the case that protects production: with the metadata server answering,
@@ -1948,6 +1966,25 @@ check "metadata unreachable and no key configured -> non-zero, nothing on stdout
   "__NONZERO__" "$(mdt_run "$MDT_FN" down "")"
 check "metadata unreachable and the key path does not exist -> non-zero, not a crash" \
   "__NONZERO__" "$(mdt_run "$MDT_FN" down "$WORK/no-such-key.json")"
+
+# Falling back must be VISIBLE. Inside GCP it means the metadata server broke and the key is
+# covering for it, which is a degradation that would otherwise boot green and say nothing.
+check "falling back announces itself EXACTLY once across two calls in one container" \
+  "1" "$(mdt_twice "$MDT_FN" down "$MDT_SA")"
+check "the metadata server answering announces nothing -- silence is the healthy path" \
+  "0" "$(mdt_twice "$MDT_FN" up "$MDT_SA")"
+
+echo "== MUTANT: of_metadata_token -- the announcement fires on every call =="
+# The noise failure, which is how a real signal stops being read. Asserts the specific wrong
+# count (2 for two calls), not merely "differs".
+extract_one_fn "$WORK/mdt-noisy.sh" of_metadata_token \
+  's|if \[\[ ! -e "$announced" \]\]; then|if true; then|'
+if grep -q 'if true; then' "$WORK/mdt-noisy.sh"; then
+  check "guard removed -> both calls announce, which is the line people learn to skip" \
+    "2" "$(mdt_twice "$WORK/mdt-noisy.sh" down "$MDT_SA")"
+else
+  bad "announcement-guard mutation did not apply -- a mutant that does not mutate proves nothing"
+fi
 
 echo "== MUTANT: of_metadata_token -- the fallback is removed (the pre-ENG-244 state) =="
 # The regression this change exists to prevent: off GCP there is no second source, so the

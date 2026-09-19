@@ -162,6 +162,22 @@ of_metadata_token() {
   fi
 
   [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" && -r "${GOOGLE_APPLICATION_CREDENTIALS}" ]] || return 1
+
+  # Say it ONCE per container. A boot that quietly authenticates with the key when it should
+  # have reached the metadata server is a degradation nobody sees -- inside GCP that means
+  # the metadata server broke and the key is covering for it. Announcing on EVERY call would
+  # be the other failure: the sync loops call this on a timer, and a line that repeats
+  # forever is the noise that trains people to skip boot logs.
+  #
+  # The flag cannot be a shell variable: every caller invokes this inside "$(...)", a
+  # command-substitution subshell, so any assignment here evaporates with it. Same reason
+  # the test harness keeps its stubs file-backed.
+  local announced="${TMPDIR:-/tmp}/.of-token-fallback-announced"
+  if [[ ! -e "$announced" ]]; then
+    : > "$announced" 2>/dev/null || true
+    echo "[of-token] metadata server unreachable -- authenticating with GOOGLE_APPLICATION_CREDENTIALS" >&2
+  fi
+
   python3 - "$GOOGLE_APPLICATION_CREDENTIALS" <<'PYEOF'
 import sys
 
