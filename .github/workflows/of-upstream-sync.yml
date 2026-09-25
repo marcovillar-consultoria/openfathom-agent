@@ -137,16 +137,22 @@ jobs:
           fi
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
 
-      # PUSH ONLY -- the PR is opened by a human, deliberately (openfathom-meta ENG-62,
-      # measured 2026-07-20). The App token pushes the branch (INCLUDING the upstream
-      # `ci.yml` change -- the fourth blocker, now proven fixed), but `gh pr create` from
-      # inside Actions is refused with `Resource not accessible by integration`: the ORG
-      # policy "Allow GitHub Actions to create and approve pull requests" is OFF, and a
-      # repo cannot override it (PUT returns 409). Turning it ON is org-wide and bundles
-      # PR *approval* by automation -- a posture the program declined for a once-a-week
-      # convenience, since the 1588-commit sync PR needs a real human review anyway. So the
-      # workflow stops at the push and prints the compare link; the human clicks it. The
-      # one manual step lands exactly where the human was already going to read the diff.
+      # PUSH, THEN OPEN THE PR VIA REST (openfathom-meta ENG-239, decided 2026-09-24).
+      # Until then this step stopped at the push and printed a compare link for a human to
+      # click -- and the link lived in a `::notice` on a GREEN run, the run nobody opens:
+      # the 2026-09-07, 09-14 and 09-21 sync branches all sat without a PR until someone
+      # went looking. Merging stays human; only the OPENING is automated.
+      #
+      # Why push-only existed, and why it was wrong: on 2026-07-20 `gh pr create` with the
+      # App token was refused (`GraphQL: Resource not accessible by integration
+      # (createPullRequest)`), and the cause was recorded as the org policy "Allow GitHub
+      # Actions to create and approve pull requests" being OFF. That policy governs the
+      # default GITHUB_TOKEN, not an App installation token. openfathom-meta ADR-059
+      # measured it on 2026-08-13 with THIS App on THIS repo: REST
+      # (`gh api --method POST .../pulls`) opened a real PR on the first try (run
+      # 31699495995, PR #53); the refusal belonged to the GraphQL path. of-build-image.yml
+      # has opened promotion PRs over REST since then. No org policy changes, and nothing
+      # here can APPROVE a PR.
       # `--force-with-lease`, not a bare push: the branch name is date-derived
       # (`sync/upstream-YYYYMMDD`), so a SECOND run on the same day pushes to a ref that
       # already exists and git rejects it as non-fast-forward. Measured 2026-07-25, and it
@@ -173,9 +179,9 @@ jobs:
       # (docs.github.com/en/pull-requests/reference/using-query-parameters-to-create-a-pull-request)
       # and a corroborating community report (github.com/orgs/community/discussions/62482):
       # `body=` REPLACES the auto-filled template rather than appending to it --
-      # exactly what we want, not a bug to route around. `gh pr create` itself
-      # stays off the table (org policy, see below); this only changes what's
-      # pre-typed on the page the human still has to open and click through.
+      # exactly what we want, not a bug to route around. Since ENG-239 the compare
+      # link is the FALLBACK only: the same title/body go to the REST call, and the
+      # link is printed only if that call is refused (and the run then ends red).
       #
       # The check-attribution note below is COMPUTED, not a static string
       # (openfathom-meta ENG-62, second edit same day, 2026-07-27). A first
@@ -218,6 +224,8 @@ jobs:
       # itself edits a workflow/action) the label exists to catch.
       - name: Push sync branch
         if: steps.rebase.outputs.conflict == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           git push --force-with-lease origin "${{ steps.rebase.outputs.branch }}"
 
@@ -269,15 +277,58 @@ jobs:
               "⚠️ this sync touches CI-sensitive and/or MCP-catalog file(s) (classify_changes.py: ci_review=${ci_review}, mcp_catalog=${mcp_catalog}) -- read the diff before deciding whether \`ci-reviewed\` applies. Not applied automatically."
             )
           fi
+          # openfathom-meta ENG-239. Every sync branch is cut fresh from `cloudrun`, so an
+          # open sync PR from an EARLIER date carries nothing this one lacks: it is
+          # superseded, and is closed below -- AFTER this run's PR exists, so there is never
+          # a moment with no sync PR. A PR already open for THIS branch (a same-day re-run)
+          # was just updated in place by the force-push above: nothing to open.
+          branch="${{ steps.rebase.outputs.branch }}"
+          open_sync=$(gh api "repos/${GITHUB_REPOSITORY}/pulls?state=open&base=cloudrun&per_page=100" \
+            --jq '.[] | select(.head.ref | startswith("sync/upstream-")) | "\(.number) \(.head.ref)"')
+          same=""
+          superseded=()
+          while read -r num ref; do
+            [ -n "$num" ] || continue
+            if [ "$ref" = "$branch" ]; then same="$num"; else superseded+=("$num"); fi
+          done <<< "$open_sync"
+          if [ "${#superseded[@]}" -gt 0 ]; then
+            lines+=(
+              ""
+              "Supersedes $(printf '#%s ' "${superseded[@]}")-- every sync branch is cut fresh from \`cloudrun\`, so the older PR carries nothing this one lacks; this run closes it once this PR exists."
+            )
+          fi
+
           body=$(printf '%s\n' "${lines[@]}")
 
           title_enc=$(jq -nr --arg v "$title" '$v|@uri')
           body_enc=$(jq -nr --arg v "$body" '$v|@uri')
-          pr_url="${repo_url}/compare/cloudrun...${{ steps.rebase.outputs.branch }}?expand=1&title=${title_enc}&body=${body_enc}"
+          pr_url="${repo_url}/compare/cloudrun...${branch}?expand=1&title=${title_enc}&body=${body_enc}"
 
-          echo "::notice title=Sync branch pushed::Open the PR (base cloudrun): ${pr_url}"
-          echo "Sync branch pushed. Open the PR here (base cloudrun):"
-          echo "  ${pr_url}"
+          if [ -n "$same" ]; then
+            echo "::notice title=Sync PR updated in place::#${same} already tracks ${branch}"
+          # REST, not `gh pr create` -- see the comment above this step. If it is ever
+          # refused, the compare link is the fallback and the run ends RED: a sync branch
+          # without a PR is exactly the silent state ENG-239 exists to remove.
+          elif new_pr=$(gh api --method POST "repos/${GITHUB_REPOSITORY}/pulls" \
+                 -f title="$title" -f head="$branch" -f base=cloudrun -f body="$body" \
+                 --jq '.html_url'); then
+            echo "::notice title=Sync PR opened::${new_pr}"
+          else
+            {
+              echo "## upstream-sync: branch pushed, PR NOT opened"
+              echo
+              echo "\`${branch}\` was pushed, but the REST call that opens the PR was refused. Open it here (base cloudrun):"
+              echo
+              echo "  ${pr_url}"
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "::error title=Sync PR not created::${branch} pushed, PR refused -- see the job summary for the link"
+            exit 1
+          fi
+
+          for n in "${superseded[@]}"; do
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/pulls/${n}" -f state=closed --silent
+            echo "closed superseded sync PR #${n}"
+          done
 
       # No `gh issue create` here (removed 2026-07-27, openfathom-meta ENG-62 sixth
       # blocker): the org disables workflow write permissions with no per-repo or
