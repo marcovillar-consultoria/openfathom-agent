@@ -162,7 +162,18 @@ jobs:
     if: github.event_name == 'push'
     needs: build
     runs-on: ubuntu-latest
-    permissions: {} # everything here authenticates with the App token, not GITHUB_TOKEN
+    # Writes to openfathom-infra authenticate with the App token. GITHUB_TOKEN only READS
+    # this repo: the `compare` below orders this build against open promotions of the same
+    # pin (openfathom-meta ENG-196).
+    permissions:
+      contents: read
+    # One promote at a time for this pin, so a second run SEES the first run's PR. Without
+    # it, two runs list open PRs before either opens one and neither supersedes the other.
+    # GitHub keeps one PENDING run per group: a third run cancels the pending second one,
+    # which is older and whose commits the third already contains (cloudrun is linear).
+    concurrency:
+      group: promote-of-agent
+      cancel-in-progress: false
     env:
       INFRA_REPO: marcovillar-consultoria/openfathom-infra
       TFVARS: environments/prod/terraform.tfvars
@@ -386,12 +397,43 @@ jobs:
         if: steps.bump.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SRC_TOKEN: ${{ github.token }}
           OLD_DIGEST: ${{ steps.bump.outputs.old_digest }}
+          PIN_PREFIX: promote/of-agent-
         run: |
           sha_short=$(echo "${{ github.sha }}" | cut -c1-8)
-          branch="promote/of-agent-${sha_short}"
+          branch="${PIN_PREFIX}${sha_short}"
           run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           src_url="${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}"
+
+          # openfathom-meta ENG-196 (a): an open promotion of the SAME pin is superseded by
+          # this one -- but only if its origin commit is an ANCESTOR of this build's. Builds
+          # of close merges can finish out of order, and closing the newer PR to open an
+          # older digest is a silent rollback that reads as a plausible digest swap in the
+          # plan. The origin is the full SHA every promotion body links to (…/commit/<sha>).
+          # Anything that cannot be ordered is LEFT OPEN -- today's behaviour, never worse.
+          same_pin=$(gh api "repos/${INFRA_REPO}/pulls?state=open&base=main&per_page=100" \
+            --jq '.[] | select(.head.ref | startswith(env.PIN_PREFIX)) | "\(.number) \(.head.ref) \(([(.body // "") | match("commit/([0-9a-f]{40})"; "g") | .captures[0].string] | first) // "none")"')
+          superseded=()
+          while read -r num ref src; do
+            [ -n "$num" ] || continue
+            [ "$ref" != "$branch" ] || continue
+            if [ "$src" = "none" ]; then
+              echo "::warning title=promotion left open::#${num} links no origin commit -- cannot order it against this build"
+              continue
+            fi
+            if ! status=$(GH_TOKEN="$SRC_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/compare/${src}...${GITHUB_SHA}" --jq '.status'); then
+              echo "::warning title=promotion left open::#${num} -- compare ${src}...${GITHUB_SHA} failed"
+              continue
+            fi
+            case "$status" in
+              ahead) superseded+=("$num") ;;
+              behind)
+                echo "::notice title=promotion skipped -- a newer one is open::#${num} promotes ${src}, which already contains ${GITHUB_SHA}. Promoting this build would roll the pin back; nothing pushed, no PR opened."
+                exit 0 ;;
+              *) echo "::warning title=promotion left open::#${num} -- compare says '${status}'" ;;
+            esac
+          done <<< "$same_pin"
 
           git config user.name  "openfathom-bot"
           git config user.email "openfathom-bot@users.noreply.github.com"
@@ -413,11 +455,9 @@ jobs:
                        --json number --jq '.[0].number // empty')
           if [ -n "$existing" ]; then
             echo "::notice title=promotion PR already open::#${existing} -- branch re-pushed, no second PR"
-            exit 0
-          fi
-
-          title="deploy(promote): of-agent ${IMAGE_TAG}"
-          body=$(cat <<EOF
+          else
+            title="deploy(promote): of-agent ${IMAGE_TAG}"
+            body=$(cat <<EOF
           Promocao automatica (ADR-059). **Nao aplicado ainda** -- o merge deste PR e o apply.
 
           | | |
@@ -436,26 +476,47 @@ jobs:
           - [ ] \`plan\` verde (roda \`check_pinned_images_exist.py\`; um \`plan\` verde de dias atras NAO reexecuta -- \`strict_required_status_checks_policy\` e false)
           - [ ] o que a imagem nova traz, e como confirmar depois do apply
           EOF
-          )
+            )
+            if [ "${#superseded[@]}" -gt 0 ]; then
+              body="${body}
 
-          # REST, not `gh pr create` -- verified 2026-08-13 (ENG-157 Fase 0), see the job
-          # header comment. If this is ever refused, fall back to the push-branch-and-link
-          # pattern `sync` already uses in production, and end RED -- never a silent no-op.
-          if gh api --method POST "repos/${INFRA_REPO}/pulls" \
-               -f title="$title" -f head="$branch" -f base=main -f body="$body"; then
-            echo "::notice title=promotion PR opened::${INFRA_REPO} <- ${branch}"
-            exit 0
+          Supersedes $(printf '#%s ' "${superseded[@]}")-- a origem de cada um e ancestral desta; este run os fecha assim que este PR existir (openfathom-meta ENG-196)."
+            fi
+
+            # REST, not `gh pr create` -- verified 2026-08-13 (ENG-157 Fase 0), see the job
+            # header comment. If this is ever refused, fall back to the push-branch-and-link
+            # pattern `sync` already uses in production, and end RED -- never a silent no-op.
+            if gh api --method POST "repos/${INFRA_REPO}/pulls" \
+                 -f title="$title" -f head="$branch" -f base=main -f body="$body"; then
+              echo "::notice title=promotion PR opened::${INFRA_REPO} <- ${branch}"
+            else
+              title_enc=$(jq -nr --arg v "$title" '$v|@uri')
+              body_enc=$(jq -nr --arg v "$body" '$v|@uri')
+              compare="${{ github.server_url }}/${INFRA_REPO}/compare/main...${branch}?expand=1&title=${title_enc}&body=${body_enc}"
+              {
+                echo "## promocao NAO abriu o PR"
+                echo
+                echo "O branch \`${branch}\` foi empurrado para \`${INFRA_REPO}\`. Abra o PR:"
+                echo
+                echo "  ${compare}"
+              } | tee -a "$GITHUB_STEP_SUMMARY"
+              echo "::error title=promotion PR not created::branch pushed, PR refused -- see job summary for the link"
+              exit 1
+            fi
           fi
 
-          title_enc=$(jq -nr --arg v "$title" '$v|@uri')
-          body_enc=$(jq -nr --arg v "$body" '$v|@uri')
-          compare="${{ github.server_url }}/${INFRA_REPO}/compare/main...${branch}?expand=1&title=${title_enc}&body=${body_enc}"
-          {
-            echo "## promocao NAO abriu o PR"
-            echo
-            echo "O branch \`${branch}\` foi empurrado para \`${INFRA_REPO}\`. Abra o PR:"
-            echo
-            echo "  ${compare}"
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-          echo "::error title=promotion PR not created::branch pushed, PR refused -- see job summary for the link"
-          exit 1
+          # Only now, with this run's PR in place: there is never a moment with no open
+          # promotion for the pin. A close that fails ends the run RED -- a superseded PR
+          # left open is exactly the state ENG-196 exists to remove.
+          not_closed=()
+          for n in "${superseded[@]}"; do
+            if gh api --method PATCH "repos/${INFRA_REPO}/pulls/${n}" -f state=closed --silent; then
+              echo "::notice title=superseded promotion closed::#${n}"
+            else
+              not_closed+=("$n")
+            fi
+          done
+          if [ "${#not_closed[@]}" -gt 0 ]; then
+            echo "::error title=superseded promotion NOT closed::$(printf '#%s ' "${not_closed[@]}")-- still open; merging it would roll hermes_agent_image back"
+            exit 1
+          fi

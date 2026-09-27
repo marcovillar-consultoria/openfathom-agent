@@ -1945,7 +1945,7 @@ PYEOF
     # Verified locally before writing this (not assumed): `hermes mcp add github --url
     # https://api.githubcopilot.com/mcp/ --auth header` writes exactly this shape --
     # `headers.Authorization: "Bearer ${VAR}"` as a LITERAL placeholder string, never the
-    # raw secret -- and tools/mcp_tool.py's _interpolate_env_vars() resolves ${VAR} from
+    # raw secret -- and tools/mcp_tool_config.py's _interpolate_env_vars() resolves ${VAR} from
     # os.environ at CONNECT time (its own docstring: "resolved from os.environ (which
     # includes ~/.hermes/.env loaded at startup)"). A plain container env var satisfies
     # that lookup exactly like ~/.hermes/.env does locally -- confirmed against the real
@@ -1982,7 +1982,7 @@ PYEOF
     # without the fix. A sync landing is therefore NOT evidence that the fix landed.
     #
     # THE CONDITION IS THE CODE, NOT THE CALENDAR. Re-enable only after checking, in
-    # the image being deployed, that `_normalize_mcp_input_schema` in tools/mcp_tool.py
+    # the image being deployed, that `_normalize_mcp_input_schema` in tools/mcp_tool_schema.py
     # collapses multi-type `type` arrays -- today it calls only `strip_nullable_unions`
     # (verified on cloudrun HEAD, 2026-08-09). Flipping to True before that 400s EVERY
     # Claude-backed turn, which is exactly the outage this bridge ended.
