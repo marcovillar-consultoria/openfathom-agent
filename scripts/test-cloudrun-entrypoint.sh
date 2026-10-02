@@ -1156,6 +1156,12 @@ check "model.max_tokens set to a realistic ceiling, unconditionally" \
 check "prompt_caching.cache_ttl set to 1h, unconditionally" \
   "1" "$(grep -c 'hermes config set prompt_caching.cache_ttl 1h' "$ENTRYPOINT")"
 
+# openfathom-meta ENG-283: per-message timestamps, so the model sees the current date
+# in every turn instead of the session's frozen "Conversation started:" line.
+# Structural check, same reasoning as model.max_tokens above.
+check "gateway.message_timestamps.enabled set to true, unconditionally" \
+  "1" "$(grep -c 'hermes config set gateway.message_timestamps.enabled true' "$ENTRYPOINT")"
+
 # ---------------------------------------------------------------------------
 # of_skill_usage_report (openfathom-meta ADR-053) -- derives the skill_invocations
 # log-based metric from the .usage.json sidecar Hermes already writes natively.

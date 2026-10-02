@@ -1767,6 +1767,19 @@ case "${HERMES_MODE:-service}" in
       hermes config set timezone "${HERMES_TIMEZONE}"
     fi
 
+    # openfathom-meta ENG-283. The system prompt's date is "Conversation started:",
+    # built ONCE per session and kept byte-stable for the prompt cache
+    # (agent/system_prompt.py) -- on this always-on gateway a session can outlive
+    # its start date by days. Measured 2026-10-02: four days after the boot that
+    # opened the session, the Sonda gave 28/09 as "today", attributed it to the time
+    # tool, and admitted it came from context. get_current_time exists, but only
+    # helps when the model chooses to call it. This upstream option (default OFF,
+    # gateway/message_timestamps.py) prefixes every user message with its own
+    # timestamp in the configured timezone, rendered at send time and never
+    # persisted, so the current date is in every turn without a tool call.
+    # Unconditional: no deployment of this image wants a stale "today".
+    hermes config set gateway.message_timestamps.enabled true
+
     # ENG-47 / language-protocol. Unconditional, not env-gated, same reasoning as
     # agent.reasoning_effort below -- there is no deployment of this image where
     # English static UI strings are wanted over Portuguese. Covers the curated subset
