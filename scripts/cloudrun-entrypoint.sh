@@ -1721,12 +1721,15 @@ case "${HERMES_MODE:-service}" in
     of_reconcile_api_server_key
     export HERMES_GATEWAY_NO_SUPERVISE=1
     export API_SERVER_ENABLED=true
-    # openfathom-meta OF-10 task [2]: loopback only. "0.0.0.0" was for the Cloud Run
-    # Service, whose ingress probed $PORT; nothing calls this port since ADR-061, and on
-    # the VM (ADR-069) the container runs with `--network host`, so 0.0.0.0 bound the
-    # VM's own NIC -- the gateway itself warned at boot that the endpoint dispatches agent
-    # work with an unsandboxed terminal, and only the empty VPC firewall kept it off the
-    # internet. Re-instantiating modules/cloud_run_service means putting 0.0.0.0 back.
+    # openfathom-meta OF-10 task [2]: loopback only. "0.0.0.0" was for Cloud Run, which
+    # probed $PORT from outside the container: the Service by default, the Worker Pool
+    # (ADR-061) through its explicit tcp_socket startup_probe. On the VM (ADR-069) nothing
+    # probes or calls the port, and the container runs with `--network host`, so 0.0.0.0
+    # bound the VM's own NIC -- the gateway itself warned at boot that the endpoint
+    # dispatches agent work with an unsandboxed terminal, and only the empty VPC firewall
+    # kept it off the internet. The documented way back, re-instantiating
+    # modules/cloud_run_worker_pool (or modules/cloud_run_service), must put 0.0.0.0 back,
+    # or its probe fails the first boot.
     export API_SERVER_HOST="127.0.0.1"
     export API_SERVER_PORT="${PORT:-8080}"
     # Translate the env-var contract into config.yaml, which is the only input the
