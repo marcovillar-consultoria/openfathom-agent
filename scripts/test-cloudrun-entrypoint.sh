@@ -1162,6 +1162,15 @@ check "prompt_caching.cache_ttl set to 1h, unconditionally" \
 check "gateway.message_timestamps.enabled set to true, unconditionally" \
   "1" "$(grep -c 'hermes config set gateway.message_timestamps.enabled true' "$ENTRYPOINT")"
 
+# openfathom-meta OF-10 task [2]: the API server binds loopback only. On the VM the
+# container shares the host's network stack, so a 0.0.0.0 bind put an endpoint that
+# dispatches agent work on the VM's NIC. Structural check, same reasoning as above; the
+# second line catches a revert that keeps the new line around but re-adds the old one.
+check "API server bound to 127.0.0.1" \
+  "1" "$(grep -c '^    export API_SERVER_HOST="127.0.0.1"$' "$ENTRYPOINT")"
+check "API server never bound to 0.0.0.0" \
+  "0" "$(grep -c '^ *export API_SERVER_HOST="0.0.0.0"' "$ENTRYPOINT")"
+
 # ---------------------------------------------------------------------------
 # of_skill_usage_report (openfathom-meta ADR-053) -- derives the skill_invocations
 # log-based metric from the .usage.json sidecar Hermes already writes natively.
