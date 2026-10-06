@@ -54,26 +54,33 @@ RUN chmod +x /opt/hermes/scripts/cloudrun-entrypoint.sh
 # the latest release was unbuildable BY CONSTRUCTION. 6.15.0 (2026-08-06)
 # is the newest one outside the window, and a pin only ages further out of
 # it. When bumping this, check the upload date, not just the version.
-RUN uv pip install --python /opt/hermes/.venv/bin/python --no-cache-dir \
-    pypdf==6.15.0 openpyxl==3.1.5
-
-# hermes-plugins/youtube-transcript (openfathom-bridges) reads a video's
-# caption track -- openfathom-meta ENG-231. The bundled upstream skill
-# `youtube-content` is competent but its workflow shells out to
-# `uv run python .../fetch_transcript.py`, and terminal/code_execution are
-# disabled (ENG-51, ADR-043); measured 2026-09-07, the model fell back to
-# web_extract, which returns the YouTube page and no captions. Same
-# third-party exception ADR-062 registers for pypdf/openpyxl.
 #
-# Verified on PyPI 2026-09-08, and the date is the check that matters, not
-# the version number: 1.2.4 was published 2026-01-29, far outside the
-# `exclude-newer = "14 days"` window that made a pypdf pin unbuildable BY
-# CONSTRUCTION above. It is pure-Python (py3-none-any), and its only
-# non-stdlib dependencies -- requests and defusedxml 0.7.1 -- are already
-# pinned in pyproject.toml at exactly those versions, so this resolves
-# without moving anything else.
-RUN uv pip install --python /opt/hermes/.venv/bin/python --no-cache-dir \
-    youtube-transcript-api==1.2.4
+# Where `uv` comes from (openfathom-meta ENG-296). Since the upstream sync of
+# 2026-10-05 (#73) the base image no longer puts `uv` on PATH: PM stages it
+# under /opt/hermes/tools/uv-<version>-<platform>/uv from pm/lock.json, and
+# PM's public API refuses to hand it out ("uv is internal PM tooling") --
+# `uv: not found` broke every build from that merge on. The private resolver
+# (pm._uv._toolchain) would answer, but a private name is the first thing a
+# sync renames silently; the glob below fails LOUD at build time instead,
+# when it matches zero binaries or more than one.
+#
+# The venv is now built `--sealed`, and upstream documents it as never
+# written after the build. Writing it HERE, at build time, is still safe:
+# measured 2026-10-06 on the base of cloudrun 1284582aa7, the tree reports
+# sealed=True, venv sync returns early for a sealed tree, and both modules
+# still import after a full boot through /init.
+RUN set -eu; \
+    set -- /opt/hermes/tools/uv-*/uv; \
+    [ "$#" -eq 1 ] && [ -x "$1" ] || { echo "expected exactly one PM-staged uv, got: $*" >&2; exit 1; }; \
+    "$1" pip install --python /opt/hermes/.venv/bin/python --no-cache-dir \
+        pypdf==6.15.0 openpyxl==3.1.5
+
+# hermes-plugins/youtube-transcript (openfathom-bridges, ENG-231) needs
+# youtube-transcript-api, and it is no longer installed here: since the
+# upstream sync of 2026-10-05 the base image's `[all]` extra carries
+# `hermes-agent[youtube]`, pinned to the same 1.2.4 this file used to
+# install (measured in the base of cloudrun 1284582aa7). Installing it again
+# would only re-pin what upstream already pins.
 
 # Cloud Run Service injects $PORT at runtime (see cloudrun-entrypoint.sh);
 # 8080 is only the documented default for local `docker run -p`.
