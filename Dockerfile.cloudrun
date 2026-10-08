@@ -69,11 +69,8 @@ RUN chmod +x /opt/hermes/scripts/cloudrun-entrypoint.sh
 # measured 2026-10-06 on the base of cloudrun 1284582aa7, the tree reports
 # sealed=True, venv sync returns early for a sealed tree, and both modules
 # still import after a full boot through /init.
-RUN set -eu; \
-    set -- /opt/hermes/tools/uv-*/uv; \
-    [ "$#" -eq 1 ] && [ -x "$1" ] || { echo "expected exactly one PM-staged uv, got: $*" >&2; exit 1; }; \
-    "$1" pip install --python /opt/hermes/.venv/bin/python --no-cache-dir \
-        pypdf==6.15.0 openpyxl==3.1.5
+RUN uv pip install --python /opt/hermes/.venv/bin/python --no-cache-dir \
+    pypdf==6.15.0 openpyxl==3.1.5
 
 # hermes-plugins/youtube-transcript (openfathom-bridges, ENG-231) needs
 # youtube-transcript-api, and it is no longer installed here: since the
