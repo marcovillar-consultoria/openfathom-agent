@@ -2,7 +2,12 @@ name: of-build-image
 
 # OpenFathom delta — allowed by ADR-002. Builds the Cloud Run image on every
 # push to `cloudrun` and pushes it to Artifact Registry, tagged
-# v<hermes-upstream>-of-<git-sha-short> per ADR-002's branch model.
+# of-<git-sha-short>. ADR-002's branch model prefixed the upstream version
+# (v<hermes-upstream>-of-<sha>); that prefix was dropped on 2026-10-08
+# (openfathom-meta ENG-298) because upstream no longer carries one: since
+# 9cc319f9a1 the pyproject.toml `version` is a "0.0.0" placeholder, and none
+# of upstream's tags matches its own STABLE_TAG_RE (hermes_cli/update_channel.py).
+# Provenance was always the SHA and the registry digest, never the prefix.
 #
 # Filename is `of-build-image.yml`, not the `build-image.yml` ADR-002 lists
 # verbatim -- same `of-` namespacing reasoning as of-upstream-sync.yml, so a
@@ -21,7 +26,8 @@ name: of-build-image
 # Also runs on `pull_request` into `cloudrun` (added by ADR-035): the
 # validate-scope job enforces the ADR-002 file allow-list on every PR, not
 # just via review discipline -- the mitigation ADR-002's Consequences section
-# always named but never wired into CI until now.
+# always named but never wired into CI until now. Since ENG-297 the PR run also
+# builds both image stages (`build-check`), without credentials and without pushing.
 
 on:
   push:
@@ -73,6 +79,34 @@ jobs:
       - name: Test cloudrun-entrypoint state logic (ADR-049)
         run: bash scripts/test-cloudrun-entrypoint.sh
 
+  # openfathom-meta ENG-297. `build` runs only on `push`, so a PR into `cloudrun` -- the
+  # weekly upstream sync above all -- closed green without ever building the image: agent#73
+  # merged green and the `push` build broke right after (ENG-296). This job builds the same
+  # two stages on the PR, and stops there.
+  #
+  # TRUST BOUNDARY (ADR-059): it runs `docker build .` over upstream code before a human
+  # merges it, so it holds nothing worth stealing. Job-level `permissions` REPLACES the
+  # workflow-level block, which grants `id-token: write` for WIF -- without this override
+  # the PR run could mint a GCP token. No `secrets.*`, no registry login, no push, and
+  # `persist-credentials: false` keeps GITHUB_TOKEN out of .git/config. Standard runner on
+  # a public repo: no billed minutes (measured in the GitHub Actions billing docs, 2026-10-08).
+  build-check:
+    if: github.event_name == 'pull_request'
+    needs: test-entrypoint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Build base image (real upstream Dockerfile, unmodified)
+        run: docker build -t of-agent:base .
+
+      - name: Build Cloud Run image (packaging layer only)
+        run: docker build -f Dockerfile.cloudrun -t of-agent:cloudrun --build-arg BASE_IMAGE=of-agent:base .
+
   build:
     if: github.event_name == 'push'
     needs: test-entrypoint
@@ -91,9 +125,8 @@ jobs:
       - name: Compute image tag
         id: tag
         run: |
-          hermes_version=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
           sha_short=$(git rev-parse --short=8 HEAD)
-          echo "tag=v${hermes_version}-of-${sha_short}" >> "$GITHUB_OUTPUT"
+          echo "tag=of-${sha_short}" >> "$GITHUB_OUTPUT"
 
       - name: Authenticate to GCP (WIF, no long-lived key)
         uses: google-github-actions/auth@140bb5113ffb6b65a7e9b937a81fa96cf5064462 # v2.1.11
