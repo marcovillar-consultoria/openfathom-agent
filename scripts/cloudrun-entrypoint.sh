@@ -201,7 +201,7 @@ PYEOF
 # Unlike the state snapshot, a 404 here is NOT a normal first boot -- the object is
 # published deliberately, so its absence means the publish step was skipped.
 of_skills_fetch() {
-  local dest="$1" tok code tarball="/tmp/of-skills.tar.gz"
+  local dest="$1" tok code tarball="${TMPDIR:-/tmp}/of-skills.tar.gz"
   tok="$(of_metadata_token)" || { echo "[of-skills] WARN: no metadata token" >&2; return 1; }
 
   code="$(curl -sS -o "$tarball" -w '%{http_code}' --max-time 60 \
@@ -237,7 +237,7 @@ of_skills_fetch() {
 # that to decide whether to enable the plugin. Same transport and same fail-loud contract
 # as of_skills_fetch: a 404 means the publish step was skipped, not a normal first boot.
 of_plugins_fetch() {
-  local dest="$1" tok code tarball="/tmp/of-plugins.tar.gz"
+  local dest="$1" tok code tarball="${TMPDIR:-/tmp}/of-plugins.tar.gz"
   tok="$(of_metadata_token)" || { echo "[of-plugins] WARN: no metadata token" >&2; return 1; }
 
   code="$(curl -sS -o "$tarball" -w '%{http_code}' --max-time 60 \
@@ -271,7 +271,7 @@ of_plugins_fetch() {
 # gateway that refuses to boot is down (Dogma 2). HTTP 404 is the first-boot case
 # and is not an error.
 of_state_restore() {
-  local tok code tarball="/tmp/of-state-restore.tar.gz"
+  local tok code tarball="${TMPDIR:-/tmp}/of-state-restore.tar.gz"
   tok="$(of_metadata_token)" || { echo "[of-state] WARN: no metadata token; starting with empty state" >&2; return 0; }
 
   # Record the generation we are about to read, for the compare-and-swap in
@@ -489,7 +489,7 @@ PY
 #   3. its messages ⊆ ours         -- promoting must not drop anything
 of_state_try_promote() {
   local mine="$1" conflict="$2" tok="$3"
-  local live="/tmp/of-state-live.tar.gz" code gen live_epoch
+  local live="${TMPDIR:-/tmp}/of-state-live.tar.gz" code gen live_epoch
 
   code="$(curl -sS -o "$live" -w '%{http_code}' --max-time 20 \
     -H "Authorization: Bearer ${tok}" \
@@ -1005,7 +1005,7 @@ PY
 # Best-effort by design, same as of_state_restore (Dogma 2): a gateway that boots with
 # fewer memories than it should is degraded, not down.
 of_memories_restore() {
-  local tok code tarball="/tmp/of-memories-restore.tar.gz"
+  local tok code tarball="${TMPDIR:-/tmp}/of-memories-restore.tar.gz"
   local mem_dir="${HERMES_HOME:-/opt/data}/memories"
   tok="$(of_metadata_token)" || { echo "[of-memories] WARN: no metadata token; starting with restored state only" >&2; return 0; }
 
@@ -1374,7 +1374,7 @@ of_skills_inbox_deposit() {
     return 0
   fi
 
-  stage="/tmp/of-inbox-stage"; tarball="/tmp/of-inbox.tar.gz"
+  stage="${TMPDIR:-/tmp}/of-inbox-stage"; tarball="${TMPDIR:-/tmp}/of-inbox.tar.gz"
   rm -rf "$stage" "$tarball"; mkdir -p "$stage"
 
   local dir name
