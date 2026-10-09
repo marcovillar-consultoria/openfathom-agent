@@ -1647,7 +1647,7 @@ echo "== MUTANT: of_state_snapshot back on the shared fixed staging path =="
 # ran exactly once per process. With of_state_sync_loop alive it no longer does, and the
 # `rm -rf "$stage"` of one invocation deletes what the other is mid-tar into.
 extract_one_fn "$WORK/stage-mut.sh" of_state_snapshot \
-  's|stage="\$(mktemp -d)"; tarball="\$(mktemp --suffix=.tar.gz)"|stage="/tmp/of-state-stage-mut"; tarball="/tmp/of-state-snap-mut.tar.gz"; rm -rf "$stage" "$tarball"; mkdir -p "$stage"|'
+  's|stage="\$(mktemp -d)"; tarball="\$(mktemp --suffix=.tar.gz)"|stage="/tmp/of-state-stage-mut"; tarball="/tmp/of-state-snap-mut.tar.gz"; rm -rf "$stage" "$tarball"; mkdir -p "$stage"|'  # no-tmp: ok — the mutant restores the pre-ENG-132 fixed path on purpose
 if grep -q '/tmp/of-state-stage-mut' "$WORK/stage-mut.sh"; then
   reset_stub
   MUT_HOME="$WORK/stage-mut-home"; mk_state_home "$MUT_HOME" 3 "1:s1:user:100:hello"
