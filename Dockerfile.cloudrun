@@ -69,11 +69,25 @@ RUN chmod +x /opt/hermes/scripts/cloudrun-entrypoint.sh
 # measured 2026-10-06 on the base of cloudrun 1284582aa7, the tree reports
 # sealed=True, venv sync returns early for a sealed tree, and both modules
 # still import after a full boot through /init.
+#
+# parallel-web backs the `parallel` web_search/web_extract provider, the one
+# PARALLEL_API_KEY selects. Upstream ships it as an on-use extra
+# (`parallel-web = false` in pyproject.toml): the provider calls
+# pm.ensure_import("parallel-web") on first use, which installs it into a
+# generation under /opt/data/installs and then refuses with "parallel-web
+# installed; restart Hermes to activate it". On the VM /opt/data does not
+# survive a boot, so the restart never comes and every search fell through
+# to the keyless rescue -- in production since the 2026-10-07 promotion,
+# found 2026-10-10 (openfathom-meta ENG-309). Measured locally that day:
+# without this pin the on-use install refuses on the cloudrun bases of
+# 2026-10-06 and 2026-10-10; with it, the provider reaches the API in 3.5 s
+# (401 for a fake key). 0.4.2 is upstream's own pin for the extra
+# (published 2026-03-09, outside the exclude-newer window).
 RUN set -eu; \
     set -- /opt/hermes/tools/uv-*/uv; \
     [ "$#" -eq 1 ] && [ -x "$1" ] || { echo "expected exactly one PM-staged uv, got: $*" >&2; exit 1; }; \
     "$1" pip install --python /opt/hermes/.venv/bin/python --no-cache-dir \
-        pypdf==6.15.0 openpyxl==3.1.5
+        pypdf==6.15.0 openpyxl==3.1.5 parallel-web==0.4.2
 
 # hermes-plugins/youtube-transcript (openfathom-bridges, ENG-231) needs
 # youtube-transcript-api, and it is no longer installed here: since the
