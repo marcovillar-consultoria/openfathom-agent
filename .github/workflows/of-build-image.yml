@@ -44,6 +44,32 @@ env:
   PROJECT_ID: openfathom-prod
   REPOSITORY: openfathom-images
   IMAGE: of-agent
+  # openfathom-meta OF-13 item 1 (ENG-309 class). The promotion of 2026-10-07 shipped an
+  # image whose Parallel SDK was an on-demand pm extra; the VM does not keep /opt/data, so
+  # the lazy install never activated and search fell back to the keyless rescue for three
+  # days, unseen. This imports, inside the image just built and with no network, the
+  # anchor module of every pm extra the Sonda reaches -- the inventory and the command
+  # that produced it are in openfathom-meta docs/execution/of-13.md, item 0. Groq STT is
+  # absent on purpose: it uses the core `openai` SDK, not an extra. The anchor lookup
+  # mirrors pm.extras._anchors (ANCHORS, else the extra name with "-" -> "_"; `mcp` has
+  # no ANCHORS row), so an extra renamed upstream resolves to a module that does not
+  # exist and fails here instead of going quiet.
+  OF_CAPABILITY_SMOKE: |
+    import importlib
+    from pm.extras import ANCHORS
+    required = ["anthropic", "telegram", "parallel-web", "mcp", "youtube", "doc-extract"]
+    missing = []
+    for extra in required:
+        anchors = ANCHORS.get(extra, extra.replace("-", "_"))
+        for anchor in anchors if isinstance(anchors, tuple) else (anchors,):
+            try:
+                importlib.import_module(anchor)
+            except Exception as exc:
+                missing.append(f"{extra} ({anchor}): {type(exc).__name__}: {exc}")
+    for line in missing:
+        print(f"::error title=SDK not baked into the image::{line}")
+    print(f"capability smoke: {len(required)} extras checked, {len(missing)} missing")
+    raise SystemExit(1 if missing else 0)
 
 jobs:
   validate-scope:
@@ -107,6 +133,9 @@ jobs:
       - name: Build Cloud Run image (packaging layer only)
         run: docker build -f Dockerfile.cloudrun -t of-agent:cloudrun --build-arg BASE_IMAGE=of-agent:base .
 
+      - name: Capability smoke test (every SDK the Sonda reaches is baked in)
+        run: docker run --rm --network none --entrypoint /opt/hermes/.venv/bin/python of-agent:cloudrun -c "$OF_CAPABILITY_SMOKE"
+
   build:
     if: github.event_name == 'push'
     needs: test-entrypoint
@@ -142,6 +171,11 @@ jobs:
 
       - name: Build Cloud Run image (packaging layer only)
         run: docker build -f Dockerfile.cloudrun -t of-agent:cloudrun --build-arg BASE_IMAGE=of-agent:base .
+
+      # Before the push on purpose: an image missing an SDK never reaches the registry, so
+      # `promote` never opens a PR for it.
+      - name: Capability smoke test (every SDK the Sonda reaches is baked in)
+        run: docker run --rm --network none --entrypoint /opt/hermes/.venv/bin/python of-agent:cloudrun -c "$OF_CAPABILITY_SMOKE"
 
       - name: Tag and push
         id: push
