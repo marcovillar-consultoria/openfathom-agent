@@ -358,8 +358,10 @@ jobs:
               f"#         -> {digest}",
               "# Digest lido do Artifact Registry com `gcloud artifacts docker images",
               "# describe`, nao suposto da tag (ENG-115).",
-              "# O dossie desta promocao -- o que a imagem traz, o que conferir depois do",
-              "# apply -- fica em docs/promotions.md, que e append-only (ENG-236).",
+              "# O registro factual desta promocao fica em docs/promotions.md, que e",
+              "# append-only (ENG-236); o julgamento humano -- o que a imagem traz, o que",
+              "# conferir depois do apply -- fica na bitacora, em",
+              "# openfathom-meta/docs/execution/, achado pelo digest (ENG-305).",
               END,
               "",
           ])
