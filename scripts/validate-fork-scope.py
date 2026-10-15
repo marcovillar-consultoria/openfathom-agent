@@ -61,6 +61,7 @@ def _rev_exists(ref: str) -> bool:
         ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
         capture_output=True,
         text=True,
+        check=False,
     ).returncode == 0
 
 
