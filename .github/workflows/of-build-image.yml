@@ -438,10 +438,11 @@ jobs:
               "",
               f"## {now:%Y-%m-%d} — `{os.environ['TFVAR_NAME']}` → `{os.environ['IMAGE_TAG']}`",
               "",
-              "**Entrada automática (ADR-059). O julgamento ainda não foi escrito** — o que "
-              "esta imagem muda em runtime, o que conferir depois do apply e o que ela NÃO "
-              "conserta é o que nenhuma máquina sabe. Quem mergear a promoção acrescenta "
-              "abaixo, ou deixa dito que não havia nada a dizer.",
+              "**Entrada automática (ADR-059).** O julgamento humano desta imagem — o que "
+              "ela muda em runtime, o que conferir depois do apply e o que ela NÃO conserta "
+              "— mora na bitácora do sprint ou do item que a motivou, em "
+              "`openfathom-meta/docs/execution/`; ache-o pelo digest novo (openfathom-meta "
+              "ENG-305).",
               "",
               "| | |",
               "|---|---|",
@@ -539,7 +540,7 @@ jobs:
           Digest lido do Artifact Registry com \`gcloud artifacts docker images describe\`, nao suposto da tag (ENG-115).
 
           Antes de mergear:
-          - [ ] a entrada nova em \`${PROMOTIONS}\` recebeu o julgamento: o que esta imagem muda em runtime, ou a frase dizendo que nao muda nada
+          - [ ] o julgamento desta imagem esta na bitacora (\`openfathom-meta/docs/execution/\`), citando o digest novo: o que ela muda em runtime, ou a frase dizendo que nao muda nada
           - [ ] \`plan\` verde (roda \`check_pinned_images_exist.py\`; um \`plan\` verde de dias atras NAO reexecuta -- \`strict_required_status_checks_policy\` e false)
           - [ ] o que a imagem nova traz, e como confirmar depois do apply
           EOF
