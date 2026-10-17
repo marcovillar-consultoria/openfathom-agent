@@ -2032,61 +2032,65 @@ fi
 
 # ---------------------------------------------------------------------------
 # openfathom-meta ENG-171: of_configure_openrouter_route. The shell half is EXECUTED here
-# (python3 is replaced by a recorder, since hermes_cli is not importable in this job);
-# the python half -- what lands in config.yaml -- is proven by running the published
-# image, not by this file.
+# (python3 is replaced by a recorder, since hermes_cli is not importable in this job): the
+# provider gate and the six guards, each with its mutant. The python half -- what lands in
+# config.yaml -- is proven by running the published image, not by this file.
 # ---------------------------------------------------------------------------
 echo "== case: ENG-171 openrouter route =="
-OR_CALLS="$WORK/or-calls"
-or_run() { # or_run <fn-file> <provider> <only> [vision-model] -> prints "rc=<n>"; python3 argv lands in $OR_CALLS
-  local vision_model="${4-claude-sonnet-5}"
+OR_CALLS="$WORK/or-calls"; OR_ERR="$WORK/or-err"
+or_run() { # or_run <fn-file> [VAR=value ...] -> prints "rc=<n>"; python3 argv in $OR_CALLS, stderr in $OR_ERR
+  local fn_file="$1"; shift
   : > "$OR_CALLS"
   ( set +e
     python3() { echo "PY $*" >> "$OR_CALLS"; cat > /dev/null; return 0; }
     # shellcheck disable=SC1090
-    source "$1"
-    HERMES_INFERENCE_PROVIDER="$2" HERMES_OPENROUTER_ONLY="$3" HERMES_INFERENCE_MODEL="z-ai/glm-5.3" \
-      HERMES_OPENROUTER_REASONING_EFFORT="low" HERMES_VISION_PROVIDER="anthropic" \
-      HERMES_VISION_MODEL="$vision_model" HERMES_AUX_PROVIDER="anthropic" \
-      HERMES_AUX_MODEL="claude-haiku-4-5-20251001" of_configure_openrouter_route 2>/dev/null
+    source "$fn_file"
+    export HERMES_INFERENCE_PROVIDER=openrouter HERMES_OPENROUTER_ONLY=together \
+      HERMES_INFERENCE_MODEL=z-ai/glm-5.3 HERMES_OPENROUTER_REASONING_EFFORT=low \
+      HERMES_VISION_PROVIDER=anthropic HERMES_VISION_MODEL=claude-sonnet-5 \
+      HERMES_AUX_PROVIDER=anthropic HERMES_AUX_MODEL=claude-sonnet-5 ANTHROPIC_API_KEY=sk-ant-test
+    local kv; for kv in "$@"; do export "$kv"; done
+    of_configure_openrouter_route 2> "$OR_ERR"
     echo "rc=$?" )
 }
 extract_one_fn "$WORK/or.sh" of_configure_openrouter_route
-check "anthropic provider -> no-op, rc 0" "rc=0" "$(or_run "$WORK/or.sh" anthropic "")"
+check "anthropic provider -> no-op, rc 0" "rc=0" "$(or_run "$WORK/or.sh" HERMES_INFERENCE_PROVIDER=anthropic)"
 check "anthropic provider -> config untouched (python never runs)" "0" "$(grep -c '^PY' "$OR_CALLS")"
-check "openrouter without a host list -> refuses to boot" "rc=1" "$(or_run "$WORK/or.sh" openrouter "")"
-check "openrouter without a host list -> nothing written" "0" "$(grep -c '^PY' "$OR_CALLS")"
-check "openrouter with only separators -> refuses to boot" "rc=1" "$(or_run "$WORK/or.sh" openrouter " , ")"
-check "openrouter with hosts -> writes" "rc=0" "$(or_run "$WORK/or.sh" openrouter "together,fireworks")"
-check "openrouter with hosts -> python gets hosts, model, effort, vision pin and aux pin" \
-  "PY - together z-ai/glm-5.3 low anthropic claude-sonnet-5 anthropic claude-haiku-4-5-20251001" \
-  "$(or_run "$WORK/or.sh" openrouter "together" > /dev/null; cat "$OR_CALLS")"
-check "openrouter without a vision pin -> refuses to boot (photos would go dark)" \
-  "rc=2" "$(or_run "$WORK/or.sh" openrouter "together" "")"
-check "openrouter without a vision pin -> nothing written" "0" "$(grep -c '^PY' "$OR_CALLS")"
+check "openrouter with every pin -> writes" "rc=0" "$(or_run "$WORK/or.sh")"
+check "openrouter with every pin -> python gets hosts, model, effort, vision and aux pins" \
+  "PY - together z-ai/glm-5.3 low anthropic claude-sonnet-5 anthropic claude-sonnet-5" "$(cat "$OR_CALLS")"
+# One row per guard: the env that trips it, and the return code that names it.
+OR_GUARDS=(
+  "1|HERMES_OPENROUTER_ONLY=|no host list"
+  "1|HERMES_OPENROUTER_ONLY= , |only separators"
+  "2|HERMES_VISION_MODEL=|no vision model"
+  "2|HERMES_VISION_PROVIDER=|no vision provider"
+  "3|HERMES_AUX_MODEL=|no aux model"
+  "4|HERMES_OPENROUTER_REASONING_EFFORT=|no effort"
+  "5|ANTHROPIC_API_KEY=|anthropic pins without the anthropic key"
+  "6|HERMES_VISION_PROVIDER=openrouter|vision on the chain that cannot see"
+)
+for row in "${OR_GUARDS[@]}"; do
+  IFS='|' read -r rc env label <<< "$row"
+  check "openrouter, $label -> refuses to boot (rc $rc)" "rc=$rc" "$(or_run "$WORK/or.sh" "$env")"
+  check "openrouter, $label -> nothing written" "0" "$(grep -c '^PY' "$OR_CALLS")"
+  check "openrouter, $label -> says why, on stderr" "1" "$(grep -c '^FATAL: HERMES_INFERENCE_PROVIDER=openrouter' "$OR_ERR")"
+done
 
-echo "== MUTANT: ENG-171 host-list guard removed =="
-extract_one_fn "$WORK/or-noguard.sh" of_configure_openrouter_route 's/^    return 1$/    :/'
-if ! grep -q '^    return 1$' "$WORK/or-noguard.sh"; then
-  check "guard removed -> openrouter without hosts boots (the leak the guard exists for)" \
-    "rc=0" "$(or_run "$WORK/or-noguard.sh" openrouter "")"
-else
-  bad "host-list guard mutation did not apply -- a mutant that does not mutate proves nothing"
-fi
-
-echo "== MUTANT: ENG-171 vision guard removed =="
-extract_one_fn "$WORK/or-novision.sh" of_configure_openrouter_route 's/^    return 2$/    :/'
-if ! grep -q '^    return 2$' "$WORK/or-novision.sh"; then
-  check "vision guard removed -> openrouter without a vision pin boots" \
-    "rc=0" "$(or_run "$WORK/or-novision.sh" openrouter "together" "")"
-else
-  bad "vision guard mutation did not apply -- a mutant that does not mutate proves nothing"
-fi
+for rc in 1 2 3 4 5 6; do
+  echo "== MUTANT: ENG-171 guard $rc removed =="
+  extract_one_fn "$WORK/or-m$rc.sh" of_configure_openrouter_route "s/^    return $rc\$/    :/"
+  if grep -q "^    return $rc\$" "$WORK/or-m$rc.sh"; then
+    bad "guard $rc mutation did not apply -- a mutant that does not mutate proves nothing"; continue
+  fi
+  env=$(printf '%s\n' "${OR_GUARDS[@]}" | awk -F'|' -v r="$rc" '$1==r {print $2; exit}')
+  check "guard $rc removed -> the case it exists for boots ($env)" "rc=0" "$(or_run "$WORK/or-m$rc.sh" "$env")"
+done
 
 echo "== MUTANT: ENG-171 provider gate removed =="
 extract_one_fn "$WORK/or-nogate.sh" of_configure_openrouter_route 's/ || return 0$/ || true/'
 if grep -q '|| true$' "$WORK/or-nogate.sh"; then
-  or_run "$WORK/or-nogate.sh" anthropic "together" > /dev/null
+  or_run "$WORK/or-nogate.sh" HERMES_INFERENCE_PROVIDER=anthropic > /dev/null
   check "gate removed -> an anthropic deployment gets OpenRouter routing written" \
     "1" "$(grep -c '^PY' "$OR_CALLS")"
 else
@@ -2100,12 +2104,17 @@ check "routing pins the hosts and refuses data collection" \
   "1" "$(grep -c '_set_nested(cfg, "provider_routing", {"only": only, "data_collection": "deny"})' "$ENTRYPOINT")"
 check "the effort override is keyed by the model, not global" \
   "1" "$(grep -c '_set_nested(cfg, "agent.reasoning_overrides", {model: effort})' "$ENTRYPOINT")"
+check "telegram never shows the reasoning a mandatory-reasoning model produces" \
+  "1" "$(grep -c '_set_nested(cfg, "display.platforms.telegram.show_reasoning", False)' "$ENTRYPOINT")"
 check "compression and title_generation move to the aux pin" \
   "1" "$(grep -c 'for task in ("compression", "title_generation"):' "$ENTRYPOINT")"
 none_line=$(grep -n '^    hermes config set agent.reasoning_effort none$' "$ENTRYPOINT" | cut -d: -f1)
+aux_line=$(grep -n '^      hermes config set auxiliary.title_generation.model ' "$ENTRYPOINT" | cut -d: -f1)
 call_line=$(grep -n '^    of_configure_openrouter_route$' "$ENTRYPOINT" | cut -d: -f1)
 check "the route is configured after the global reasoning_effort none" \
   "1" "$([[ -n "$none_line" && -n "$call_line" && "$call_line" -gt "$none_line" ]] && echo 1 || echo 0)"
+check "the route is configured after the ENG-83 aux block it overrides" \
+  "1" "$([[ -n "$aux_line" && -n "$call_line" && "$call_line" -gt "$aux_line" ]] && echo 1 || echo 0)"
 
 echo
 echo "passed: $pass   failed: $fail"
