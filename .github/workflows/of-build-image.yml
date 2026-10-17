@@ -136,6 +136,61 @@ jobs:
       - name: Capability smoke test (every SDK the Sonda reaches is baked in)
         run: docker run --rm --network none --entrypoint /opt/hermes/.venv/bin/python of-agent:cloudrun -c "$OF_CAPABILITY_SMOKE"
 
+      # openfathom-meta ENG-171 (2026-10-17): the entrypoint's config writers are python
+      # heredocs that test-cloudrun-entrypoint.sh can only grep -- and `hermes config set
+      # agent.reasoning_effort none` passed that grep for two months after upstream
+      # 138e482ed0 turned it into YAML null. This runs the writers inside the built image,
+      # after its own config seeding, and asserts what hermes' resolver reads.
+      - name: Config writers run in the image (reasoning effort, OpenRouter route)
+        run: |
+          cat > /tmp/of-config-check.sh <<'SH'
+          set -euo pipefail
+          export PATH=/command:/opt/hermes/bin:$PATH
+          cd /opt/hermes
+          ext() { awk -v f="$1" '$0 ~ "^"f"\\(\\) \\{" {p=1} p {print} p && /^\}$/ {exit}' /ep.sh; }
+          ext of_configure_reasoning_effort > /tmp/re.sh; ext of_configure_openrouter_route > /tmp/or.sh
+          source /tmp/re.sh; source /tmp/or.sh
+          verify() { python3 - "$1" <<'PY'
+          import sys
+          from hermes_cli.config import get_config_path, fast_safe_load
+          from hermes_constants import resolve_reasoning_config
+          cfg = fast_safe_load(open(get_config_path()))
+          fails = []
+          def want(label, got, exp):
+              print(("ok  " if got == exp else "FAIL") + f" {label}: {got!r}")
+              fails.extend([] if got == exp else [label])
+          def dig(*ks):
+              d = cfg
+              for k in ks:
+                  d = (d or {}).get(k)
+              return d
+          want("reasoning_effort is the string medium", dig("agent", "reasoning_effort"), "medium")
+          want("claude-sonnet-5 resolves to medium", resolve_reasoning_config(cfg, "claude-sonnet-5"), {"enabled": True, "effort": "medium"})
+          want("telegram show_reasoning", dig("display", "platforms", "telegram", "show_reasoning"), False)
+          if sys.argv[1] == "openrouter":
+              want("z-ai/glm-5.3 resolves to low", resolve_reasoning_config(cfg, "z-ai/glm-5.3"), {"enabled": True, "effort": "low"})
+              want("provider_routing", cfg.get("provider_routing"), {"only": ["together"], "data_collection": "deny"})
+              want("vision pin", dig("auxiliary", "vision", "provider"), "anthropic")
+          sys.exit(1 if fails else 0)
+          PY
+          }
+          for scen in anthropic openrouter; do
+            export HERMES_HOME=/tmp/hh-$scen
+            bash docker/stage2-hook.sh > /dev/null 2>&1
+            hermes config set agent.reasoning_effort none > /dev/null 2>&1  # the old boot line: the writer must win
+            of_configure_reasoning_effort
+            if [ "$scen" = openrouter ]; then
+              HERMES_INFERENCE_PROVIDER=openrouter HERMES_OPENROUTER_ONLY=together HERMES_INFERENCE_MODEL=z-ai/glm-5.3 \
+                HERMES_OPENROUTER_REASONING_EFFORT=low HERMES_VISION_PROVIDER=anthropic HERMES_VISION_MODEL=claude-sonnet-5 \
+                HERMES_AUX_PROVIDER=anthropic HERMES_AUX_MODEL=claude-sonnet-5 ANTHROPIC_API_KEY=sk-ant-fake \
+                of_configure_openrouter_route
+            fi
+            echo "== $scen"; verify "$scen"
+          done
+          SH
+          docker run --rm --entrypoint bash -v /tmp/of-config-check.sh:/check.sh:ro \
+            -v "$PWD/scripts/cloudrun-entrypoint.sh:/ep.sh:ro" of-agent:cloudrun /check.sh
+
   build:
     if: github.event_name == 'push'
     needs: test-entrypoint
