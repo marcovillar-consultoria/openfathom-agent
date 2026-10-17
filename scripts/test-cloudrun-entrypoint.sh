@@ -2108,13 +2108,26 @@ check "telegram never shows the reasoning a mandatory-reasoning model produces" 
   "1" "$(grep -c '_set_nested(cfg, "display.platforms.telegram.show_reasoning", False)' "$ENTRYPOINT")"
 check "compression and title_generation move to the aux pin" \
   "1" "$(grep -c 'for task in ("compression", "title_generation"):' "$ENTRYPOINT")"
-none_line=$(grep -n '^    hermes config set agent.reasoning_effort none$' "$ENTRYPOINT" | cut -d: -f1)
+none_line=$(grep -n '^    of_configure_reasoning_effort$' "$ENTRYPOINT" | cut -d: -f1)
 aux_line=$(grep -n '^      hermes config set auxiliary.title_generation.model ' "$ENTRYPOINT" | cut -d: -f1)
 call_line=$(grep -n '^    of_configure_openrouter_route$' "$ENTRYPOINT" | cut -d: -f1)
-check "the route is configured after the global reasoning_effort none" \
+check "the route is configured after the global reasoning effort" \
   "1" "$([[ -n "$none_line" && -n "$call_line" && "$call_line" -gt "$none_line" ]] && echo 1 || echo 0)"
 check "the route is configured after the ENG-83 aux block it overrides" \
   "1" "$([[ -n "$aux_line" && -n "$call_line" && "$call_line" -gt "$aux_line" ]] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# openfathom-meta ENG-171: of_configure_reasoning_effort. All of it is python, so this file
+# can only prove the text; the build-check job of of-build-image.yml runs it inside the
+# built image and asserts what the resolver reads (the proof that executes).
+# ---------------------------------------------------------------------------
+echo "== structural: ENG-171 the effort is a string, and the display flag is pinned =="
+check "the old null-writing line is gone" \
+  "0" "$(grep -c '^    hermes config set agent.reasoning_effort none$' "$ENTRYPOINT")"
+check "the effort is written as the string medium" \
+  "1" "$(grep -c '_set_nested(cfg, "agent.reasoning_effort", "medium")' "$ENTRYPOINT")"
+check "the Gemini fallback is not pinned off (its native adapter separates reasoning)" \
+  "0" "$(grep -c 'gemini-3.6-flash"\] = "none"' "$ENTRYPOINT")"
 
 echo
 echo "passed: $pass   failed: $fail"

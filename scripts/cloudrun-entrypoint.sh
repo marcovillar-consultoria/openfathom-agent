@@ -1696,6 +1696,37 @@ of_reconcile_api_server_key() {
   echo "[of-apikey] reconciled API_SERVER_KEY in $env_file with the Secret Manager value (dotenv override=True would otherwise win)"
 }
 
+# openfathom-meta ENG-171 (2026-10-17): the reasoning effort, written so the resolver reads it.
+# `hermes config set agent.reasoning_effort none` -- what this script ran since ENG-49 --
+# stopped working when upstream 138e482ed0 (2026-08-20, "set coerces ... null") reached
+# `cloudrun`: since then it stores YAML null (the CLI warns the key is "not recognized"),
+# hermes_constants.parse_reasoning_effort(None) means "caller uses the default", and the
+# anthropic adapter sends no thinking parameter, so adaptive Claude models think at the API
+# default -- `high` on claude-sonnet-5 (platform.claude.com/docs/en/build-with-claude/effort).
+# The config value was measured in both images, the deployed 797bcf8b included; the effort on
+# the wire is inferred from the adapter and the docs, not observed.
+#
+# The Tech Lead's decision the same day: reasoning matters for the Sonda, at medium or
+# equivalent. So the effort is `medium`, written as a string through _set_nested (a bare
+# `none` is what `config set` coerces). The Gemini fallback is NOT pinned: its native adapter
+# separates thought parts into `reasoning` (agent/gemini_native_adapter.py), and the ENG-49
+# leak was the Vertex OpenAI-compat surface putting them in `content`. What keeps reasoning
+# out of a Telegram reply is the display flag, pinned here because an explicit effort makes
+# the adapter request `display: "summarized"`, so every turn now carries reasoning text.
+of_configure_reasoning_effort() {
+  python3 - <<'PYEOF'
+from hermes_cli.config import get_config_path, fast_safe_load, ensure_hermes_home, _set_nested
+from utils import atomic_yaml_write
+p = get_config_path()
+cfg = (fast_safe_load(open(p)) or {}) if p.exists() else {}
+_set_nested(cfg, "agent.reasoning_effort", "medium")
+_set_nested(cfg, "display.platforms.telegram.show_reasoning", False)
+ensure_hermes_home()
+atomic_yaml_write(p, cfg, sort_keys=False)
+print(f"✓ Set agent.reasoning_effort='medium', telegram show_reasoning=false in {p}")
+PYEOF
+}
+
 # openfathom-meta ENG-171 (2026-10-17): the GLM-5.3 trial routes the main model through
 # OpenRouter, and OpenRouter by default falls back to ANY host serving the model --
 # Chinese hosts included -- while the Sonda's conversations carry personal data. Only when
@@ -1710,15 +1741,11 @@ of_reconcile_api_server_key() {
 #     other auxiliary calls do not ("do NOT propagate to aux calls by design",
 #     hermes_cli/config_defaults.py), and the account-wide "Allowed providers" ceiling on
 #     OpenRouter is what covers them.
-#   agent.reasoning_overrides -- the per-model effort, which wins over the global
-#     `agent.reasoning_effort none` (hermes_constants.py, resolve_reasoning_config). GLM-5.3's
-#     reasoning is mandatory, and with `none` Hermes omits the field and OpenRouter applies
-#     `max`. Not always honoured: `z-ai/` is not a known reasoning prefix, so on a cold model
+#   agent.reasoning_overrides -- the per-model effort, which wins over the global `medium`
+#     of_configure_reasoning_effort writes (hermes_constants.py, resolve_reasoning_config). GLM-5.3's reasoning is mandatory and
+#     accepts only low/high/max; without a level OpenRouter applies `max`. Not always honoured: `z-ai/` is not a known reasoning prefix, so on a cold model
 #     catalog -- after every boot, until the background refresh lands -- no reasoning field
 #     is sent at all (agent/reasoning_params.py).
-#   display.platforms.telegram.show_reasoning false -- the global `none` was what kept
-#     reasoning out of the reply (ENG-49); with a model that must reason, the display flag is
-#     the remaining guard, and its platform default is not pinned anywhere else.
 #   auxiliary.vision -- GLM-5.3 takes text only. Pinned by provider and model, no base_url:
 #     a base_url routes through the explicit-endpoint override, not the anthropic client the
 #     compression task uses in production. Photos are then described in text by this model
@@ -1772,7 +1799,6 @@ p = get_config_path()
 cfg = (fast_safe_load(open(p)) or {}) if p.exists() else {}
 _set_nested(cfg, "provider_routing", {"only": only, "data_collection": "deny"})
 _set_nested(cfg, "agent.reasoning_overrides", {model: effort})
-_set_nested(cfg, "display.platforms.telegram.show_reasoning", False)
 _set_nested(cfg, "auxiliary.vision.provider", vision_provider)
 _set_nested(cfg, "auxiliary.vision.model", vision_model)
 for task in ("compression", "title_generation"):
@@ -1781,7 +1807,7 @@ for task in ("compression", "title_generation"):
 ensure_hermes_home()
 atomic_yaml_write(p, cfg, sort_keys=False)
 print(f"✓ Set provider_routing only={only} data_collection=deny, agent.reasoning_overrides "
-      f"{model}={effort}, telegram show_reasoning=false, auxiliary.vision "
+      f"{model}={effort}, auxiliary.vision "
       f"{vision_provider}/{vision_model}, auxiliary.compression+title_generation "
       f"{aux_provider}/{aux_model} in {p}")
 PYEOF
@@ -2004,11 +2030,13 @@ PYEOF
     # this turns off is returning the thoughts. Suppressing the thinking itself
     # would be thinkingBudget, a different knob, and would trade answer quality for
     # tokens -- not this item's call to make.
-    hermes config set agent.reasoning_effort none
+    # The line that stood here -- `hermes config set agent.reasoning_effort none` -- stopped
+    # taking effect in 2026-08: see of_configure_reasoning_effort, which replaces it.
+    of_configure_reasoning_effort
 
     # openfathom-meta ENG-171: a no-op unless HERMES_INFERENCE_PROVIDER=openrouter (see
-    # of_configure_openrouter_route). After the global `none` above, which its per-model
-    # override deliberately outranks for the one model whose reasoning cannot be disabled.
+    # of_configure_openrouter_route). After the global `medium` above, which its per-model
+    # override deliberately outranks for the one model that accepts no medium.
     of_configure_openrouter_route
 
     # openfathom-meta ADR-043 / ENG-51: scope host-execution tools OUT of the
