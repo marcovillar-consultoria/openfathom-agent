@@ -2038,7 +2038,8 @@ fi
 # ---------------------------------------------------------------------------
 echo "== case: ENG-171 openrouter route =="
 OR_CALLS="$WORK/or-calls"
-or_run() { # or_run <fn-file> <provider> <only> -> prints "rc=<n>"; python3 argv lands in $OR_CALLS
+or_run() { # or_run <fn-file> <provider> <only> [vision-model] -> prints "rc=<n>"; python3 argv lands in $OR_CALLS
+  local vision_model="${4-claude-sonnet-5}"
   : > "$OR_CALLS"
   ( set +e
     python3() { echo "PY $*" >> "$OR_CALLS"; cat > /dev/null; return 0; }
@@ -2046,7 +2047,8 @@ or_run() { # or_run <fn-file> <provider> <only> -> prints "rc=<n>"; python3 argv
     source "$1"
     HERMES_INFERENCE_PROVIDER="$2" HERMES_OPENROUTER_ONLY="$3" HERMES_INFERENCE_MODEL="z-ai/glm-5.3" \
       HERMES_OPENROUTER_REASONING_EFFORT="low" HERMES_VISION_PROVIDER="anthropic" \
-      HERMES_VISION_MODEL="claude-sonnet-5" of_configure_openrouter_route 2>/dev/null
+      HERMES_VISION_MODEL="$vision_model" HERMES_AUX_PROVIDER="anthropic" \
+      HERMES_AUX_MODEL="claude-haiku-4-5-20251001" of_configure_openrouter_route 2>/dev/null
     echo "rc=$?" )
 }
 extract_one_fn "$WORK/or.sh" of_configure_openrouter_route
@@ -2056,8 +2058,12 @@ check "openrouter without a host list -> refuses to boot" "rc=1" "$(or_run "$WOR
 check "openrouter without a host list -> nothing written" "0" "$(grep -c '^PY' "$OR_CALLS")"
 check "openrouter with only separators -> refuses to boot" "rc=1" "$(or_run "$WORK/or.sh" openrouter " , ")"
 check "openrouter with hosts -> writes" "rc=0" "$(or_run "$WORK/or.sh" openrouter "together,fireworks")"
-check "openrouter with hosts -> python gets hosts, model, effort and vision pin" \
-  "PY - together,fireworks z-ai/glm-5.3 low anthropic claude-sonnet-5" "$(cat "$OR_CALLS")"
+check "openrouter with hosts -> python gets hosts, model, effort, vision pin and aux pin" \
+  "PY - together z-ai/glm-5.3 low anthropic claude-sonnet-5 anthropic claude-haiku-4-5-20251001" \
+  "$(or_run "$WORK/or.sh" openrouter "together" > /dev/null; cat "$OR_CALLS")"
+check "openrouter without a vision pin -> refuses to boot (photos would go dark)" \
+  "rc=2" "$(or_run "$WORK/or.sh" openrouter "together" "")"
+check "openrouter without a vision pin -> nothing written" "0" "$(grep -c '^PY' "$OR_CALLS")"
 
 echo "== MUTANT: ENG-171 host-list guard removed =="
 extract_one_fn "$WORK/or-noguard.sh" of_configure_openrouter_route 's/^    return 1$/    :/'
@@ -2066,6 +2072,15 @@ if ! grep -q '^    return 1$' "$WORK/or-noguard.sh"; then
     "rc=0" "$(or_run "$WORK/or-noguard.sh" openrouter "")"
 else
   bad "host-list guard mutation did not apply -- a mutant that does not mutate proves nothing"
+fi
+
+echo "== MUTANT: ENG-171 vision guard removed =="
+extract_one_fn "$WORK/or-novision.sh" of_configure_openrouter_route 's/^    return 2$/    :/'
+if ! grep -q '^    return 2$' "$WORK/or-novision.sh"; then
+  check "vision guard removed -> openrouter without a vision pin boots" \
+    "rc=0" "$(or_run "$WORK/or-novision.sh" openrouter "together" "")"
+else
+  bad "vision guard mutation did not apply -- a mutant that does not mutate proves nothing"
 fi
 
 echo "== MUTANT: ENG-171 provider gate removed =="
@@ -2078,11 +2093,15 @@ else
   bad "provider gate mutation did not apply -- a mutant that does not mutate proves nothing"
 fi
 
+# Text, not execution: these prove the lines exist in the shipped script, not that hermes_cli
+# writes them -- that is proven by running the published image (openfathom-meta ENG-171).
 echo "== structural: ENG-171 what the python half writes, and when it runs =="
 check "routing pins the hosts and refuses data collection" \
   "1" "$(grep -c '_set_nested(cfg, "provider_routing", {"only": only, "data_collection": "deny"})' "$ENTRYPOINT")"
 check "the effort override is keyed by the model, not global" \
   "1" "$(grep -c '_set_nested(cfg, "agent.reasoning_overrides", {model: effort})' "$ENTRYPOINT")"
+check "compression and title_generation move to the aux pin" \
+  "1" "$(grep -c 'for task in ("compression", "title_generation"):' "$ENTRYPOINT")"
 none_line=$(grep -n '^    hermes config set agent.reasoning_effort none$' "$ENTRYPOINT" | cut -d: -f1)
 call_line=$(grep -n '^    of_configure_openrouter_route$' "$ENTRYPOINT" | cut -d: -f1)
 check "the route is configured after the global reasoning_effort none" \

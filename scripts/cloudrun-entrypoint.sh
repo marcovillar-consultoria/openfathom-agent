@@ -1712,7 +1712,13 @@ of_reconcile_api_server_key() {
 #   auxiliary.vision -- GLM-5.3 takes text only, and with openrouter as the main provider
 #     the vision chain has no backend that sees images. Pinned by provider and model only:
 #     a base_url would route through the explicit-endpoint override, which is not the
-#     anthropic client the compression task already uses in production.
+#     anthropic client the compression task already uses in production. Required: an
+#     openrouter deployment without it would stop understanding photos, silently.
+#   auxiliary.compression / title_generation -- moved OFF the main model when
+#     HERMES_AUX_PROVIDER/MODEL are set. Auxiliary calls read neither provider_routing nor
+#     reasoning_overrides (agent/auxiliary_client.py), so on GLM-5.3 they would go to any
+#     host at the model's default effort, `max`. Found by the adversarial review of the
+#     trial's plan (openfathom-meta, 2026-10-17, findings M1/M2).
 of_configure_openrouter_route() {
   [[ "${HERMES_INFERENCE_PROVIDER:-}" == "openrouter" ]] || return 0
   local only="${HERMES_OPENROUTER_ONLY:-}"
@@ -1720,12 +1726,17 @@ of_configure_openrouter_route() {
     echo "FATAL: HERMES_INFERENCE_PROVIDER=openrouter without HERMES_OPENROUTER_ONLY -- refusing to let OpenRouter pick the host" >&2
     return 1
   fi
+  if [[ -z "${HERMES_VISION_PROVIDER:-}" || -z "${HERMES_VISION_MODEL:-}" ]]; then
+    echo "FATAL: HERMES_INFERENCE_PROVIDER=openrouter without HERMES_VISION_PROVIDER/MODEL -- photos would stop being understood" >&2
+    return 2
+  fi
   python3 - "${HERMES_OPENROUTER_ONLY}" "${HERMES_INFERENCE_MODEL:-}" \
-    "${HERMES_OPENROUTER_REASONING_EFFORT:-}" "${HERMES_VISION_PROVIDER:-}" "${HERMES_VISION_MODEL:-}" <<'PYEOF'
+    "${HERMES_OPENROUTER_REASONING_EFFORT:-}" "${HERMES_VISION_PROVIDER:-}" "${HERMES_VISION_MODEL:-}" \
+    "${HERMES_AUX_PROVIDER:-}" "${HERMES_AUX_MODEL:-}" <<'PYEOF'
 import sys
 from hermes_cli.config import get_config_path, fast_safe_load, ensure_hermes_home, _set_nested
 from utils import atomic_yaml_write
-only_raw, model, effort, vision_provider, vision_model = sys.argv[1:6]
+only_raw, model, effort, vision_provider, vision_model, aux_provider, aux_model = sys.argv[1:8]
 only = [h.strip() for h in only_raw.split(",") if h.strip()]
 if not only:
     sys.exit("FATAL: HERMES_OPENROUTER_ONLY names no host")
@@ -1733,6 +1744,8 @@ if effort and not model:
     sys.exit("FATAL: HERMES_OPENROUTER_REASONING_EFFORT needs HERMES_INFERENCE_MODEL to key it")
 if bool(vision_provider) != bool(vision_model):
     sys.exit("FATAL: HERMES_VISION_PROVIDER and HERMES_VISION_MODEL go together")
+if bool(aux_provider) != bool(aux_model):
+    sys.exit("FATAL: HERMES_AUX_PROVIDER and HERMES_AUX_MODEL go together")
 p = get_config_path()
 cfg = (fast_safe_load(open(p)) or {}) if p.exists() else {}
 _set_nested(cfg, "provider_routing", {"only": only, "data_collection": "deny"})
@@ -1741,11 +1754,16 @@ if effort:
 if vision_provider:
     _set_nested(cfg, "auxiliary.vision.provider", vision_provider)
     _set_nested(cfg, "auxiliary.vision.model", vision_model)
+if aux_provider:
+    for task in ("compression", "title_generation"):
+        _set_nested(cfg, f"auxiliary.{task}.provider", aux_provider)
+        _set_nested(cfg, f"auxiliary.{task}.model", aux_model)
 ensure_hermes_home()
 atomic_yaml_write(p, cfg, sort_keys=False)
 print(f"✓ Set provider_routing only={only} data_collection=deny"
       + (f", agent.reasoning_overrides {model}={effort}" if effort else "")
       + (f", auxiliary.vision {vision_provider}/{vision_model}" if vision_provider else "")
+      + (f", auxiliary.compression+title_generation {aux_provider}/{aux_model}" if aux_provider else "")
       + f" in {p}")
 PYEOF
 }
