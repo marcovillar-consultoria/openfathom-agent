@@ -2102,19 +2102,53 @@ fi
 echo "== structural: ENG-171 what the python half writes, and when it runs =="
 check "routing pins the hosts and refuses data collection" \
   "1" "$(grep -c '_set_nested(cfg, "provider_routing", {"only": only, "data_collection": "deny"})' "$ENTRYPOINT")"
-check "the effort override is keyed by the model, not global" \
-  "1" "$(grep -c '_set_nested(cfg, "agent.reasoning_overrides", {model: effort})' "$ENTRYPOINT")"
+check "both writers set the merged overrides dict, keyed by model" \
+  "2" "$(grep -c '_set_nested(cfg, "agent.reasoning_overrides", overrides)' "$ENTRYPOINT")"
 check "telegram never shows the reasoning a mandatory-reasoning model produces" \
   "1" "$(grep -c '_set_nested(cfg, "display.platforms.telegram.show_reasoning", False)' "$ENTRYPOINT")"
 check "compression and title_generation move to the aux pin" \
   "1" "$(grep -c 'for task in ("compression", "title_generation"):' "$ENTRYPOINT")"
-none_line=$(grep -n '^    hermes config set agent.reasoning_effort none$' "$ENTRYPOINT" | cut -d: -f1)
+none_line=$(grep -n '^    of_configure_reasoning_effort$' "$ENTRYPOINT" | cut -d: -f1)
 aux_line=$(grep -n '^      hermes config set auxiliary.title_generation.model ' "$ENTRYPOINT" | cut -d: -f1)
 call_line=$(grep -n '^    of_configure_openrouter_route$' "$ENTRYPOINT" | cut -d: -f1)
-check "the route is configured after the global reasoning_effort none" \
+check "the route is configured after the global reasoning effort" \
   "1" "$([[ -n "$none_line" && -n "$call_line" && "$call_line" -gt "$none_line" ]] && echo 1 || echo 0)"
 check "the route is configured after the ENG-83 aux block it overrides" \
   "1" "$([[ -n "$aux_line" && -n "$call_line" && "$call_line" -gt "$aux_line" ]] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# openfathom-meta ENG-171: of_configure_reasoning_effort. `hermes config set ... none` stored
+# YAML null, read as "use the API default" (high on Sonnet 5). Shell half executed here with
+# python3 recorded; what lands in config.yaml is proven by running the published image.
+# ---------------------------------------------------------------------------
+echo "== case: ENG-171 global reasoning effort =="
+re_run() { # re_run <fn-file> [VAR=value] -> python3 argv
+  ( python3() { echo "PY $*"; cat > /dev/null; }
+    # shellcheck disable=SC1090
+    source "$1"; unset HERMES_REASONING_EFFORT
+    [[ -n "${2:-}" ]] && export "$2"
+    of_configure_reasoning_effort )
+}
+extract_one_fn "$WORK/re.sh" of_configure_reasoning_effort
+check "unset -> the Tech Lead's medium" "PY - medium" "$(re_run "$WORK/re.sh")"
+check "set -> that level" "PY - low" "$(re_run "$WORK/re.sh" HERMES_REASONING_EFFORT=low)"
+echo "== MUTANT: ENG-171 default back to none =="
+extract_one_fn "$WORK/re-none.sh" of_configure_reasoning_effort 's/:-medium}/:-none}/'
+if grep -q ':-none}' "$WORK/re-none.sh"; then
+  check "default none -> unset no longer gives medium" "PY - none" "$(re_run "$WORK/re-none.sh")"
+else
+  bad "default mutation did not apply -- a mutant that does not mutate proves nothing"
+fi
+# Text, not execution.
+echo "== structural: ENG-171 the effort is a string, the fallback stays off, overrides merge =="
+check "the old null-writing line is gone" \
+  "0" "$(grep -c '^    hermes config set agent.reasoning_effort none$' "$ENTRYPOINT")"
+check "the effort is written through _set_nested" \
+  "1" "$(grep -c '_set_nested(cfg, "agent.reasoning_effort", effort)' "$ENTRYPOINT")"
+check "the Gemini fallback is pinned to none (ENG-49)" \
+  "1" "$(grep -c 'overrides\["gemini-3.6-flash"\] = "none"' "$ENTRYPOINT")"
+check "the openrouter route adds to the overrides instead of replacing them" \
+  "1" "$(grep -c '^overrides\[model\] = effort$' "$ENTRYPOINT")"
 
 echo
 echo "passed: $pass   failed: $fail"
