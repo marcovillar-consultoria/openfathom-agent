@@ -2030,6 +2030,64 @@ else
   bad "token-order mutation did not apply -- a mutant that does not mutate proves nothing"
 fi
 
+# ---------------------------------------------------------------------------
+# openfathom-meta ENG-171: of_configure_openrouter_route. The shell half is EXECUTED here
+# (python3 is replaced by a recorder, since hermes_cli is not importable in this job);
+# the python half -- what lands in config.yaml -- is proven by running the published
+# image, not by this file.
+# ---------------------------------------------------------------------------
+echo "== case: ENG-171 openrouter route =="
+OR_CALLS="$WORK/or-calls"
+or_run() { # or_run <fn-file> <provider> <only> -> prints "rc=<n>"; python3 argv lands in $OR_CALLS
+  : > "$OR_CALLS"
+  ( set +e
+    python3() { echo "PY $*" >> "$OR_CALLS"; cat > /dev/null; return 0; }
+    # shellcheck disable=SC1090
+    source "$1"
+    HERMES_INFERENCE_PROVIDER="$2" HERMES_OPENROUTER_ONLY="$3" HERMES_INFERENCE_MODEL="z-ai/glm-5.3" \
+      HERMES_OPENROUTER_REASONING_EFFORT="low" HERMES_VISION_PROVIDER="anthropic" \
+      HERMES_VISION_MODEL="claude-sonnet-5" of_configure_openrouter_route 2>/dev/null
+    echo "rc=$?" )
+}
+extract_one_fn "$WORK/or.sh" of_configure_openrouter_route
+check "anthropic provider -> no-op, rc 0" "rc=0" "$(or_run "$WORK/or.sh" anthropic "")"
+check "anthropic provider -> config untouched (python never runs)" "0" "$(grep -c '^PY' "$OR_CALLS")"
+check "openrouter without a host list -> refuses to boot" "rc=1" "$(or_run "$WORK/or.sh" openrouter "")"
+check "openrouter without a host list -> nothing written" "0" "$(grep -c '^PY' "$OR_CALLS")"
+check "openrouter with only separators -> refuses to boot" "rc=1" "$(or_run "$WORK/or.sh" openrouter " , ")"
+check "openrouter with hosts -> writes" "rc=0" "$(or_run "$WORK/or.sh" openrouter "together,fireworks")"
+check "openrouter with hosts -> python gets hosts, model, effort and vision pin" \
+  "PY - together,fireworks z-ai/glm-5.3 low anthropic claude-sonnet-5" "$(cat "$OR_CALLS")"
+
+echo "== MUTANT: ENG-171 host-list guard removed =="
+extract_one_fn "$WORK/or-noguard.sh" of_configure_openrouter_route 's/^    return 1$/    :/'
+if ! grep -q '^    return 1$' "$WORK/or-noguard.sh"; then
+  check "guard removed -> openrouter without hosts boots (the leak the guard exists for)" \
+    "rc=0" "$(or_run "$WORK/or-noguard.sh" openrouter "")"
+else
+  bad "host-list guard mutation did not apply -- a mutant that does not mutate proves nothing"
+fi
+
+echo "== MUTANT: ENG-171 provider gate removed =="
+extract_one_fn "$WORK/or-nogate.sh" of_configure_openrouter_route 's/ || return 0$/ || true/'
+if grep -q '|| true$' "$WORK/or-nogate.sh"; then
+  or_run "$WORK/or-nogate.sh" anthropic "together" > /dev/null
+  check "gate removed -> an anthropic deployment gets OpenRouter routing written" \
+    "1" "$(grep -c '^PY' "$OR_CALLS")"
+else
+  bad "provider gate mutation did not apply -- a mutant that does not mutate proves nothing"
+fi
+
+echo "== structural: ENG-171 what the python half writes, and when it runs =="
+check "routing pins the hosts and refuses data collection" \
+  "1" "$(grep -c '_set_nested(cfg, "provider_routing", {"only": only, "data_collection": "deny"})' "$ENTRYPOINT")"
+check "the effort override is keyed by the model, not global" \
+  "1" "$(grep -c '_set_nested(cfg, "agent.reasoning_overrides", {model: effort})' "$ENTRYPOINT")"
+none_line=$(grep -n '^    hermes config set agent.reasoning_effort none$' "$ENTRYPOINT" | cut -d: -f1)
+call_line=$(grep -n '^    of_configure_openrouter_route$' "$ENTRYPOINT" | cut -d: -f1)
+check "the route is configured after the global reasoning_effort none" \
+  "1" "$([[ -n "$none_line" && -n "$call_line" && "$call_line" -gt "$none_line" ]] && echo 1 || echo 0)"
+
 echo
 echo "passed: $pass   failed: $fail"
 [[ "$fail" -eq 0 ]]

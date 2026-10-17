@@ -1692,6 +1692,64 @@ of_reconcile_api_server_key() {
   echo "[of-apikey] reconciled API_SERVER_KEY in $env_file with the Secret Manager value (dotenv override=True would otherwise win)"
 }
 
+# openfathom-meta ENG-171 (2026-10-17): the GLM-5.3 trial routes the main model through
+# OpenRouter, and OpenRouter by default falls back to ANY host serving the model --
+# Chinese hosts included -- while the Sonda's conversations carry personal data. This
+# writes the three things that trial needs, and only when the provider is openrouter, so
+# an anthropic deployment of this image is untouched:
+#   provider_routing  -- `only` the hosts in HERMES_OPENROUTER_ONLY, data_collection deny.
+#     Fails CLOSED: openrouter without a host list refuses to boot, because an implicit
+#     host is exactly how a prompt would reach one nobody chose. Hermes has no
+#     allow_fallbacks key (agent/chat_completion_helpers.py, _provider_preferences_for_agent),
+#     so fallback stays inside `only`; and auxiliary calls never inherit this block
+#     (hermes_cli/config_defaults.py: "do NOT propagate to aux calls by design") -- the
+#     account-wide "Allowed providers" ceiling on OpenRouter is what covers them.
+#   agent.reasoning_overrides -- the per-model effort, which wins over the global
+#     `agent.reasoning_effort none` below (hermes_constants.py, resolve_reasoning_config).
+#     GLM-5.3's reasoning is mandatory: with `none` Hermes omits the field and OpenRouter
+#     applies the model's default, `max`. The global `none` stays for every other model,
+#     because it is what keeps reasoning out of the reply (ENG-49).
+#   auxiliary.vision -- GLM-5.3 takes text only, and with openrouter as the main provider
+#     the vision chain has no backend that sees images. Pinned by provider and model only:
+#     a base_url would route through the explicit-endpoint override, which is not the
+#     anthropic client the compression task already uses in production.
+of_configure_openrouter_route() {
+  [[ "${HERMES_INFERENCE_PROVIDER:-}" == "openrouter" ]] || return 0
+  local only="${HERMES_OPENROUTER_ONLY:-}"
+  if [[ -z "${only//[ ,]/}" ]]; then
+    echo "FATAL: HERMES_INFERENCE_PROVIDER=openrouter without HERMES_OPENROUTER_ONLY -- refusing to let OpenRouter pick the host" >&2
+    return 1
+  fi
+  python3 - "${HERMES_OPENROUTER_ONLY}" "${HERMES_INFERENCE_MODEL:-}" \
+    "${HERMES_OPENROUTER_REASONING_EFFORT:-}" "${HERMES_VISION_PROVIDER:-}" "${HERMES_VISION_MODEL:-}" <<'PYEOF'
+import sys
+from hermes_cli.config import get_config_path, fast_safe_load, ensure_hermes_home, _set_nested
+from utils import atomic_yaml_write
+only_raw, model, effort, vision_provider, vision_model = sys.argv[1:6]
+only = [h.strip() for h in only_raw.split(",") if h.strip()]
+if not only:
+    sys.exit("FATAL: HERMES_OPENROUTER_ONLY names no host")
+if effort and not model:
+    sys.exit("FATAL: HERMES_OPENROUTER_REASONING_EFFORT needs HERMES_INFERENCE_MODEL to key it")
+if bool(vision_provider) != bool(vision_model):
+    sys.exit("FATAL: HERMES_VISION_PROVIDER and HERMES_VISION_MODEL go together")
+p = get_config_path()
+cfg = (fast_safe_load(open(p)) or {}) if p.exists() else {}
+_set_nested(cfg, "provider_routing", {"only": only, "data_collection": "deny"})
+if effort:
+    _set_nested(cfg, "agent.reasoning_overrides", {model: effort})
+if vision_provider:
+    _set_nested(cfg, "auxiliary.vision.provider", vision_provider)
+    _set_nested(cfg, "auxiliary.vision.model", vision_model)
+ensure_hermes_home()
+atomic_yaml_write(p, cfg, sort_keys=False)
+print(f"✓ Set provider_routing only={only} data_collection=deny"
+      + (f", agent.reasoning_overrides {model}={effort}" if effort else "")
+      + (f", auxiliary.vision {vision_provider}/{vision_model}" if vision_provider else "")
+      + f" in {p}")
+PYEOF
+}
+
 case "${HERMES_MODE:-service}" in
   service)
     # Same command docker-compose.yml already runs today (`gateway: command:
@@ -1910,6 +1968,11 @@ PYEOF
     # would be thinkingBudget, a different knob, and would trade answer quality for
     # tokens -- not this item's call to make.
     hermes config set agent.reasoning_effort none
+
+    # openfathom-meta ENG-171: a no-op unless HERMES_INFERENCE_PROVIDER=openrouter (see
+    # of_configure_openrouter_route). After the global `none` above, which its per-model
+    # override deliberately outranks for the one model whose reasoning cannot be disabled.
+    of_configure_openrouter_route
 
     # openfathom-meta ADR-043 / ENG-51: scope host-execution tools OUT of the
     # always-on gateway. The inventory (references/gateway-tool-surface.md) measured
