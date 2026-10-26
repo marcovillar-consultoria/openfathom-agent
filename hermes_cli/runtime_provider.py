@@ -7,8 +7,11 @@ OpenRouter/bare-custom, Bedrock and external-process builders in
 
 from __future__ import annotations
 
+import copy
 import logging
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
@@ -22,7 +25,7 @@ from agent.credential_pool import (  # custom_provider_pool_key_candidates is re
 from agent.secret_scope import get_secret_str
 from hermes_cli.auth import (  # resolve_external_process_provider_credentials is read via origin by runtime_provider_backends
     ACTUAL_LOCAL_NOAUTH_PLACEHOLDER, AuthError, DEFAULT_CODEX_BASE_URL, DEFAULT_QWEN_BASE_URL, DEFAULT_XAI_OAUTH_BASE_URL,
-    PROVIDER_REGISTRY, _agent_key_is_usable, _nous_inference_env_override, format_auth_error, resolve_provider,
+    PROVIDER_REGISTRY, _agent_key_is_usable, _nous_inference_env_override, _qwen_base_url, format_auth_error, resolve_provider,
     resolve_nous_runtime_credentials, resolve_codex_runtime_credentials, resolve_xai_oauth_runtime_credentials,
     resolve_qwen_runtime_credentials, resolve_api_key_provider_credentials,
     resolve_external_process_provider_credentials,
@@ -35,11 +38,47 @@ from hermes_cli.providers import determine_api_mode, get_provider, is_actual_rou
 from utils import base_url_host_matches, base_url_hostname, base_url_path, env_int
 
 
+# A frozen session route's config (``frozen_runtime_config``); None = the live profile config.
+_FROZEN_RUNTIME_CONFIG: ContextVar[Optional[dict[str, Any]]] = ContextVar("_FROZEN_RUNTIME_CONFIG", default=None)
+
+
+@contextmanager
+def frozen_runtime_config(config: dict[str, Any]):
+    """Resolve against a session's frozen config instead of the live config.yaml.
+
+    Every rung reads its endpoint through ``load_config``/``_get_model_config``, so a frozen route's
+    credential stays paired with the endpoint it was frozen with after a live ``model.base_url``
+    edit (R2-M2). The auth store (credential pool) is not config and still refreshes/rotates.
+    """
+    merged = _config_mod._deep_merge(copy.deepcopy(_config_mod.DEFAULT_CONFIG), config)
+    token = _FROZEN_RUNTIME_CONFIG.set(merged)
+    try:
+        yield
+    finally:
+        _FROZEN_RUNTIME_CONFIG.reset(token)
+
+
+_DEFER_TOKEN_MINT: ContextVar[bool] = ContextVar("_DEFER_TOKEN_MINT", default=False)
+
+
+@contextmanager
+def deferred_token_mint():
+    """Resolve the route without exchanging short-lived OAuth tokens up front (Vertex today): the
+    resolved ``api_key`` is a callable that mints on first use. For the gateway-backed classic
+    CLI, whose gateway session mints its own token for every turn it runs."""
+    token = _DEFER_TOKEN_MINT.set(True)
+    try:
+        yield
+    finally:
+        _DEFER_TOKEN_MINT.reset(token)
+
+
 # Late-bound delegates, deliberately NOT module-level from-imports: this module is often imported
 # lazily, so its first import can happen while a test has ``hermes_cli.config.load_config`` patched
 # — a from-import would bind the MagicMock permanently and poison every later caller.
 def load_config():
-    return _config_mod.load_config()
+    frozen = _FROZEN_RUNTIME_CONFIG.get()
+    return copy.deepcopy(frozen) if frozen is not None else _config_mod.load_config()
 
 
 def get_compatible_custom_providers(config=None):
@@ -496,7 +535,10 @@ def resolve_requested_provider(requested: Optional[str] = None) -> str:
     cfg_provider = _get_model_config().get("provider")
     if isinstance(cfg_provider, str) and cfg_provider.strip():
         return cfg_provider.strip().lower()
-    return get_secret_str("HERMES_INFERENCE_PROVIDER", "").strip().lower() or "auto"
+    from agent.session_client_env import bound_client_env
+    client = bound_client_env()  # a local session's turn: its client's export, never the daemon's
+    requested = client.get("HERMES_INFERENCE_PROVIDER", "") if client is not None else get_secret_str("HERMES_INFERENCE_PROVIDER", "")
+    return requested.strip().lower() or "auto"
 
 
 # ── extracted collaborators (re-exported; see module docstring) ────────────────────────────
@@ -696,6 +738,14 @@ def _explicit_codex(requested_provider, model_cfg, api_key, explicit_base_url, t
                     requested_provider=requested_provider)
 
 
+def _explicit_qwen(requested_provider, model_cfg, api_key, explicit_base_url, target_model):
+    # A supplied token is the credential: the Qwen CLI login is read only when none was given.
+    api_key, base_url, expires_at_ms = _creds_fallback(api_key, explicit_base_url, explicit_base_url or _qwen_base_url(),
+                                                       None, "expires_at_ms", resolve_qwen_runtime_credentials)
+    return _runtime("qwen-oauth", "chat_completions", base_url, api_key, source="explicit", expires_at_ms=expires_at_ms,
+                    requested_provider=requested_provider)
+
+
 def _explicit_nous(requested_provider, model_cfg, api_key, explicit_base_url, target_model):
     state = auth_mod.get_provider_auth_state("nous") or {}
     base_url = (explicit_base_url or _nous_inference_env_override()
@@ -745,7 +795,7 @@ def _explicit_api_key_provider(provider, pconfig, requested_provider, model_cfg,
 # Providers with a dedicated explicit-credential builder; everything else goes through the
 # registry ``api_key`` path (or None when the provider takes no explicit creds).
 _EXPLICIT_RESOLVERS: dict[str, Callable[..., dict[str, Any]]] = {
-    "anthropic": _explicit_anthropic, "openai-codex": _explicit_codex, "nous": _explicit_nous,
+    "anthropic": _explicit_anthropic, "openai-codex": _explicit_codex, "nous": _explicit_nous, "qwen-oauth": _explicit_qwen,
     "azure-foundry": lambda rq, mc, key, url, tm: _resolve_azure_foundry_runtime(requested_provider=rq, model_cfg=mc,
                                                                                  explicit_api_key=key, explicit_base_url=url),
 }
@@ -878,7 +928,7 @@ _LOCAL_BYPASS_CLOUD_HOSTS = ("openrouter.ai", "anthropic.com", "openai.com")
 def _raise_if_provider_disabled(requested_provider: str) -> None:
     """Honour ``providers.<name>.enabled: false`` for built-ins too (the custom lookup gate only
     covers custom blocks); a typed error lets the fallback chain advance."""
-    full_cfg = _config_mod.load_config()
+    full_cfg = load_config()
     provs_cfg = full_cfg.get("providers") if isinstance(full_cfg, dict) else None
     block = provs_cfg.get(requested_provider) if isinstance(provs_cfg, dict) else None
     if isinstance(block, dict) and not _config_mod.is_provider_enabled(block):
@@ -920,9 +970,14 @@ def _raise_if_local_alias_missing_endpoint(requested_provider: str, explicit_bas
 def _resolve_vertex_runtime(requested_provider: str) -> dict[str, Any]:
     """Vertex AI (OAuth2). The credential *path* (GOOGLE_APPLICATION_CREDENTIALS) must never be
     treated as a static API key; a short-lived token is minted per call, and mid-session expiry is
-    recovered on 401 by run_agent._try_refresh_vertex_client_credentials()."""
-    from agent.vertex_adapter import get_vertex_config
-    token, base_url = get_vertex_config()
+    recovered on 401 by run_agent._try_refresh_vertex_client_credentials(). Under
+    :func:`deferred_token_mint` the credentials are loaded (same failure copy) but the token is a
+    callable minted on first use, so a process that only routes never exchanges a JWT."""
+    from agent.vertex_adapter import get_vertex_base_url, get_vertex_config, vertex_access_token
+    if _DEFER_TOKEN_MINT.get():
+        token, base_url = vertex_access_token, get_vertex_base_url()
+    else:
+        token, base_url = get_vertex_config()
     if not token or not base_url:
         raise AuthError("Vertex AI credentials could not be resolved. Vertex uses OAuth2 (not a static API key): provide a "
                         "service-account JSON via GOOGLE_APPLICATION_CREDENTIALS (or VERTEX_CREDENTIALS_PATH) in ~/.hermes/.env, "
