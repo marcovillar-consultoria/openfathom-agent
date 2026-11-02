@@ -633,6 +633,10 @@ jobs:
           - [ ] o julgamento desta imagem esta na bitacora (\`openfathom-meta/docs/execution/\`), citando o digest novo: o que ela muda em runtime, ou a frase dizendo que nao muda nada
           - [ ] \`plan\` verde (roda \`check_pinned_images_exist.py\`; um \`plan\` verde de dias atras NAO reexecuta -- \`strict_required_status_checks_policy\` e false)
           - [ ] o que a imagem nova traz, e como confirmar depois do apply
+
+          Porta e raio (openfathom-meta ENG-251):
+          - **Raio do estrago:** tudo o que le \`hermes_agent_image\` no \`openfathom-infra\`: a VM \`hermes-gateway-vm\` e substituida (o gateway reinicia no apply), o Cloud Run Job \`hermes_research_runner\` troca de imagem, e o \`keep-deployed\` do Artifact Registry passa a proteger o digest novo. A contagem esperada e a do \`plan\` deste PR; nao confie num numero fixo.
+          - **Rollback:** porta de mao dupla SO enquanto \`${OLD_DIGEST}\` existir no Artifact Registry. Ate este apply, o \`keep-deployed\` o protege; depois, so enquanto ele estiver entre as 2 imagens mais novas do \`of-agent\` (\`keep-recent\`) ou tiver menos de 7 dias (\`delete-old\`): o proximo build do \`of-agent\` o tira das 2 mais novas, e dai ele e apagado assim que tiver 7 dias. Confira antes com \`gcloud artifacts docker images list us-central1-docker.pkg.dev/openfathom-prod/openfathom-images/of-agent --include-tags\`. O procedimento e a secao 2 do \`docs/incident-response/README.md\` do \`openfathom-runbooks\`, a comecar pela conferencia da chave da Anthropic que ela pede antes do revert: \`git revert -m 1 --no-commit <merge-sha>\`, \`git checkout <merge-sha> -- docs/promotions.md\` e uma entrada de rollback no \`promotions.md\`. Nunca o \`revert\` comum: ele apaga a entrada deste PR, e o arquivo e append-only.
           EOF
             )
             if [ "${#superseded[@]}" -gt 0 ]; then
