@@ -1174,22 +1174,24 @@ check "display.language set to pt" \
 check "stale 'display.language does not accept pt' claim is gone" \
   "0" "$(grep -c 'display.language does not accept pt' "$ENTRYPOINT")"
 
-# openfathom-meta ENG-84: model.max_tokens ceiling, so an unbounded 64k default
-# request never again triggers OpenRouter's HTTP 402 preflight-balance rejection.
-# Structural check, same reasoning as ENG-83 above -- hermes_cli internals aren't
-# importable in this bash-only test job.
-check "model.max_tokens set to a realistic ceiling, unconditionally" \
-  "1" "$(grep -c 'hermes config set model.max_tokens 12000' "$ENTRYPOINT")"
+# openfathom-meta ENG-316: the entrypoint no longer writes model.max_tokens -- no code
+# reads the key since upstream fd3565deec. A TEXT check, and only that: it proves the
+# line is gone from the file, not what Hermes does with its output cap. It replaces a
+# case that grepped the line in, which proved the line written and never the line read.
+check "model.max_tokens is not written by the entrypoint (ENG-316)" \
+  "0" "$(grep -c 'hermes config set model.max_tokens' "$ENTRYPOINT")"
 
 # openfathom-meta ENG-101: prompt_caching.cache_ttl 1h, so a >5-minute pause between
 # Telegram turns no longer forces a 1.25x cache write where a 0.1x cache read would do.
-# Structural check, same reasoning as model.max_tokens above.
+# Structural check, same reasoning as ENG-83 above -- hermes_cli internals aren't
+# importable in this bash-only test job.
 check "prompt_caching.cache_ttl set to 1h, unconditionally" \
   "1" "$(grep -c 'hermes config set prompt_caching.cache_ttl 1h' "$ENTRYPOINT")"
 
 # openfathom-meta ENG-283: per-message timestamps, so the model sees the current date
 # in every turn instead of the session's frozen "Conversation started:" line.
-# Structural check, same reasoning as model.max_tokens above.
+# Structural check, same reasoning as ENG-83 above -- hermes_cli internals aren't
+# importable in this bash-only test job.
 check "gateway.message_timestamps.enabled set to true, unconditionally" \
   "1" "$(grep -c 'hermes config set gateway.message_timestamps.enabled true' "$ENTRYPOINT")"
 

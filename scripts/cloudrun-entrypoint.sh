@@ -1875,15 +1875,10 @@ case "${HERMES_MODE:-service}" in
       hermes config set model.default "${HERMES_INFERENCE_MODEL}"
     fi
 
-    # openfathom-meta ENG-84. Two real production outages (2026-07-24, 12:23 and
-    # 13:04) with HTTP 402 from OpenRouter -- "requested up to 64000 tokens, but can
-    # only afford 6216/63067" -- because model.max_tokens was never set, so Hermes
-    # used the model's 64k default. A realistic ceiling doesn't fix the cause (the
-    # OpenRouter top-up friction ENG-83 targets), only the preflight-balance rejection
-    # that turns it into a full request failure. 12000 is inside the ~8-16k band
-    # ENG-84 sized as "enough for a chat reply" -- unconditional because there is no
-    # deployment of this image where a bare chat reply needs the model's full 64k.
-    hermes config set model.max_tokens 12000
+    # No model.max_tokens here since openfathom-meta ENG-316 (2026-11): the line this
+    # script wrote for ENG-84 had no reader since upstream fd3565deec ("remove dedicated
+    # user-facing output cap controls"), and the HTTP 402 of 2026-10-31 asked OpenRouter for
+    # "up to 131072 tokens" with it in force. Removed, and the 402 risk accepted.
 
     # openfathom-meta ENG-101. Never set, so production ran on the 5m default.
     # Measured from a real session's session_model_usage (2026-07-28):
@@ -1892,8 +1887,8 @@ case "${HERMES_MODE:-service}" in
     # expires between Telegram turns. The write share, not the read share, is
     # what a longer TTL targets; 1h write costs 2x instead, but amortizes
     # across the paused-then-resumed conversation pattern this gateway sees.
-    # Unconditional, same reasoning as model.max_tokens above -- no deployment
-    # of this image benefits from the 5m default over 1h.
+    # Unconditional -- no deployment of this image benefits from the 5m default
+    # over 1h.
     hermes config set prompt_caching.cache_ttl 1h
 
     if [[ -n "${HERMES_TIMEZONE:-}" ]]; then
