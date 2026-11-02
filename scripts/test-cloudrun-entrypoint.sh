@@ -987,11 +987,19 @@ of_memories_generation=1; of_state_epoch=0
 LOOP_LOG="$WORK/loop-cycles.log"
 ( of_memories_sync_loop > "$LOOP_LOG" 2>&1 ) &
 loop_pid=$!
-sleep 0.9
+# Wait for the cycles, never a fixed `sleep 0.9`: that failed 5 runs in 10 on a loaded
+# machine (openfathom-meta ENG-313, 2026-11-02). What this case protects is that the loop
+# ticks AGAIN on its own, not how fast; a loop that ticks once and stops still fails here,
+# after the deadline.
+cycles=0
+for _ in $(seq 1 200); do   # up to ~20s
+  cycles="$(grep -c 'snapshot uploaded to gs://test-bucket/memories.tar.gz' "$LOOP_LOG")"
+  [[ "$cycles" -ge 2 ]] && break
+  sleep 0.1
+done
 kill -TERM "$loop_pid" 2>/dev/null || true
 wait "$loop_pid" 2>/dev/null || true
-cycles="$(grep -c 'snapshot uploaded to gs://test-bucket/memories.tar.gz' "$LOOP_LOG")"
-check "at least 2 sync cycles ran in ~0.9s at a 0.2s interval" "1" "$([[ "$cycles" -ge 2 ]] && echo 1 || echo 0)"
+check "the loop ticks again on its own (>=2 cycles within ~20s)" "1" "$([[ "$cycles" -ge 2 ]] && echo 1 || echo 0)"
 
 echo "== case: of_memories_sync_loop -- an entry written mid-session survives a HARD kill (SIGKILL, never of_on_term) =="
 reset_stub
@@ -1001,16 +1009,39 @@ export HERMES_HOME="$MEM_HOME8"
 export HERMES_MEMORIES_OBJECT="memories.tar.gz"
 export HERMES_MEMORY_SYNC_INTERVAL_SECONDS="0.2"
 of_memories_generation=1; of_state_epoch=0
-( of_memories_sync_loop > /dev/null 2>&1 ) &
+LOOP8_LOG="$WORK/loop8-cycles.log"
+( of_memories_sync_loop > "$LOOP8_LOG" 2>&1 ) &
 loop8_pid=$!
-sleep 0.3   # let >=1 tick complete
+# Wait for the EFFECT, never a fixed sleep: two `sleep 0.3` here flapped on a loaded
+# machine (openfathom-meta ENG-313), the same shape the state-sync crash case below
+# already fixed on 2026-08-21. First, the loop has demonstrably ticked once.
+for _ in $(seq 1 200); do   # up to ~20s
+  [[ "$(grep -c 'snapshot uploaded to' "$LOOP8_LOG")" -ge 1 ]] && break
+  sleep 0.1
+done
 mk_mem_file "$MEM_HOME8/memories" "MEMORY.md" "entry written before boot" "entry written mid-session, never gracefully shut down"
-sleep 0.3   # let a tick pick up the new entry
+# Then, a later tick carried the new entry to GCS. Each branch records WHY it has not
+# succeeded yet, so a regression does not read like a slow runner.
+mem8_rows=""
+mem8_diag="no attempt completed"
+for _ in $(seq 1 200); do   # up to ~20s
+  if [[ ! -s "$UPLOADED" ]]; then
+    mem8_diag="no tarball uploaded yet"; sleep 0.1; continue
+  fi
+  rm -rf "$WORK/crash-extract8"; mkdir -p "$WORK/crash-extract8"
+  if ! tar_err="$(tar xzf "$UPLOADED" -C "$WORK/crash-extract8" 2>&1)"; then
+    mem8_diag="tar failed: $tar_err"; sleep 0.1; continue
+  fi
+  mem8_rows="$(mem_file_entries "$WORK/crash-extract8/MEMORY.md" | grep -c '^entry written mid-session, never gracefully shut down$')"
+  [[ "$mem8_rows" == "1" ]] && { mem8_diag="ok"; break; }
+  mem8_diag="tarball reached, but it holds $mem8_rows matching entr(y/ies)"
+  sleep 0.1
+done
 kill -9 "$loop8_pid" 2>/dev/null || true   # SIGKILL -- of_on_term, of_state_snapshot, of_memories_snapshot's final flush NEVER run
 wait "$loop8_pid" 2>/dev/null || true
-mkdir -p "$WORK/crash-extract8"; tar xzf "$UPLOADED" -C "$WORK/crash-extract8" 2>/dev/null
+[[ "$mem8_rows" == "1" ]] || echo "  diag: $mem8_diag"
 check "the mid-session entry reached GCS through a periodic tick, with no graceful shutdown at all" \
-  "1" "$(mem_file_entries "$WORK/crash-extract8/MEMORY.md" | grep -c '^entry written mid-session, never gracefully shut down$')"
+  "1" "$mem8_rows"
 
 echo "== case: of_memories_sync_loop -- TERM interrupts immediately, does not wait out the interval =="
 reset_stub
@@ -1690,9 +1721,9 @@ env_key() { grep '^API_SERVER_KEY=' "$1/.env" | sed 's/^API_SERVER_KEY=//'; }
 # The generated-key case: exactly what the new stage2 block leaves behind.
 RH1="$WORK/recon1"
 mk_env_file "$RH1" "ANTHROPIC_API_KEY=sk-from-dotenv" "API_SERVER_KEY=deadbeefgenerated0123456789abcdef"
-HERMES_HOME="$RH1" API_SERVER_KEY="canonical-from-secret-manager-000" of_reconcile_api_server_key >/dev/null 2>&1
-check "generated key replaced by the Secret Manager value" \
-  "canonical-from-secret-manager-000" "$(env_key "$RH1")"
+HERMES_HOME="$RH1" API_SERVER_KEY="canonical-from-container-env-0000" of_reconcile_api_server_key >/dev/null 2>&1
+check "generated key replaced by the container's env var" \
+  "canonical-from-container-env-0000" "$(env_key "$RH1")"
 check "exactly ONE assignment remains (dotenv keeps the last -- a leftover would shadow us)" \
   "1" "$(grep -c '^API_SERVER_KEY=' "$RH1/.env")"
 check "unrelated lines survive untouched" \

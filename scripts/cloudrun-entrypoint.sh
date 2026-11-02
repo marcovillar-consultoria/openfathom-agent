@@ -1661,11 +1661,13 @@ of_write_soul() {
 #
 # Why that is not harmless here: hermes_cli/env_loader.py's load_hermes_dotenv() loads
 # $HERMES_HOME/.env with `override=True`, and its own docstring says it "overrides stale
-# shell-exported values". Our key arrives as a container env var out of Secret Manager
-# (hermes-gateway-api-key) -- precisely what that override replaces. The gateway would
-# still START, because a 64-char key does exist, so nothing fails loudly; what breaks is
-# that the key in USE stops being the key Secret Manager holds, which makes the rotation
-# runbook (openfathom-meta ENG-105) rotate a value nobody reads.
+# shell-exported values". Our key arrives as a container env var -- precisely what that
+# override replaces. Since openfathom-meta ENG-308 (a) the VM launcher generates that env
+# var on every container start (openfathom-infra modules/gateway_vm/launcher.sh.tftpl);
+# before it, the value came out of Secret Manager (hermes-gateway-api-key, now destroyed).
+# The gateway would still START, because a 64-char key does exist, so nothing fails
+# loudly; what breaks is that the key in USE stops being the key the container was
+# given, so whatever was handed the env var's value holds a key nobody checks.
 #
 # This reconciles instead of pre-writing because we cannot get ahead of the generator:
 # stage2-hook runs in cont-init, BEFORE this script. Measured in production on revision
@@ -1693,7 +1695,7 @@ of_reconcile_api_server_key() {
   # deliberately tightened. A `mv` would land a fresh file with the default umask.
   cat "$tmp" > "$env_file" || { echo "[of-apikey] WARN: could not rewrite $env_file; the dotenv value stays in force" >&2; rm -f "$tmp"; return 0; }
   rm -f "$tmp"
-  echo "[of-apikey] reconciled API_SERVER_KEY in $env_file with the Secret Manager value (dotenv override=True would otherwise win)"
+  echo "[of-apikey] reconciled API_SERVER_KEY in $env_file with the container's env var (dotenv override=True would otherwise win)"
 }
 
 # openfathom-meta ENG-171 (2026-10-17): the reasoning effort, written so the resolver reads it.
@@ -1727,11 +1729,12 @@ print(f"✓ Set agent.reasoning_effort='medium', telegram show_reasoning=false i
 PYEOF
 }
 
-# openfathom-meta ENG-171 (2026-10-17): the GLM-5.3 trial routes the main model through
-# OpenRouter, and OpenRouter by default falls back to ANY host serving the model --
-# Chinese hosts included -- while the Sonda's conversations carry personal data. Only when
-# the provider is openrouter, so an anthropic deployment of this image is untouched, this
-# writes the trial's pins, and EVERY pin fails closed: a missing one refuses to boot,
+# openfathom-meta ENG-171 (2026-10-17): the primary route -- GLM-5.3 through OpenRouter, a
+# trial on 2026-10-17 and the primary since openfathom-meta ADR-077 -- and OpenRouter by
+# default falls back to ANY host serving the model -- Chinese hosts included -- while the
+# Sonda's conversations carry personal data. Only when the provider is openrouter, so an
+# anthropic deployment of this image is untouched, this writes the route's pins, and
+# EVERY pin fails closed: a missing one refuses to boot,
 # because each of them, missing, degrades silently (the adversarial reviews of the trial's
 # plan and diff, openfathom-meta 2026-10-17).
 #   provider_routing -- `only` the hosts in HERMES_OPENROUTER_ONLY, data_collection deny.
@@ -1834,7 +1837,7 @@ case "${HERMES_MODE:-service}" in
     #    erroring out with only HOST/PORT set. Same shape as HERMES_TASK
     #    below: fail fast and loud instead of silently running unreachable.
     if [[ -z "${API_SERVER_KEY:-}" ]]; then
-      echo "ERROR: API_SERVER_KEY must be set when HERMES_MODE=service (>=16 chars, e.g. \`openssl rand -hex 32\` from Secret Manager)" >&2
+      echo "ERROR: API_SERVER_KEY must be set when HERMES_MODE=service (>=16 chars; on the gateway VM the launcher generates it on every container start)" >&2
       exit 1
     fi
     # Must run BEFORE `hermes gateway run` below: that is what loads the dotenv that
