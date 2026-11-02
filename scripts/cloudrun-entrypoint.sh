@@ -1661,11 +1661,13 @@ of_write_soul() {
 #
 # Why that is not harmless here: hermes_cli/env_loader.py's load_hermes_dotenv() loads
 # $HERMES_HOME/.env with `override=True`, and its own docstring says it "overrides stale
-# shell-exported values". Our key arrives as a container env var out of Secret Manager
-# (hermes-gateway-api-key) -- precisely what that override replaces. The gateway would
-# still START, because a 64-char key does exist, so nothing fails loudly; what breaks is
-# that the key in USE stops being the key Secret Manager holds, which makes the rotation
-# runbook (openfathom-meta ENG-105) rotate a value nobody reads.
+# shell-exported values". Our key arrives as a container env var -- precisely what that
+# override replaces. Since openfathom-meta ENG-308 (a) the VM launcher generates that env
+# var on every container start (openfathom-infra modules/gateway_vm/launcher.sh.tftpl);
+# before it, the value came out of Secret Manager (hermes-gateway-api-key, now destroyed).
+# The gateway would still START, because a 64-char key does exist, so nothing fails
+# loudly; what breaks is that the key in USE stops being the key the container was
+# given, so whatever was handed the env var's value holds a key nobody checks.
 #
 # This reconciles instead of pre-writing because we cannot get ahead of the generator:
 # stage2-hook runs in cont-init, BEFORE this script. Measured in production on revision
@@ -1693,7 +1695,7 @@ of_reconcile_api_server_key() {
   # deliberately tightened. A `mv` would land a fresh file with the default umask.
   cat "$tmp" > "$env_file" || { echo "[of-apikey] WARN: could not rewrite $env_file; the dotenv value stays in force" >&2; rm -f "$tmp"; return 0; }
   rm -f "$tmp"
-  echo "[of-apikey] reconciled API_SERVER_KEY in $env_file with the Secret Manager value (dotenv override=True would otherwise win)"
+  echo "[of-apikey] reconciled API_SERVER_KEY in $env_file with the container's env var (dotenv override=True would otherwise win)"
 }
 
 # openfathom-meta ENG-171 (2026-10-17): the reasoning effort, written so the resolver reads it.
@@ -1727,11 +1729,29 @@ print(f"✓ Set agent.reasoning_effort='medium', telegram show_reasoning=false i
 PYEOF
 }
 
-# openfathom-meta ENG-171 (2026-10-17): the GLM-5.3 trial routes the main model through
-# OpenRouter, and OpenRouter by default falls back to ANY host serving the model --
-# Chinese hosts included -- while the Sonda's conversations carry personal data. Only when
-# the provider is openrouter, so an anthropic deployment of this image is untouched, this
-# writes the trial's pins, and EVERY pin fails closed: a missing one refuses to boot,
+# openfathom-meta ENG-349 (2026-11-02): an absolute cap on the compression trigger. The
+# ratio threshold (compression.threshold 0.50, hermes_cli/config_defaults.py) on GLM-5.3's
+# ~1M window lets a session grow to ~500K tokens before compressing, and a long prompt
+# that misses the cache is the cost peak: the OpenRouter Activity CSV read on 2026-11-02
+# (openfathom-meta docs/execution/of-13.md, block 54.7) showed the average cost per
+# generation 5.5x lower (US$0.119 / US$0.0216) after a /new than before it -- a cut by time,
+# not by session, so the gain here is an estimate -- and the five most expensive generations
+# sent 338,976 to 475,665 prompt tokens with 0 to 6,144 cached. agent/agent_init.py reads threshold_tokens as "lower of ratio threshold and
+# this", so 150000 only ever LOWERS the trigger. The Tech Lead's number ("150 mil, no PR de
+# amanhã"), not a measured optimum. What it costs: compression is lossy; it now runs
+# earlier and more often, billed on the auxiliary compression model; and each compression
+# rewrites the prompt prefix, so the turn after it misses the cache. Its own function so
+# the build-check step runs it inside the image; the test suite checks the call site.
+of_configure_compression() {
+  hermes config set compression.threshold_tokens 150000
+}
+
+# openfathom-meta ENG-171 (2026-10-17): the primary route -- GLM-5.3 through OpenRouter, a
+# trial on 2026-10-17 and the primary since openfathom-meta ADR-077 -- and OpenRouter by
+# default falls back to ANY host serving the model -- Chinese hosts included -- while the
+# Sonda's conversations carry personal data. Only when the provider is openrouter, so an
+# anthropic deployment of this image is untouched, this writes the route's pins, and
+# EVERY pin fails closed: a missing one refuses to boot,
 # because each of them, missing, degrades silently (the adversarial reviews of the trial's
 # plan and diff, openfathom-meta 2026-10-17).
 #   provider_routing -- `only` the hosts in HERMES_OPENROUTER_ONLY, data_collection deny.
@@ -1834,7 +1854,7 @@ case "${HERMES_MODE:-service}" in
     #    erroring out with only HOST/PORT set. Same shape as HERMES_TASK
     #    below: fail fast and loud instead of silently running unreachable.
     if [[ -z "${API_SERVER_KEY:-}" ]]; then
-      echo "ERROR: API_SERVER_KEY must be set when HERMES_MODE=service (>=16 chars, e.g. \`openssl rand -hex 32\` from Secret Manager)" >&2
+      echo "ERROR: API_SERVER_KEY must be set when HERMES_MODE=service (>=16 chars; on the gateway VM the launcher generates it on every container start)" >&2
       exit 1
     fi
     # Must run BEFORE `hermes gateway run` below: that is what loads the dotenv that
@@ -1872,15 +1892,10 @@ case "${HERMES_MODE:-service}" in
       hermes config set model.default "${HERMES_INFERENCE_MODEL}"
     fi
 
-    # openfathom-meta ENG-84. Two real production outages (2026-07-24, 12:23 and
-    # 13:04) with HTTP 402 from OpenRouter -- "requested up to 64000 tokens, but can
-    # only afford 6216/63067" -- because model.max_tokens was never set, so Hermes
-    # used the model's 64k default. A realistic ceiling doesn't fix the cause (the
-    # OpenRouter top-up friction ENG-83 targets), only the preflight-balance rejection
-    # that turns it into a full request failure. 12000 is inside the ~8-16k band
-    # ENG-84 sized as "enough for a chat reply" -- unconditional because there is no
-    # deployment of this image where a bare chat reply needs the model's full 64k.
-    hermes config set model.max_tokens 12000
+    # No model.max_tokens here since openfathom-meta ENG-316 (2026-11): the line this
+    # script wrote for ENG-84 had no reader since upstream fd3565deec ("remove dedicated
+    # user-facing output cap controls"), and the HTTP 402 of 2026-10-31 asked OpenRouter for
+    # "up to 131072 tokens" with it in force. Removed, and the 402 risk accepted.
 
     # openfathom-meta ENG-101. Never set, so production ran on the 5m default.
     # Measured from a real session's session_model_usage (2026-07-28):
@@ -1889,8 +1904,8 @@ case "${HERMES_MODE:-service}" in
     # expires between Telegram turns. The write share, not the read share, is
     # what a longer TTL targets; 1h write costs 2x instead, but amortizes
     # across the paused-then-resumed conversation pattern this gateway sees.
-    # Unconditional, same reasoning as model.max_tokens above -- no deployment
-    # of this image benefits from the 5m default over 1h.
+    # Unconditional -- no deployment of this image benefits from the 5m default
+    # over 1h.
     hermes config set prompt_caching.cache_ttl 1h
 
     if [[ -n "${HERMES_TIMEZONE:-}" ]]; then
@@ -2033,6 +2048,9 @@ PYEOF
     # The line that stood here -- `hermes config set agent.reasoning_effort none` -- stopped
     # taking effect in 2026-08: see of_configure_reasoning_effort, which replaces it.
     of_configure_reasoning_effort
+
+    # openfathom-meta ENG-349: the absolute compression cap (see of_configure_compression).
+    of_configure_compression
 
     # openfathom-meta ENG-171: a no-op unless HERMES_INFERENCE_PROVIDER=openrouter (see
     # of_configure_openrouter_route). After the global `medium` above, which its per-model

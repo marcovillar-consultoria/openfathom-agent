@@ -46,12 +46,14 @@ RUN chmod +x /opt/hermes/scripts/cloudrun-entrypoint.sh
 # discipline as openfathom-bridges' provider pins.
 #
 # The pin must ALSO be older than the resolver's window: pyproject.toml sets
-# `exclude-newer = "14 days"`, so `uv` refuses any release published inside
-# it and reports the pin as if the version did not exist at all --
+# `exclude-newer` (read the value there; upstream changes it), so `uv` refuses any
+# release published inside that window and reports the pin as if the version did not
+# exist at all --
 # "Because there is no version of pypdf==X, we can conclude that your
 # requirements are unsatisfiable". That is what broke this build on
-# 2026-08-21: pypdf 6.16.1 was published 2026-08-14, seven days before, so
-# the latest release was unbuildable BY CONSTRUCTION. 6.15.0 (2026-08-06)
+# 2026-08-21: pypdf 6.16.1 was published 2026-08-14, seven days before and
+# inside that day's 14-day window, so the latest release was unbuildable BY
+# CONSTRUCTION. 6.15.0 (2026-08-06)
 # is the newest one outside the window, and a pin only ages further out of
 # it. When bumping this, check the upload date, not just the version.
 #
