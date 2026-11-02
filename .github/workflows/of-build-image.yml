@@ -75,6 +75,10 @@ jobs:
   validate-scope:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # Job-level `permissions` REPLACES the workflow's `id-token: write`: this job installs a
+    # package from PyPI (the ruff step below) and needs no cloud identity to read the repo.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -92,6 +96,29 @@ jobs:
 
       - name: Validate fork scope (ADR-002, amended by ADR-035 and ADR-050)
         run: python3 scripts/validate-fork-scope.py
+
+      # openfathom-meta ENG-314. Upstream's ruff no longer reports on our PRs (its lanes
+      # queue on runners this account does not have), and it was upstream's ruff that
+      # caught PLW1510 in validate-fork-scope.py on 2026-10-13. Same version and upstream's
+      # rules: the pin is read from pyproject.toml, and the rules come from ruff.toml at the
+      # root, which takes precedence over [tool.ruff] in pyproject.toml. PLW1510 -- the rule
+      # of that defect -- is added with --extend-select, so a sync that drops it from
+      # ruff.toml, or deletes ruff.toml (pyproject.toml's select lacks it), cannot silence
+      # this step. Fails closed when the pin cannot be read. Mutant, measured 2026-11-02
+      # with ruff 0.15.22: dropping `check=False` from the subprocess.run in
+      # validate-fork-scope.py fails this step; the file as-is passes.
+      - name: Ruff on the fork's Python file (openfathom-meta ENG-314)
+        run: |
+          pin="$(grep -oE '"ruff==[0-9][0-9.]*"' pyproject.toml | head -1 | tr -d '"')"
+          if [ -z "$pin" ]; then
+            echo "::error title=No ruff pin::pyproject.toml carries no \"ruff==X\" pin to run"
+            exit 1
+          fi
+          echo "running $pin"
+          # --target, not a venv or pipx: it needs neither python3-venv nor pipx on the
+          # runner, and leaves the system interpreter untouched (PEP 668).
+          python3 -m pip install --quiet --target "$RUNNER_TEMP/ruff" "$pin"
+          "$RUNNER_TEMP/ruff/bin/ruff" check --extend-select PLW1510 scripts/validate-fork-scope.py
 
   # openfathom-meta ADR-050. No `if:` -- this runs on PRs AND on pushes, and `build`
   # depends on it, so a broken entrypoint cannot become an image. The entrypoint decides
