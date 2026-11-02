@@ -2149,6 +2149,16 @@ check "the route is configured after the global reasoning effort" \
 check "the route is configured after the ENG-83 aux block it overrides" \
   "1" "$([[ -n "$aux_line" && -n "$call_line" && "$call_line" -gt "$aux_line" ]] && echo 1 || echo 0)"
 
+# openfathom-meta ENG-349: build-check cuts of_configure_compression out of the file and runs
+# it alone, so it proves the WRITER and never that the service block CALLS it -- deleting the
+# call would leave every job green. A text check on the call site, between the two writers
+# it sits with. Mutant: the call line removed.
+cc_line=$(grep -n '^    of_configure_compression$' "$ENTRYPOINT" | cut -d: -f1)
+check "the service block calls of_configure_compression exactly once (ENG-349)" \
+  "1" "$(grep -c '^    of_configure_compression$' "$ENTRYPOINT")"
+check "the compression writer is called next to the other config writers (ENG-349)" \
+  "1" "$([[ -n "$cc_line" && -n "$none_line" && -n "$call_line" && "$cc_line" -gt "$none_line" && "$cc_line" -lt "$call_line" ]] && echo 1 || echo 0)"
+
 # ---------------------------------------------------------------------------
 # openfathom-meta ENG-171: of_configure_reasoning_effort. All of it is python, so this file
 # can only prove the text; the build-check job of of-build-image.yml runs it inside the

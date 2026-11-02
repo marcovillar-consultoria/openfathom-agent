@@ -1729,6 +1729,23 @@ print(f"✓ Set agent.reasoning_effort='medium', telegram show_reasoning=false i
 PYEOF
 }
 
+# openfathom-meta ENG-349 (2026-11-02): an absolute cap on the compression trigger. The
+# ratio threshold (compression.threshold 0.50, hermes_cli/config_defaults.py) on GLM-5.3's
+# ~1M window lets a session grow to ~500K tokens before compressing, and a long prompt
+# that misses the cache is the cost peak: the OpenRouter Activity CSV read on 2026-11-02
+# (openfathom-meta docs/execution/of-13.md, block 54.7) showed the average cost per
+# generation 5.5x lower (US$0.119 / US$0.0216) after a /new than before it -- a cut by time,
+# not by session, so the gain here is an estimate -- and the five most expensive generations
+# sent 338,976 to 475,665 prompt tokens with 0 to 6,144 cached. agent/agent_init.py reads threshold_tokens as "lower of ratio threshold and
+# this", so 150000 only ever LOWERS the trigger. The Tech Lead's number ("150 mil, no PR de
+# amanhã"), not a measured optimum. What it costs: compression is lossy; it now runs
+# earlier and more often, billed on the auxiliary compression model; and each compression
+# rewrites the prompt prefix, so the turn after it misses the cache. Its own function so
+# the build-check step runs it inside the image; the test suite checks the call site.
+of_configure_compression() {
+  hermes config set compression.threshold_tokens 150000
+}
+
 # openfathom-meta ENG-171 (2026-10-17): the primary route -- GLM-5.3 through OpenRouter, a
 # trial on 2026-10-17 and the primary since openfathom-meta ADR-077 -- and OpenRouter by
 # default falls back to ANY host serving the model -- Chinese hosts included -- while the
@@ -2031,6 +2048,9 @@ PYEOF
     # The line that stood here -- `hermes config set agent.reasoning_effort none` -- stopped
     # taking effect in 2026-08: see of_configure_reasoning_effort, which replaces it.
     of_configure_reasoning_effort
+
+    # openfathom-meta ENG-349: the absolute compression cap (see of_configure_compression).
+    of_configure_compression
 
     # openfathom-meta ENG-171: a no-op unless HERMES_INFERENCE_PROVIDER=openrouter (see
     # of_configure_openrouter_route). After the global `medium` above, which its per-model
