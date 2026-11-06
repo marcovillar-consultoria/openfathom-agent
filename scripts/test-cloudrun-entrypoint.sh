@@ -1111,6 +1111,30 @@ reset_stub; LIVE=""   # HTTP 404 from the stub
 of_plugins_fetch "$PDIR" >/dev/null 2>&1; rc=$?
 check "404 -> refuses (publish step skipped)"  "1"   "$rc"
 
+# In-harness mutants (so CI re-proves them, not a hand run): each mutated copy of the
+# entrypoint must turn the guarded property red. A mutation that does not change the
+# text proves nothing, so that is a failure too. ENG-332 first, then ENG-338, ENG-361.
+echo "== mutants: ENG-332/338/361 =="
+ro_mutant() { # <label> <sed-expr> <probe-fn>
+  local label="$1" expr="$2" probe="$3" m="$WORK/ro-mutant.sh"
+  sed -e "$expr" "$ENTRYPOINT" > "$m"
+  if cmp -s "$m" "$ENTRYPOINT"; then bad "$label: the mutation did not apply -- a mutant that does not mutate proves nothing"; return; fi
+  if [[ "$($probe "$m")" == "survived" ]]; then bad "$label -- SURVIVED"; else ok "$label -- killed"; fi
+}
+# ENG-332: the boot line that proves the on-demand-install policy from the log (the VM
+# has no ingress). Same fence: top level of service), above the first gateway exec.
+lazy_fence() {
+  local f="$1" svc line ex
+  svc="$(grep -n '^  service)$' "$f" | head -1 | cut -d: -f1)"
+  line="$(grep -n 'echo "\[of-lazy\] HERMES_DISABLE_LAZY_INSTALLS=' "$f" | head -1 | cut -d: -f1)"
+  ex="$(grep -nE '^ +exec hermes gateway run$' "$f" | head -1 | cut -d: -f1)"
+  [[ -n "$svc" && -n "$line" && -n "$ex" && "$line" -gt "$svc" && "$line" -lt "$ex" ]] && echo ok || echo "no (service=$svc line=$line exec=$ex)"
+}
+check "[of-lazy] boot line inside service), before the first gateway exec (ENG-332)" "ok" "$(lazy_fence "$ENTRYPOINT")"
+probe_lazy() { [[ "$(lazy_fence "$1")" == ok ]] && echo survived || echo killed; }
+ro_mutant "[of-lazy] boot line removed (ENG-332)" '/echo "\[of-lazy\] HERMES_DISABLE_LAZY_INSTALLS=/d' probe_lazy
+
+
 echo "== structural: the plugin is enabled ONLY after a successful fetch =="
 # A failed fetch must not leave plugins.enabled pointing at a plugin not on disk. Assert
 # on the source that the enable write sits after the of_plugins_fetch guard.
@@ -1305,11 +1329,21 @@ rm -rf "$CAPS_HOME"; mkdir -p "$CAPS_HOME/shared" "$CAPS_HOME/academic"
 mk_skill "$CAPS_HOME/shared/citation-format" "citation-format" "[]"
 mk_skill "$CAPS_HOME/academic/pr-triage" "pr-triage" "[terminal]"
 
-run_caps() { ( set -euo pipefail; of_skills_dir="$CAPS_HOME" of_soul_capabilities_block ); }
+# ENG-332: the documents line needs the delivered document-reader plugin.
+CAPS_PLUGINS="$WORK/caps-plugins"; mkdir -p "$CAPS_PLUGINS/document-reader"
+printf 'name: document-reader\n' > "$CAPS_PLUGINS/document-reader/plugin.yaml"
+run_caps() { ( set -euo pipefail; of_skills_dir="$CAPS_HOME" of_plugins_dir="$CAPS_PLUGINS" of_soul_capabilities_block ); }
+run_caps_no_plugins() { ( set -euo pipefail; of_skills_dir="$CAPS_HOME" of_plugins_dir="$WORK/no-plugins" of_soul_capabilities_block ); }
 
 out="$(run_caps)"; echo "$out" | sed 's/^/    | /'
 check "header present" \
   "1" "$(grep -c '^## Skills disponíveis agora' <<<"$out")"
+# openfathom-meta ENG-332: read_file no longer converts PDF in this image while its
+# core schema still says it does; the block is where the Sonda learns the real route.
+check "documents are routed to extract_document_text (ENG-332)" \
+  "1" "$(grep -c '^Documentos anexados .*extract_document_text' <<<"$out")"
+check "no document-reader delivered -> no documents line (the block claims no tool it lacks)" \
+  "0" "$(run_caps_no_plugins | grep -c '^Documentos anexados')"
 check "toolset-free skill listed as available" \
   "1" "$(grep -c '^- citation-format$' <<<"$out")"
 check "toolset-requiring skill listed as unavailable, with reason" \

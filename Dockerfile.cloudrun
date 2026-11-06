@@ -85,11 +85,48 @@ RUN chmod +x /opt/hermes/scripts/cloudrun-entrypoint.sh
 # 2026-10-06 and 2026-10-10; with it, the provider reaches the API in 3.5 s
 # (401 for a fake key). 0.4.2 is upstream's own pin for the extra
 # (published 2026-03-09, outside the exclude-newer window).
+#
+# firecrawl-anydoc is REMOVED (openfathom-meta ENG-332). It is a core dependency
+# (pyproject.toml) with a native binary, and read_file uses it to convert PDF and
+# legacy Office/OpenDocument/RTF/EPUB inside the gateway process -- a path ADR-062
+# (pure-Python parsers only) never evaluated, measured in use on 2026-10-25. The
+# Sonda reads PDF/DOCX/XLSX through the document-reader plugin, in a bounded child
+# process. Without anydoc, read_file treats a .pdf as a plain file ("Binary file
+# (PDF document ...)", or the raw source of an all-ASCII PDF): read_extract only
+# counts .pdf as extractable while anydoc imports, and .pdf is not in
+# BINARY_EXTENSIONS. Formats lost to read_file: every anydoc format but PDF, 17
+# extensions (tools/read_extract.py ANYDOC_EXTENSIONS: .doc .docm .ppt .pps .pot
+# .pptx .pptm .ppsx .ppsm .xls .xlsm .xlsb .odt .ods .odp .rtf .epub); the plugin
+# reads only PDF/DOCX/XLSX and archives. NOT fixed here: read_file's own stdlib DOCX/XLSX extraction
+# (read_extract.py, core), which no allowed file can reach -- that went upstream.
+# `uv pip uninstall` of an absent package exits 0, so the import check after it is
+# what fails the build if a sync renames or drops the package.
 RUN set -eu; \
     set -- /opt/hermes/tools/uv-*/uv; \
     [ "$#" -eq 1 ] && [ -x "$1" ] || { echo "expected exactly one PM-staged uv, got: $*" >&2; exit 1; }; \
     "$1" pip install --python /opt/hermes/.venv/bin/python --no-cache-dir \
-        pypdf==6.15.0 openpyxl==3.1.5 parallel-web==0.4.2
+        pypdf==6.15.0 openpyxl==3.1.5 parallel-web==0.4.2; \
+    "$1" pip uninstall --python /opt/hermes/.venv/bin/python firecrawl-anydoc; \
+    if /opt/hermes/.venv/bin/python -c 'import anydoc' 2>/dev/null; then \
+        echo "anydoc still imports after the uninstall (ENG-332)" >&2; exit 1; \
+    fi
+
+# Without anydoc, read_file calls pm.ensure_import("doc-extract"), which would
+# reinstall it into a PM generation under /opt/data/installs -- and a lazy sync of
+# ANY other extra would bring it back too, as a core dependency. This turns every
+# on-demand install off (pm/install.py lazy_installs_allowed reads it before
+# security.allow_lazy_installs). Measured 2026-11-06 on this image without the line:
+# a read_file of a PDF installed anydoc into /opt/data/installs over the network in
+# 34 s, inside the call. What it costs: an extra the image does not carry can no
+# longer arrive at runtime (pm can adopt a new generation in-process, so "it never
+# activated" held for parallel-web, ENG-309, not for every extra); the gateway's
+# left-core plugin migration is off too (hermes_cli/left_core_migration.py), so a
+# future upstream sync that moves a feature the Sonda uses out of core will not
+# install it -- the capability smoke in of-build-image.yml lists what must stay importable. Upstream
+# calls this an internal bridge variable ("Do not put it in .env"); it is set here,
+# in the image, and the build's capability smoke fails if lazy installs are allowed,
+# so a rename upstream turns the build red instead of silently re-enabling them.
+ENV HERMES_DISABLE_LAZY_INSTALLS=1
 
 # hermes-plugins/youtube-transcript (openfathom-bridges, ENG-231) needs
 # youtube-transcript-api, and it is no longer installed here: since the

@@ -1532,7 +1532,11 @@ of_soul_capabilities_block() {
     echo "[of-soul-capabilities] no skills directory this boot -- SOUL.md gets no capabilities block" >&2
     return 0
   fi
-  python3 - "$dir" "${of_disabled_toolsets[@]}" <<'PYEOF'
+  # ENG-332: the documents line below is true only while the document-reader plugin
+  # was delivered this boot (of_plugins_fetch runs before this); otherwise it is left out.
+  local doc_reader=""
+  [[ -n "${of_plugins_dir:-}" && -f "${of_plugins_dir}/document-reader/plugin.yaml" ]] && doc_reader=1
+  OF_DOC_READER_PRESENT="$doc_reader" python3 - "$dir" "${of_disabled_toolsets[@]}" <<'PYEOF'
 import os
 import re
 import sys
@@ -1627,6 +1631,15 @@ lines = [
     "## Skills disponíveis agora (gerado no boot -- não afirme status além do que está aqui)",
     "",
     "Toolsets desligados neste ambiente: " + (", ".join(sorted(disabled)) or "nenhum") + ".",
+]
+# openfathom-meta ENG-332: this image has no firecrawl-anydoc, so read_file returns a
+# .pdf as a binary file while its schema (core) still advertises PDF, hence this line --
+# written only when the plugin that does read documents was delivered this boot.
+if os.environ.get("OF_DOC_READER_PRESENT") == "1":
+    lines.append(
+        "Documentos anexados (PDF, DOCX, XLSX e arquivos compactados): leia com extract_document_text. "
+        "O read_file não converte PDF nem Office legado nesta imagem.")
+lines += [
     "",
     "Disponíveis:",
 ]
@@ -1860,6 +1873,20 @@ case "${HERMES_MODE:-service}" in
     # Must run BEFORE `hermes gateway run` below: that is what loads the dotenv that
     # would otherwise override this key. See the function header for the measurement.
     of_reconcile_api_server_key
+    # openfathom-meta ENG-332. The VM has no ingress (ADR-069), so what the image promises
+    # about on-demand installs is proven from the log: this line runs in the environment
+    # the gateway inherits (same variables, same interpreter) and states the policy and
+    # whether anydoc imports. Expected in production: lazy_installs_allowed=False
+    # anydoc=absent. Never fails the boot.
+    echo "[of-lazy] HERMES_DISABLE_LAZY_INSTALLS=${HERMES_DISABLE_LAZY_INSTALLS:-<unset>} $(python3 -c '
+import importlib.util
+try:
+    from pm.install import lazy_installs_allowed
+    allowed = str(lazy_installs_allowed())
+except Exception as exc:
+    allowed = "unknown(" + type(exc).__name__ + ")"
+print("lazy_installs_allowed=" + allowed, "anydoc=" + ("present" if importlib.util.find_spec("anydoc") else "absent"))
+' 2>/dev/null || echo 'probe-failed')"
     export HERMES_GATEWAY_NO_SUPERVISE=1
     export API_SERVER_ENABLED=true
     # openfathom-meta OF-10 task [2]: loopback only. "0.0.0.0" was for Cloud Run, which
