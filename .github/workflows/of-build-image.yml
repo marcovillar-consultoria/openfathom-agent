@@ -476,7 +476,7 @@ jobs:
               "# describe`, nao suposto da tag (ENG-115).",
               "# O registro factual desta promocao fica em docs/promotions.md, que e",
               "# append-only (ENG-236); o julgamento humano -- o que a imagem traz, o que",
-              "# conferir depois do apply -- fica na bitacora, em",
+              "# conferir depois do apply -- fica no diario de bordo, em",
               "# openfathom-meta/docs/execution/, achado pelo digest (ENG-305).",
               END,
               "",
@@ -558,7 +558,7 @@ jobs:
               "",
               "**Entrada automática (ADR-059).** O julgamento humano desta imagem — o que "
               "ela muda em runtime, o que conferir depois do apply e o que ela NÃO conserta "
-              "— mora na bitácora do sprint ou do item que a motivou, em "
+              "— mora no diário de bordo do sprint ou do item que a motivou, em "
               "`openfathom-meta/docs/execution/`; ache-o pelo digest novo (openfathom-meta "
               "ENG-305).",
               "",
@@ -658,7 +658,7 @@ jobs:
           Digest lido do Artifact Registry com \`gcloud artifacts docker images describe\`, nao suposto da tag (ENG-115).
 
           Antes de mergear:
-          - [ ] o julgamento desta imagem esta na bitacora (\`openfathom-meta/docs/execution/\`), citando o digest novo: o que ela muda em runtime, ou a frase dizendo que nao muda nada
+          - [ ] o julgamento desta imagem esta no diario de bordo (\`openfathom-meta/docs/execution/\`), citando o digest novo: o que ela muda em runtime, ou a frase dizendo que nao muda nada
           - [ ] \`plan\` verde (roda \`check_pinned_images_exist.py\`; um \`plan\` verde de dias atras NAO reexecuta -- \`strict_required_status_checks_policy\` e false)
           - [ ] o que a imagem nova traz, e como confirmar depois do apply
 
