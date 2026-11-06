@@ -217,7 +217,9 @@ of_skills_fetch() {
   fi
 
   # Replace wholesale: a stale skill left behind by a previous boot would keep being
-  # advertised to the model after it was deleted upstream.
+  # advertised to the model after it was deleted upstream. u+w first: a container
+  # restart over a surviving $HERMES_HOME finds the tree left read-only below.
+  chmod -R u+w "$dest" 2>/dev/null || true
   rm -rf "$dest"; mkdir -p "$dest"
   if ! tar xzf "$tarball" -C "$dest" 2>/dev/null; then
     echo "[of-skills] WARN: tarball present but did not extract" >&2
@@ -231,8 +233,30 @@ of_skills_fetch() {
     echo "[of-skills] WARN: extracted tarball contains no SKILL.md -- refusing to point external_dirs at an empty tree" >&2
     return 1
   fi
-  echo "[of-skills] loaded ${n} skill(s) from gs://${HERMES_STATE_BUCKET}/${HERMES_SKILLS_OBJECT}"
+  echo "[of-skills] loaded ${n} skill(s) from gs://${HERMES_STATE_BUCKET}/${HERMES_SKILLS_OBJECT}$(of_make_read_only "$dest" of-skills)"
   return 0
+}
+
+# openfathom-meta ENG-338 (b). This script and the gateway run as the same `hermes`
+# user, so the gateway's write_file could rewrite a delivered plugin (or skill) on
+# disk, and any forced plugin rediscovery would then import it inside the gateway --
+# measured 2026-11-06: an overwritten document-reader/__init__.py raised its injected
+# code on discover_plugins(force=True). Dropping write permission makes write_file
+# fail with EACCES (it writes a temp file beside the target and renames it; neither
+# is possible in an a-w directory), and the gateway has no tool that chmods. Root
+# would ignore this, and the gateway never runs as root (s6-setuidgid, above).
+# Prints " (read-only)" for the caller's "loaded" line only when nothing under $1 is
+# still writable, and a WARN naming the first writable path otherwise, so the line
+# the boot check reads cannot claim more than the chmod did. Never fails the boot.
+of_make_read_only() {
+  local dest="$1" tag="$2" item="${3:-ENG-338}" w
+  chmod -R a-w "$dest" 2>/dev/null || true
+  w="$(find "$dest" -perm /222 -print -quit 2>/dev/null)"
+  if [[ -z "$w" ]]; then
+    printf ' (read-only)'
+  else
+    echo "[${tag}] WARN: ${dest} is still writable (${w}) -- the gateway can rewrite it (${item})" >&2
+  fi
 }
 
 # ADR-052. Fetch the OpenFathom plugin tarball and extract it into $1 -- a
@@ -253,7 +277,8 @@ of_plugins_fetch() {
   fi
 
   # Replace wholesale: a stale plugin left by a previous boot would keep loading after it
-  # was removed upstream.
+  # was removed upstream. u+w first, as in of_skills_fetch (ENG-338).
+  chmod -R u+w "$dest" 2>/dev/null || true
   rm -rf "$dest"; mkdir -p "$dest"
   if ! tar xzf "$tarball" -C "$dest" 2>/dev/null; then
     echo "[of-plugins] WARN: tarball present but did not extract" >&2
@@ -267,7 +292,7 @@ of_plugins_fetch() {
     echo "[of-plugins] WARN: extracted tarball contains no plugin.yaml -- refusing to enable an empty plugins dir" >&2
     return 1
   fi
-  echo "[of-plugins] loaded ${n} plugin(s) from gs://${HERMES_STATE_BUCKET}/${HERMES_PLUGINS_OBJECT}"
+  echo "[of-plugins] loaded ${n} plugin(s) from gs://${HERMES_STATE_BUCKET}/${HERMES_PLUGINS_OBJECT}$(of_make_read_only "$dest" of-plugins)"
   return 0
 }
 
