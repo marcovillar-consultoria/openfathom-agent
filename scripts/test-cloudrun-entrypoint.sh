@@ -1172,6 +1172,43 @@ else
   check "chmod failing: WARN names the writable path"         "yes" "$(grep -q 'still writable' "$WORK/ro-warn" && echo yes || echo no)"
 fi
 
+# ---------------------------------------------------------------------------
+# openfathom-meta ENG-361: $HERMES_HOME/scripts is created empty and read-only on the
+# service path, before either gateway start, so write_file cannot place a script that a
+# cron job (cronjob_manage script=, no_agent=True) would run with bash. Structural: the
+# line sits inside `service)` and above the first `exec hermes gateway run`. Functional:
+# the two lines, run as written in the entrypoint, leave a directory where neither a file
+# nor a subdirectory can be created.
+# ---------------------------------------------------------------------------
+echo "== case: ENG-361 -- \$HERMES_HOME/scripts is read-only before the gateway starts =="
+scripts_fence() { # <entrypoint> -> "ok" when the of-scripts line is at the top level of service), above the first gateway exec
+  local f="$1" svc line ex depth
+  svc="$(grep -n '^  service)$' "$f" | head -1 | cut -d: -f1)"
+  line="$(grep -n 'of_make_read_only "\${HERMES_HOME:-/opt/data}/scripts" of-scripts' "$f" | head -1 | cut -d: -f1)"
+  ex="$(grep -nE '^ +exec hermes gateway run$' "$f" | head -1 | cut -d: -f1)"
+  # if/fi depth between `service)` and the line: 0 means no optional block (skills,
+  # plugins, bucket) can skip it. Counts shell keywords only, at line start.
+  depth="$(awk -v a="$svc" -v b="$line" -v q="'" '
+    NR<=a || NR>=b { next }
+    hd != "" { if ($0 == hd) hd = ""; next }                 # inside a heredoc body (embedded Python)
+    { if ($0 ~ /^[[:space:]]*if[[:space:]]/) d++; if ($0 ~ /^[[:space:]]*fi([[:space:];]|$)/) d-- }
+    match($0, "<<-?" q "?[A-Z_]+" q "?") { w = substr($0, RSTART, RLENGTH); gsub("[<" q "-]", "", w); hd = w }
+    END { print d+0 }' "$f")"
+  [[ -n "$svc" && -n "$line" && -n "$ex" && "$line" -gt "$svc" && "$line" -lt "$ex" && "$depth" == 0 ]] && echo ok || echo "no (service=$svc line=$line exec=$ex depth=$depth)"
+}
+check "scripts dir made read-only inside service), before the first gateway exec" "ok" "$(scripts_fence "$ENTRYPOINT")"
+scripts_lines() { # <entrypoint> -> the two shipped lines (mkdir + of_make_read_only), verbatim
+  grep -E '^    mkdir -p "\$\{HERMES_HOME:-/opt/data\}/scripts"|^    echo "\[of-scripts\]' "$1"
+}
+check "the two shipped scripts lines were found" "2" "$(scripts_lines "$ENTRYPOINT" | wc -l)"
+if [[ "$(id -u)" -ne 0 ]]; then
+  SH_HOME="$WORK/scripts-home"; mkdir -p "$SH_HOME"
+  sc_out="$( ( HERMES_HOME="$SH_HOME"; eval "$(scripts_lines "$ENTRYPOINT")" ) 2>&1)"
+  check "scripts line says (read-only)"                     "yes" "$([[ "$sc_out" == *"/scripts (read-only)"* ]] && echo yes || echo no)"
+  check "a script cannot be written into scripts/"          "no"  "$( (printf 'id\n' > "$SH_HOME/scripts/p.sh") 2>/dev/null && echo yes || echo no)"
+  check "a subdirectory cannot be created in scripts/"      "no"  "$(mkdir "$SH_HOME/scripts/gmail-triage" 2>/dev/null && echo yes || echo no)"
+fi
+
 # In-harness mutants (so CI re-proves them, not a hand run): each mutated copy of the
 # entrypoint must turn the guarded property red. A mutation that does not change the
 # text proves nothing, so that is a failure too. ENG-332 first, then ENG-338, ENG-361.
@@ -1209,6 +1246,15 @@ if [[ "$(id -u)" -ne 0 ]]; then
   ro_mutant "of_make_read_only without chmod -R a-w" 's/^  chmod -R a-w "\$dest" 2>\/dev\/null || true$/  :/' probe_ro_helper
   ro_mutant "(read-only) claimed without the find" 's/^  w="\$(find "\$dest" -perm \/222 -print -quit 2>\/dev\/null)"$/  w=""/' probe_ro_claim
 fi
+# ENG-361: the scripts lock.
+probe_scripts() { # <entrypoint> -> "survived" if the scripts fence still holds
+  [[ "$(scripts_fence "$1")" == ok ]] && echo survived || echo killed
+}
+ro_mutant "scripts dir left writable (ENG-361 line removed)" '/of_make_read_only "\${HERMES_HOME:-\/opt\/data}\/scripts" of-scripts/d' probe_scripts
+ro_mutant "scripts lock moved inside the optional plugins block (ENG-361)" '/^    mkdir -p "\${HERMES_HOME:-\/opt\/data}\/scripts"/i\
+    if [[ -n "${HERMES_PLUGINS_OBJECT:-}" ]]; then
+/of_make_read_only "\${HERMES_HOME:-\/opt\/data}\/scripts" of-scripts/a\
+    fi' probe_scripts
 
 echo "== structural: the plugin is enabled ONLY after a successful fetch =="
 # A failed fetch must not leave plugins.enabled pointing at a plugin not on disk. Assert

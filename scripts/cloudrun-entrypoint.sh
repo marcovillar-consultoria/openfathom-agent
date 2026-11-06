@@ -2330,6 +2330,18 @@ PYEOF
       fi
     fi
 
+    # openfathom-meta ENG-361. $HERMES_HOME/scripts is where cronjob_manage takes a `script`
+    # from (tools/cronjob_job_args.py _validate_cron_script_path: relative, must exist) and
+    # runs it -- `.sh` with bash, no approval gate, and with no_agent=True the script is the
+    # whole job. The gateway's write_file can create files there, so write_file + a cron job
+    # was a shell on the gateway that ADR-043's disabled toolsets never closed: measured
+    # 2026-11-06 on this image, a written p.sh undid the read-only plugins above. An empty,
+    # read-only scripts dir leaves cron with prompts working and script jobs impossible (the
+    # Telegram adapter's gmail-triage scripts live there too, and close with it). Before
+    # both gateway starts below, and outside the optional skills/plugins blocks.
+    mkdir -p "${HERMES_HOME:-/opt/data}/scripts" 2>/dev/null || true
+    echo "[of-scripts] ${HERMES_HOME:-/opt/data}/scripts$(of_make_read_only "${HERMES_HOME:-/opt/data}/scripts" of-scripts ENG-361)"
+
     # ENG-45. Without a bucket configured this whole block is skipped and the old
     # `exec hermes gateway run` semantics are kept exactly -- that is the contract
     # the OF-05/OF-09 placeholder stages relied on, and it stays valid.
