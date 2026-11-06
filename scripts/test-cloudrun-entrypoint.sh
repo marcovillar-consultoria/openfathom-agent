@@ -22,7 +22,8 @@ set -uo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ENTRYPOINT="${SCRIPT_DIR}/cloudrun-entrypoint.sh"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+# chmod first: the ENG-338 cases leave read-only trees under $WORK.
+trap 'chmod -R u+w "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
 
 [[ -r "$ENTRYPOINT" ]] || { echo "FATAL: cannot read $ENTRYPOINT" >&2; exit 1; }
 
@@ -1077,6 +1078,9 @@ unset HERMES_MEMORY_SYNC_INTERVAL_SECONDS
 echo "== case: of_plugins_fetch =="
 PLUG_FN="$WORK/plug.sh"
 awk '/^of_plugins_fetch\(\) \{/{p=1} p{print} p&&/^\}$/{exit}' "$ENTRYPOINT" > "$PLUG_FN"
+# of_plugins_fetch's "loaded" line calls of_make_read_only (ENG-338); define it too.
+awk '/^of_make_read_only\(\) \{/{p=1} p{print} p&&/^\}$/{exit}' "$ENTRYPOINT" >> "$PLUG_FN"
+grep -q "of_make_read_only() {" "$PLUG_FN" || { echo "FATAL: of_make_read_only extraction failed" >&2; exit 1; }
 grep -q "of_plugins_fetch() {" "$PLUG_FN" || { echo "FATAL: of_plugins_fetch extraction failed" >&2; exit 1; }
 # shellcheck disable=SC1090
 source "$PLUG_FN"
@@ -1110,6 +1114,147 @@ check "tarball with no plugin.yaml -> refuses" "1"   "$rc"
 reset_stub; LIVE=""   # HTTP 404 from the stub
 of_plugins_fetch "$PDIR" >/dev/null 2>&1; rc=$?
 check "404 -> refuses (publish step skipped)"  "1"   "$rc"
+
+# ---------------------------------------------------------------------------
+# openfathom-meta ENG-338 (b): a delivered plugin or skill tree is left read-only, so
+# the gateway's write_file (same `hermes` user) cannot rewrite code a forced plugin
+# rediscovery would import. Three properties, for both fetch functions: nothing under
+# dest is writable and neither a file nor a new directory can be created there; a
+# second fetch over the read-only tree (a container restart over a surviving
+# $HERMES_HOME) still replaces it; and the "loaded" line says "(read-only)" only
+# because that held. The a-w and the find mutants run in-harness below ("mutants:
+# ENG-338/361"); dropping either `chmod -R u+w` before `rm -rf` was run by hand on
+# 2026-11-06 and turns "second fetch over the read-only tree" red.
+# Root ignores file modes, so under root these cases would prove nothing: fail loud.
+# ---------------------------------------------------------------------------
+echo "== case: ENG-338 -- delivered trees are read-only =="
+RO_FN="$WORK/ro.sh"
+for fn in of_skills_fetch; do
+  awk "/^${fn}\\(\\) \\{/{p=1} p{print} p&&/^\\}\$/{exit}" "$ENTRYPOINT" >> "$RO_FN"
+  grep -q "${fn}() {" "$RO_FN" || { echo "FATAL: ${fn} extraction failed" >&2; exit 1; }
+done
+# shellcheck disable=SC1090
+source "$RO_FN"
+export HERMES_SKILLS_OBJECT="skills.tar.gz" HERMES_STATE_BUCKET="${HERMES_STATE_BUCKET:-test-bucket}"
+mk_skill_tarball() { # <out> -- a tarball of_skills_fetch accepts: one SKILL.md
+  local out="$1" d; d="$(mktemp -d -p "$WORK")"
+  mkdir -p "$d/daily-briefing"
+  printf -- '---\nname: daily-briefing\n---\n' > "$d/daily-briefing/SKILL.md"
+  tar czf "$out" -C "$d" .
+}
+SKILL_OK="$WORK/skill-ok.tar.gz"; mk_skill_tarball "$SKILL_OK"
+
+if [[ "$(id -u)" -eq 0 ]]; then
+  bad "ENG-338 cases run as root, which ignores file modes -- they cannot prove read-only here"
+else
+  for spec in "of_plugins_fetch|$PLUG_OK|$WORK/ro-plugins|delegation-tasks/plugin.yaml" \
+              "of_skills_fetch|$SKILL_OK|$WORK/ro-skills|daily-briefing/SKILL.md"; do
+    IFS='|' read -r fn tb dest leaf <<< "$spec"
+    reset_stub; LIVE="$tb"
+    out="$("$fn" "$dest" 2>/dev/null)"; rc=$?
+    check "$fn: fetch ok"                                     "0"   "$rc"
+    check "$fn: loaded line says (read-only)"                 "yes" "$([[ "$out" == *"(read-only)"* ]] && echo yes || echo no)"
+    check "$fn: nothing under dest is writable"               ""    "$(find "$dest" -perm /222 -print -quit)"
+    check "$fn: overwriting a delivered file is refused"      "no"  "$( (printf x > "$dest/$leaf") 2>/dev/null && echo yes || echo no)"
+    check "$fn: a new directory in dest is refused"           "no"  "$(mkdir "$dest/injected" 2>/dev/null && echo yes || echo no)"
+    reset_stub; LIVE="$tb"
+    "$fn" "$dest" >/dev/null 2>&1; rc=$?
+    check "$fn: second fetch over the read-only tree ok"      "0"   "$rc"
+    check "$fn: second fetch left the delivered file"         "yes" "$([[ -f "$dest/$leaf" ]] && echo yes || echo no)"
+  done
+  # The line must not outrun the chmod: with chmod neutralised, the tree stays
+  # writable, and the helper must WARN and print no "(read-only)".
+  NOCHMOD="$WORK/still-writable"; mkdir -p "$NOCHMOD/p"; : > "$NOCHMOD/p/plugin.yaml"
+  chmod() { :; }
+  ro_out="$(of_make_read_only "$NOCHMOD" of-plugins 2>"$WORK/ro-warn")"
+  unset -f chmod
+  check "chmod failing: no (read-only) claimed"               ""    "$ro_out"
+  check "chmod failing: WARN names the writable path"         "yes" "$(grep -q 'still writable' "$WORK/ro-warn" && echo yes || echo no)"
+fi
+
+# ---------------------------------------------------------------------------
+# openfathom-meta ENG-361: $HERMES_HOME/scripts is created empty and read-only on the
+# service path, before either gateway start, so write_file cannot place a script that a
+# cron job (cronjob_manage script=, no_agent=True) would run with bash. Structural: the
+# line sits inside `service)` and above the first `exec hermes gateway run`. Functional:
+# the two lines, run as written in the entrypoint, leave a directory where neither a file
+# nor a subdirectory can be created.
+# ---------------------------------------------------------------------------
+echo "== case: ENG-361 -- \$HERMES_HOME/scripts is read-only before the gateway starts =="
+scripts_fence() { # <entrypoint> -> "ok" when the of-scripts line is at the top level of service), above the first gateway exec
+  local f="$1" svc line ex depth
+  svc="$(grep -n '^  service)$' "$f" | head -1 | cut -d: -f1)"
+  line="$(grep -n 'of_make_read_only "\${HERMES_HOME:-/opt/data}/scripts" of-scripts' "$f" | head -1 | cut -d: -f1)"
+  ex="$(grep -nE '^ +exec hermes gateway run$' "$f" | head -1 | cut -d: -f1)"
+  # if/fi depth between `service)` and the line: 0 means no optional block (skills,
+  # plugins, bucket) can skip it. Counts shell keywords only, at line start.
+  depth="$(awk -v a="$svc" -v b="$line" -v q="'" '
+    NR<=a || NR>=b { next }
+    hd != "" { if ($0 == hd) hd = ""; next }                 # inside a heredoc body (embedded Python)
+    { if ($0 ~ /^[[:space:]]*if[[:space:]]/) d++; if ($0 ~ /^[[:space:]]*fi([[:space:];]|$)/) d-- }
+    match($0, "<<-?" q "?[A-Z_]+" q "?") { w = substr($0, RSTART, RLENGTH); gsub("[<" q "-]", "", w); hd = w }
+    END { print d+0 }' "$f")"
+  [[ -n "$svc" && -n "$line" && -n "$ex" && "$line" -gt "$svc" && "$line" -lt "$ex" && "$depth" == 0 ]] && echo ok || echo "no (service=$svc line=$line exec=$ex depth=$depth)"
+}
+check "scripts dir made read-only inside service), before the first gateway exec" "ok" "$(scripts_fence "$ENTRYPOINT")"
+scripts_lines() { # <entrypoint> -> the two shipped lines (mkdir + of_make_read_only), verbatim
+  grep -E '^    mkdir -p "\$\{HERMES_HOME:-/opt/data\}/scripts"|^    echo "\[of-scripts\]' "$1"
+}
+check "the two shipped scripts lines were found" "2" "$(scripts_lines "$ENTRYPOINT" | wc -l)"
+if [[ "$(id -u)" -ne 0 ]]; then
+  SH_HOME="$WORK/scripts-home"; mkdir -p "$SH_HOME"
+  sc_out="$( ( HERMES_HOME="$SH_HOME"; eval "$(scripts_lines "$ENTRYPOINT")" ) 2>&1)"
+  check "scripts line says (read-only)"                     "yes" "$([[ "$sc_out" == *"/scripts (read-only)"* ]] && echo yes || echo no)"
+  check "a script cannot be written into scripts/"          "no"  "$( (printf 'id\n' > "$SH_HOME/scripts/p.sh") 2>/dev/null && echo yes || echo no)"
+  check "a subdirectory cannot be created in scripts/"      "no"  "$(mkdir "$SH_HOME/scripts/gmail-triage" 2>/dev/null && echo yes || echo no)"
+fi
+
+# In-harness mutants (so CI re-proves them, not a hand run): each mutated copy of the
+# entrypoint must turn the guarded property red. A mutation that does not change the
+# text proves nothing, so that is a failure too. ENG-332 first, then ENG-338, ENG-361.
+echo "== mutants: ENG-332/338/361 =="
+ro_mutant() { # <label> <sed-expr> <probe-fn>
+  local label="$1" expr="$2" probe="$3" m="$WORK/ro-mutant.sh"
+  sed -e "$expr" "$ENTRYPOINT" > "$m"
+  if cmp -s "$m" "$ENTRYPOINT"; then bad "$label: the mutation did not apply -- a mutant that does not mutate proves nothing"; return; fi
+  if [[ "$($probe "$m")" == "survived" ]]; then bad "$label -- SURVIVED"; else ok "$label -- killed"; fi
+}
+# ENG-332: the boot line that proves the on-demand-install policy from the log (the VM
+# has no ingress). Same fence: top level of service), above the first gateway exec.
+lazy_fence() {
+  local f="$1" svc line ex
+  svc="$(grep -n '^  service)$' "$f" | head -1 | cut -d: -f1)"
+  line="$(grep -n 'echo "\[of-lazy\] HERMES_DISABLE_LAZY_INSTALLS=' "$f" | head -1 | cut -d: -f1)"
+  ex="$(grep -nE '^ +exec hermes gateway run$' "$f" | head -1 | cut -d: -f1)"
+  [[ -n "$svc" && -n "$line" && -n "$ex" && "$line" -gt "$svc" && "$line" -lt "$ex" ]] && echo ok || echo "no (service=$svc line=$line exec=$ex)"
+}
+check "[of-lazy] boot line inside service), before the first gateway exec (ENG-332)" "ok" "$(lazy_fence "$ENTRYPOINT")"
+probe_lazy() { [[ "$(lazy_fence "$1")" == ok ]] && echo survived || echo killed; }
+ro_mutant "[of-lazy] boot line removed (ENG-332)" '/echo "\[of-lazy\] HERMES_DISABLE_LAZY_INSTALLS=/d' probe_lazy
+# ENG-338 (b): the read-only helper.
+probe_ro_helper() { # <entrypoint> -> "survived" if its of_make_read_only still yields a read-only tree that it reports as such
+  local f="$1" d; d="$(mktemp -d -p "$WORK")"; mkdir -p "$d/p"; : > "$d/p/plugin.yaml"
+  local out; out="$( ( eval "$(awk '/^of_make_read_only\(\) \{/{p=1} p{print} p&&/^\}$/{exit}' "$f")"; of_make_read_only "$d" t ) 2>/dev/null)"
+  [[ -z "$(find "$d" -perm /222 -print -quit)" && "$out" == " (read-only)" ]] && echo survived || echo killed
+}
+probe_ro_claim() { # <entrypoint> -> "survived" if, with chmod neutralised, the helper still WARNs and claims nothing
+  local f="$1" d; d="$(mktemp -d -p "$WORK")"; : > "$d/plugin.yaml"
+  local out; out="$( ( eval "$(awk '/^of_make_read_only\(\) \{/{p=1} p{print} p&&/^\}$/{exit}' "$f")"; chmod() { :; }; of_make_read_only "$d" t ) 2>"$d.warn")"
+  [[ -z "$out" ]] && grep -q 'still writable' "$d.warn" && echo survived || echo killed
+}
+if [[ "$(id -u)" -ne 0 ]]; then
+  ro_mutant "of_make_read_only without chmod -R a-w" 's/^  chmod -R a-w "\$dest" 2>\/dev\/null || true$/  :/' probe_ro_helper
+  ro_mutant "(read-only) claimed without the find" 's/^  w="\$(find "\$dest" -perm \/222 -print -quit 2>\/dev\/null)"$/  w=""/' probe_ro_claim
+fi
+# ENG-361: the scripts lock.
+probe_scripts() { # <entrypoint> -> "survived" if the scripts fence still holds
+  [[ "$(scripts_fence "$1")" == ok ]] && echo survived || echo killed
+}
+ro_mutant "scripts dir left writable (ENG-361 line removed)" '/of_make_read_only "\${HERMES_HOME:-\/opt\/data}\/scripts" of-scripts/d' probe_scripts
+ro_mutant "scripts lock moved inside the optional plugins block (ENG-361)" '/^    mkdir -p "\${HERMES_HOME:-\/opt\/data}\/scripts"/i\
+    if [[ -n "${HERMES_PLUGINS_OBJECT:-}" ]]; then
+/of_make_read_only "\${HERMES_HOME:-\/opt\/data}\/scripts" of-scripts/a\
+    fi' probe_scripts
 
 echo "== structural: the plugin is enabled ONLY after a successful fetch =="
 # A failed fetch must not leave plugins.enabled pointing at a plugin not on disk. Assert
@@ -1305,11 +1450,21 @@ rm -rf "$CAPS_HOME"; mkdir -p "$CAPS_HOME/shared" "$CAPS_HOME/academic"
 mk_skill "$CAPS_HOME/shared/citation-format" "citation-format" "[]"
 mk_skill "$CAPS_HOME/academic/pr-triage" "pr-triage" "[terminal]"
 
-run_caps() { ( set -euo pipefail; of_skills_dir="$CAPS_HOME" of_soul_capabilities_block ); }
+# ENG-332: the documents line needs the delivered document-reader plugin.
+CAPS_PLUGINS="$WORK/caps-plugins"; mkdir -p "$CAPS_PLUGINS/document-reader"
+printf 'name: document-reader\n' > "$CAPS_PLUGINS/document-reader/plugin.yaml"
+run_caps() { ( set -euo pipefail; of_skills_dir="$CAPS_HOME" of_plugins_dir="$CAPS_PLUGINS" of_soul_capabilities_block ); }
+run_caps_no_plugins() { ( set -euo pipefail; of_skills_dir="$CAPS_HOME" of_plugins_dir="$WORK/no-plugins" of_soul_capabilities_block ); }
 
 out="$(run_caps)"; echo "$out" | sed 's/^/    | /'
 check "header present" \
   "1" "$(grep -c '^## Skills disponíveis agora' <<<"$out")"
+# openfathom-meta ENG-332: read_file no longer converts PDF in this image while its
+# core schema still says it does; the block is where the Sonda learns the real route.
+check "documents are routed to extract_document_text (ENG-332)" \
+  "1" "$(grep -c '^Documentos anexados .*extract_document_text' <<<"$out")"
+check "no document-reader delivered -> no documents line (the block claims no tool it lacks)" \
+  "0" "$(run_caps_no_plugins | grep -c '^Documentos anexados')"
 check "toolset-free skill listed as available" \
   "1" "$(grep -c '^- citation-format$' <<<"$out")"
 check "toolset-requiring skill listed as unavailable, with reason" \

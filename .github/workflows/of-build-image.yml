@@ -16,7 +16,8 @@ name: of-build-image
 # Two-stage build on purpose (see Dockerfile.cloudrun's header comment):
 # stage 1 builds the REAL upstream Dockerfile as-is (s6-overlay, Node,
 # Playwright, uv) so this workflow never re-implements or drifts from it;
-# stage 2 layers Dockerfile.cloudrun (just the entrypoint) on top.
+# stage 2 layers Dockerfile.cloudrun (the entrypoint, the plugin parsers, and the
+# firecrawl-anydoc removal with lazy installs off -- read that file) on top.
 #
 # WIF wired (2026-07-13, ENG-32 in docs/BACKLOG.md, openfathom-meta): the
 # github-actions-agent-build@openfathom-prod service account and its bindings
@@ -53,11 +54,20 @@ env:
   # absent on purpose: it uses the core `openai` SDK, not an extra. The anchor lookup
   # mirrors pm.extras._anchors (ANCHORS, else the extra name with "-" -> "_"; `mcp` has
   # no ANCHORS row), so an extra renamed upstream resolves to a module that does not
-  # exist and fails here instead of going quiet.
+  # exist and fails here instead of going quiet. `vertex` is the research-runner Job's
+  # provider (agent/vertex_adapter.py ensure_import): with lazy installs off below, an
+  # extra the image does not carry can no longer arrive at runtime.
+  #
+  # And the inverse, openfathom-meta ENG-332: firecrawl-anydoc must be ABSENT and lazy
+  # installs OFF (Dockerfile.cloudrun), or read_file converts PDF and legacy Office in
+  # the gateway process again. Each assertion prints its own verdict line, so a red
+  # build names which half regressed; the lazy-install one is behavioural
+  # (pm.install.lazy_installs_allowed), not a read of the variable's text, so an
+  # upstream rename of HERMES_DISABLE_LAZY_INSTALLS fails here.
   OF_CAPABILITY_SMOKE: |
     import importlib
     from pm.extras import ANCHORS
-    required = ["anthropic", "telegram", "parallel-web", "mcp", "youtube", "doc-extract"]
+    required = ["anthropic", "telegram", "parallel-web", "mcp", "youtube", "vertex"]
     missing = []
     for extra in required:
         anchors = ANCHORS.get(extra, extra.replace("-", "_"))
@@ -69,7 +79,25 @@ env:
     for line in missing:
         print(f"::error title=SDK not baked into the image::{line}")
     print(f"capability smoke: {len(required)} extras checked, {len(missing)} missing")
-    raise SystemExit(1 if missing else 0)
+    absent = []
+    try:
+        importlib.import_module("anydoc")
+        absent.append("anydoc imports: firecrawl-anydoc is back in the image")
+    except ModuleNotFoundError:
+        print("absence smoke: anydoc not importable -- ok")
+    from pm.install import lazy_installs_allowed
+    if lazy_installs_allowed():
+        absent.append("lazy installs allowed: read_file would reinstall anydoc at runtime")
+    else:
+        print("absence smoke: lazy installs refused -- ok")
+    from tools.read_extract import is_extractable_document
+    if is_extractable_document("/x.pdf"):
+        absent.append("read_file treats .pdf as an extractable document")
+    else:
+        print("absence smoke: read_file does not extract .pdf -- ok")
+    for line in absent:
+        print(f"::error title=Removed capability is back (ENG-332)::{line}")
+    raise SystemExit(1 if missing or absent else 0)
 
 jobs:
   validate-scope:
@@ -448,7 +476,7 @@ jobs:
               "# describe`, nao suposto da tag (ENG-115).",
               "# O registro factual desta promocao fica em docs/promotions.md, que e",
               "# append-only (ENG-236); o julgamento humano -- o que a imagem traz, o que",
-              "# conferir depois do apply -- fica na bitacora, em",
+              "# conferir depois do apply -- fica no diario de bordo, em",
               "# openfathom-meta/docs/execution/, achado pelo digest (ENG-305).",
               END,
               "",
@@ -530,7 +558,7 @@ jobs:
               "",
               "**Entrada automática (ADR-059).** O julgamento humano desta imagem — o que "
               "ela muda em runtime, o que conferir depois do apply e o que ela NÃO conserta "
-              "— mora na bitácora do sprint ou do item que a motivou, em "
+              "— mora no diário de bordo do sprint ou do item que a motivou, em "
               "`openfathom-meta/docs/execution/`; ache-o pelo digest novo (openfathom-meta "
               "ENG-305).",
               "",
@@ -630,7 +658,7 @@ jobs:
           Digest lido do Artifact Registry com \`gcloud artifacts docker images describe\`, nao suposto da tag (ENG-115).
 
           Antes de mergear:
-          - [ ] o julgamento desta imagem esta na bitacora (\`openfathom-meta/docs/execution/\`), citando o digest novo: o que ela muda em runtime, ou a frase dizendo que nao muda nada
+          - [ ] o julgamento desta imagem esta no diario de bordo (\`openfathom-meta/docs/execution/\`), citando o digest novo: o que ela muda em runtime, ou a frase dizendo que nao muda nada
           - [ ] \`plan\` verde (roda \`check_pinned_images_exist.py\`; um \`plan\` verde de dias atras NAO reexecuta -- \`strict_required_status_checks_policy\` e false)
           - [ ] o que a imagem nova traz, e como confirmar depois do apply
 

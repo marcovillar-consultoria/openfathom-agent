@@ -217,7 +217,9 @@ of_skills_fetch() {
   fi
 
   # Replace wholesale: a stale skill left behind by a previous boot would keep being
-  # advertised to the model after it was deleted upstream.
+  # advertised to the model after it was deleted upstream. u+w first: a container
+  # restart over a surviving $HERMES_HOME finds the tree left read-only below.
+  chmod -R u+w "$dest" 2>/dev/null || true
   rm -rf "$dest"; mkdir -p "$dest"
   if ! tar xzf "$tarball" -C "$dest" 2>/dev/null; then
     echo "[of-skills] WARN: tarball present but did not extract" >&2
@@ -231,8 +233,30 @@ of_skills_fetch() {
     echo "[of-skills] WARN: extracted tarball contains no SKILL.md -- refusing to point external_dirs at an empty tree" >&2
     return 1
   fi
-  echo "[of-skills] loaded ${n} skill(s) from gs://${HERMES_STATE_BUCKET}/${HERMES_SKILLS_OBJECT}"
+  echo "[of-skills] loaded ${n} skill(s) from gs://${HERMES_STATE_BUCKET}/${HERMES_SKILLS_OBJECT}$(of_make_read_only "$dest" of-skills)"
   return 0
+}
+
+# openfathom-meta ENG-338 (b). This script and the gateway run as the same `hermes`
+# user, so the gateway's write_file could rewrite a delivered plugin (or skill) on
+# disk, and any forced plugin rediscovery would then import it inside the gateway --
+# measured 2026-11-06: an overwritten document-reader/__init__.py raised its injected
+# code on discover_plugins(force=True). Dropping write permission makes write_file
+# fail with EACCES (it writes a temp file beside the target and renames it; neither
+# is possible in an a-w directory), and the gateway has no tool that chmods. Root
+# would ignore this, and the gateway never runs as root (s6-setuidgid, above).
+# Prints " (read-only)" for the caller's "loaded" line only when nothing under $1 is
+# still writable, and a WARN naming the first writable path otherwise, so the line
+# the boot check reads cannot claim more than the chmod did. Never fails the boot.
+of_make_read_only() {
+  local dest="$1" tag="$2" item="${3:-ENG-338}" w
+  chmod -R a-w "$dest" 2>/dev/null || true
+  w="$(find "$dest" -perm /222 -print -quit 2>/dev/null)"
+  if [[ -z "$w" ]]; then
+    printf ' (read-only)'
+  else
+    echo "[${tag}] WARN: ${dest} is still writable (${w}) -- the gateway can rewrite it (${item})" >&2
+  fi
 }
 
 # ADR-052. Fetch the OpenFathom plugin tarball and extract it into $1 -- a
@@ -253,7 +277,8 @@ of_plugins_fetch() {
   fi
 
   # Replace wholesale: a stale plugin left by a previous boot would keep loading after it
-  # was removed upstream.
+  # was removed upstream. u+w first, as in of_skills_fetch (ENG-338).
+  chmod -R u+w "$dest" 2>/dev/null || true
   rm -rf "$dest"; mkdir -p "$dest"
   if ! tar xzf "$tarball" -C "$dest" 2>/dev/null; then
     echo "[of-plugins] WARN: tarball present but did not extract" >&2
@@ -267,7 +292,7 @@ of_plugins_fetch() {
     echo "[of-plugins] WARN: extracted tarball contains no plugin.yaml -- refusing to enable an empty plugins dir" >&2
     return 1
   fi
-  echo "[of-plugins] loaded ${n} plugin(s) from gs://${HERMES_STATE_BUCKET}/${HERMES_PLUGINS_OBJECT}"
+  echo "[of-plugins] loaded ${n} plugin(s) from gs://${HERMES_STATE_BUCKET}/${HERMES_PLUGINS_OBJECT}$(of_make_read_only "$dest" of-plugins)"
   return 0
 }
 
@@ -1532,7 +1557,11 @@ of_soul_capabilities_block() {
     echo "[of-soul-capabilities] no skills directory this boot -- SOUL.md gets no capabilities block" >&2
     return 0
   fi
-  python3 - "$dir" "${of_disabled_toolsets[@]}" <<'PYEOF'
+  # ENG-332: the documents line below is true only while the document-reader plugin
+  # was delivered this boot (of_plugins_fetch runs before this); otherwise it is left out.
+  local doc_reader=""
+  [[ -n "${of_plugins_dir:-}" && -f "${of_plugins_dir}/document-reader/plugin.yaml" ]] && doc_reader=1
+  OF_DOC_READER_PRESENT="$doc_reader" python3 - "$dir" "${of_disabled_toolsets[@]}" <<'PYEOF'
 import os
 import re
 import sys
@@ -1627,6 +1656,15 @@ lines = [
     "## Skills disponíveis agora (gerado no boot -- não afirme status além do que está aqui)",
     "",
     "Toolsets desligados neste ambiente: " + (", ".join(sorted(disabled)) or "nenhum") + ".",
+]
+# openfathom-meta ENG-332: this image has no firecrawl-anydoc, so read_file returns a
+# .pdf as a binary file while its schema (core) still advertises PDF, hence this line --
+# written only when the plugin that does read documents was delivered this boot.
+if os.environ.get("OF_DOC_READER_PRESENT") == "1":
+    lines.append(
+        "Documentos anexados (PDF, DOCX, XLSX e arquivos compactados): leia com extract_document_text. "
+        "O read_file não converte PDF nem Office legado nesta imagem.")
+lines += [
     "",
     "Disponíveis:",
 ]
@@ -1860,6 +1898,20 @@ case "${HERMES_MODE:-service}" in
     # Must run BEFORE `hermes gateway run` below: that is what loads the dotenv that
     # would otherwise override this key. See the function header for the measurement.
     of_reconcile_api_server_key
+    # openfathom-meta ENG-332. The VM has no ingress (ADR-069), so what the image promises
+    # about on-demand installs is proven from the log: this line runs in the environment
+    # the gateway inherits (same variables, same interpreter) and states the policy and
+    # whether anydoc imports. Expected in production: lazy_installs_allowed=False
+    # anydoc=absent. Never fails the boot.
+    echo "[of-lazy] HERMES_DISABLE_LAZY_INSTALLS=${HERMES_DISABLE_LAZY_INSTALLS:-<unset>} $(python3 -c '
+import importlib.util
+try:
+    from pm.install import lazy_installs_allowed
+    allowed = str(lazy_installs_allowed())
+except Exception as exc:
+    allowed = "unknown(" + type(exc).__name__ + ")"
+print("lazy_installs_allowed=" + allowed, "anydoc=" + ("present" if importlib.util.find_spec("anydoc") else "absent"))
+' 2>/dev/null || echo 'probe-failed')"
     export HERMES_GATEWAY_NO_SUPERVISE=1
     export API_SERVER_ENABLED=true
     # openfathom-meta OF-10 task [2]: loopback only. "0.0.0.0" was for Cloud Run, which
@@ -2277,6 +2329,18 @@ PYEOF
              "the gateway is starting WITHOUT the delivered plugins" >&2
       fi
     fi
+
+    # openfathom-meta ENG-361. $HERMES_HOME/scripts is where cronjob_manage takes a `script`
+    # from (tools/cronjob_job_args.py _validate_cron_script_path: relative, must exist) and
+    # runs it -- `.sh` with bash, no approval gate, and with no_agent=True the script is the
+    # whole job. The gateway's write_file can create files there, so write_file + a cron job
+    # was a shell on the gateway that ADR-043's disabled toolsets never closed: measured
+    # 2026-11-06 on this image, a written p.sh undid the read-only plugins above. An empty,
+    # read-only scripts dir leaves cron with prompts working and script jobs impossible (the
+    # Telegram adapter's gmail-triage scripts live there too, and close with it). Before
+    # both gateway starts below, and outside the optional skills/plugins blocks.
+    mkdir -p "${HERMES_HOME:-/opt/data}/scripts" 2>/dev/null || true
+    echo "[of-scripts] ${HERMES_HOME:-/opt/data}/scripts$(of_make_read_only "${HERMES_HOME:-/opt/data}/scripts" of-scripts ENG-361)"
 
     # ENG-45. Without a bucket configured this whole block is skipped and the old
     # `exec hermes gateway run` semantics are kept exactly -- that is the contract
