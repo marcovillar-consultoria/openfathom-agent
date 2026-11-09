@@ -319,8 +319,9 @@ of_verify_sha256() { # <file> <pinned> <log-tag> <env-var-name>
 #
 # Prints "N extracted, M refused" and exits 0 when the archive was read to the end --
 # refusals are not a failure, they are the point. Exits 2 when the archive cannot be read
-# (truncated, not gzip, not tar), possibly after a partial extraction: the caller treats
-# that as a failed restore.
+# (truncated, not gzip, not tar), after removing every file and new directory it had
+# already written -- a partial extraction never stays on disk: the caller treats that as a
+# failed restore.
 of_safe_extract() { # <tarball> <dest> <log-tag> <state|files>
   python3 - "$1" "$2" "$3" "$4" <<'PYEOF'
 import os, shutil, sys, tarfile
@@ -351,6 +352,19 @@ def through_link(parts):
 
 
 extracted, refused = 0, []
+written, made = [], []   # this run's files and new directories, removed if the archive breaks
+
+
+def mkdirs(path):
+    missing = []
+    while not os.path.isdir(path):
+        missing.append(path)
+        path = os.path.dirname(path)
+    for d in reversed(missing):
+        os.mkdir(d)
+        made.append(d)
+
+
 os.makedirs(dest, exist_ok=True)
 try:
     with tarfile.open(tarball, "r:gz") as tf:
@@ -366,10 +380,11 @@ try:
                 continue
             target = os.path.join(dest, *parts)
             if m.isdir():
-                os.makedirs(target, exist_ok=True)
+                mkdirs(target)
                 continue
-            os.makedirs(os.path.dirname(target), exist_ok=True)
+            mkdirs(os.path.dirname(target))
             src = tf.extractfile(m)
+            written.append(target)
             with src, open(target, "wb") as out:
                 shutil.copyfileobj(src, out)
             os.chmod(target, (m.mode & 0o755) | 0o600)
@@ -381,8 +396,20 @@ try:
         if tf.fileobj.read().strip(b"\0"):
             raise ValueError("data after the last readable member")
 except Exception as exc:  # truncated gzip, not a tar, unreadable member, trailing garbage
-    print(f"[{tag}] ERROR: archive unreadable after {extracted} member(s) "
-          f"({type(exc).__name__}: {exc})", file=sys.stderr)
+    # A half-written state.db is worse than none: take back everything this run wrote, so
+    # a failed restore really leaves the state it says it leaves (empty, not partial).
+    for path in written:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    for d in reversed(made):
+        try:
+            os.rmdir(d)
+        except OSError:
+            pass
+    print(f"[{tag}] ERROR: archive unreadable after {extracted} member(s), "
+          f"{len(written)} written file(s) removed ({type(exc).__name__}: {exc})", file=sys.stderr)
     sys.exit(2)
 for name in refused[:20]:
     print(f"[{tag}] WARN: refused archive member {name!r} (ENG-373)", file=sys.stderr)
@@ -447,7 +474,8 @@ of_plugins_fetch() {
 # merging then would upload this boot's incomplete plans/, pairing/ and cron/ over the
 # live ones -- hence the epoch is forced too, not read). The live snapshot is never
 # touched; this boot's state survives only in the parked objects (expired after 90 days,
-# recovered by hand), and this boot's memories are lost at the next restart. Hence ERROR,
+# recovered by hand), and this boot's memories never reach the live memories object
+# (of_memories_restore forgets its generation too, so its uploads give up). Hence ERROR,
 # which the gateway_monitoring alert in openfathom-infra pages on: the remedy is to
 # restart the VM, which retries the restore.
 of_state_restore_failed() {
@@ -459,7 +487,7 @@ of_state_restore_failed() {
 
 of_state_restore() {
   local tok code tarball="${TMPDIR:-/tmp}/of-state-restore.tar.gz"
-  tok="$(of_metadata_token)" || { echo "[of-state] WARN: no metadata token; starting with empty state" >&2; return 0; }
+  tok="$(of_metadata_token)" || { echo "[of-state] WARN: no metadata token" >&2; of_state_restore_failed; return 0; }
 
   # Record the generation we are about to read, for the compare-and-swap in
   # of_state_snapshot(). A metadata GET (no alt=media) is the documented way to
@@ -1199,13 +1227,16 @@ PY
 # Best-effort by design, same as of_state_restore (Dogma 2): a gateway that boots with
 # fewer memories than it should is degraded, not down.
 # openfathom-meta ENG-373: the same reason as of_state_restore_failed, for the memories
-# object and its own compare-and-swap. With the generation forgotten the first upload gets
-# a 412 and the merge path unions with the live memories -- or, when of_state_restore_failed
-# also forced our epoch to 0, gives up each cycle without writing. Either way the live
-# memories are never replaced by this boot's.
+# object and its own compare-and-swap. Called when the memories download fails AND when the
+# state restore failed: a failed state restore forces our epoch to 0, and a memories upload
+# that still held the matched generation would stamp the live object with epoch 0 -- which
+# the next healthy boot (epoch 2) reads as "predates a reset" and replaces with the curated
+# memories only, losing every agent-written one (second diff-mode review, 2026-11-09). With
+# the generation forgotten the first upload gets a 412 and the merge path unions with the
+# live memories -- or, with our epoch forced to 0, gives up each cycle without writing.
 of_memories_forget_generation() {
   of_memories_generation=0
-  echo "[of-memories] restore failed -- generation forgotten, the live memories are never replaced by this boot's (ENG-373)" >&2
+  echo "[of-memories] generation forgotten -- the live memories are never replaced by this boot's (ENG-373)" >&2
 }
 
 of_memories_restore() {
@@ -1214,6 +1245,9 @@ of_memories_restore() {
   tok="$(of_metadata_token)" || { echo "[of-memories] WARN: no metadata token; starting with restored state only" >&2; return 0; }
 
   of_memories_generation="$(of_gcs_read_generation "$HERMES_STATE_BUCKET" "$HERMES_MEMORIES_OBJECT" "$tok")"
+  # ENG-373: of_state_restore ran first. If it failed, our epoch is 0 and must never stamp
+  # the live memories object -- see of_memories_forget_generation.
+  [[ -z "${of_state_restore_failed:-}" ]] || of_memories_forget_generation
 
   code="$(curl -sS -o "$tarball" -w '%{http_code}' --max-time 30 \
     -H "Authorization: Bearer ${tok}" \

@@ -2548,6 +2548,54 @@ rs_home memhttp; reset_stub; LIVE="HTTP500"; LIVE_GEN="42"; of_memories_generati
 of_memories_restore >/dev/null 2>&1
 check "memories: an HTTP 500 after the generation forgets it" "0" "$of_memories_generation"
 
+echo "== case: ENG-373 -- a failed STATE restore never stamps the live memories with epoch 0 =="
+# Second diff-mode review, 2026-11-09: the state restore fails (epoch forced to 0), the
+# memories restore succeeds and keeps the matched generation, and the first memories tick
+# would upload with .memories_epoch 0 -- which the next healthy boot (epoch 2) reads as
+# "predates a reset", keeping only the curated memories and overwriting the live object.
+MEM_LIVE_E2="$WORK/mem-live-e2.tar.gz"; mk_memories_tarball "$MEM_LIVE_E2" 2 "MEMORY.md" "agent-written entry"
+memfail_case() { # <fns-file or ""> -> "same" if one memories tick left the live object byte for byte
+  local h="$WORK/memfail-home"; chmod -R u+w "$h" 2>/dev/null; rm -rf "$h"; mkdir -p "$h/memories"
+  mk_mem_file "$h/memories" "USER.md" "curated entry"
+  ( [[ -n "$1" ]] && source "$1"
+    export HERMES_HOME="$h"
+    reset_stub; LIVE="HTTP500"; LIVE_GEN="42"; of_state_generation=""; of_state_epoch=""; of_state_restore_failed=""
+    of_state_restore >/dev/null 2>&1
+    reset_stub; cas_enable 55 "$MEM_LIVE_E2"; of_memories_generation=""
+    of_memories_restore >/dev/null 2>&1
+    of_memories_snapshot >/dev/null 2>&1 )
+  cmp -s "$CAS_LIVE" "$MEM_LIVE_E2" && echo same || echo changed
+}
+check "state restore failed, memories restored: a memories tick leaves the live object untouched" "same" "$(memfail_case "")"
+probe_memfail() { # survived = the live memories survive a failed state restore
+  local fl; fl="$(fns_of "$1" of_state_read_local_epoch of_gcs_read_generation of_safe_extract of_state_restore_failed of_state_restore of_memories_forget_generation of_memories_tarball_epoch of_memory_union of_memories_restore of_memories_write_with_merge_retry of_memories_snapshot)"
+  [[ "$(memfail_case "$fl")" == same ]] && echo survived || echo killed
+}
+
+echo "== case: ENG-373 -- a partial restore takes back what it wrote =="
+# Same review: of_safe_extract wrote members in place and exited 2, leaving a half-written
+# state.db for the gateway to boot on, while the log, the alert and the comments said
+# "empty state". (rs_park_case deletes state.db on purpose, so it could not see this.)
+rs_home partial; reset_stub; LIVE="$RS_PARTIAL"; LIVE_GEN="42"
+of_state_restore > "$WORK/rs-partial.out" 2>&1
+check "partial restore: no half-written state.db left"      "no" "$([[ -e "$RS_HOME/state.db" ]] && echo yes || echo no)"
+check "... nor the .state_epoch it had landed first"         "no" "$([[ -e "$RS_HOME/.state_epoch" ]] && echo yes || echo no)"
+check "... the boot's config.yaml is untouched"              "SAFE" "$(cat "$RS_HOME/config.yaml")"
+check "... and it says what it removed"                      "1" "$(grep -c 'written file(s) removed' "$WORK/rs-partial.out")"
+probe_cleanup() { # survived = a partial restore still leaves nothing behind
+  local fl; fl="$(fns_of "$1" of_safe_extract of_state_restore_failed of_state_restore of_state_read_local_epoch)"
+  rs_home mutpartial
+  ( source "$fl"; reset_stub; LIVE="$RS_PARTIAL"; LIVE_GEN="42"; of_state_restore >/dev/null 2>&1 )
+  [[ ! -e "$RS_HOME/state.db" && ! -e "$RS_HOME/.state_epoch" ]] && echo survived || echo killed
+}
+
+echo "== case: ENG-373 -- no metadata token is a failed restore too =="
+rs_home notok; reset_stub
+( of_metadata_token() { return 1; }; of_state_generation=""; of_state_restore_failed=""
+  of_state_restore > "$WORK/rs-notok.out" 2>&1; printf '%s|%s' "$of_state_generation" "$of_state_restore_failed" > "$WORK/rs-notok.res" )
+check "no token: generation 0 and the failure flagged"   "0|1" "$(cat "$WORK/rs-notok.res")"
+check "... at ERROR, so the alert sees it"               "1"   "$(grep -c '\[of-state\] ERROR: restore failed' "$WORK/rs-notok.out")"
+
 echo "== case: ENG-373 -- a real snapshot round-trips through the allow-list =="
 # Not a hand-picked member list: what of_state_snapshot itself writes from a populated
 # home, restored with the allow-list. Anything it writes that the list refuses is lost
@@ -2688,15 +2736,47 @@ probe_partial() { # survived = the live snapshot survives a partial restore that
 m373 "the memories merge path back to tar xzf" 's/^    if ! of_safe_extract "\$live" "\$live_extract" of-memories files >\/dev\/null; then$/    if ! tar xzf "$live" -C "$live_extract" 2>\/dev\/null; then/' probe_mem412
 m373 "the end-of-archive check removed" 's/^        if tf.fileobj.read().strip(b"\\0"):$/        if False:/' probe_tailjunk
 m373 "an unreadable snapshot keeps the generation (the old line 330)" '/^    echo "\[of-state\] WARN: snapshot present but did not extract; starting with empty state" >&2$/{n;/of_state_restore_failed/d}' probe_forget
-m373 "a failed restore reads the epoch back from what it half-extracted" 's/^  \[\[ -n "\${of_state_restore_failed:-}" \]\] || of_state_epoch=/  of_state_epoch=/' probe_partial
+probe_skills_pin() { # survived = a mismatched pin still refuses the skills tarball
+  local fl; fl="$(fns_of "$1" of_verify_sha256 of_skills_fetch of_make_read_only)"
+  local rc; rc="$( source "$fl"; reset_stub; LIVE="$SKILL_OK"; HERMES_SKILLS_SHA256="$(sha_of "$PLUG_OK")"; of_skills_fetch "$WORK/m-skills-pin" >/dev/null 2>&1; echo $? )"
+  [[ "$rc" == 1 ]] && echo survived || echo killed
+}
+probe_pin_upper() { # survived = an upper-case pin still loads
+  local fl; fl="$(fns_of "$1" of_verify_sha256 of_plugins_fetch of_make_read_only)"
+  local rc; rc="$( source "$fl"; reset_stub; LIVE="$PLUG_OK"; HERMES_PLUGINS_SHA256="$(sha_of "$PLUG_OK" | tr a-f A-F)"; of_plugins_fetch "$WORK/m-pin-up" >/dev/null 2>&1; echo $? )"
+  [[ "$rc" == 0 ]] && echo survived || echo killed
+}
+probe_pin_space() { # survived = a pin with surrounding whitespace and a newline still loads
+  local fl; fl="$(fns_of "$1" of_verify_sha256 of_plugins_fetch of_make_read_only)"
+  local rc; rc="$( source "$fl"; reset_stub; LIVE="$PLUG_OK"; HERMES_PLUGINS_SHA256="$(printf '  %s\n' "$(sha_of "$PLUG_OK")")"; of_plugins_fetch "$WORK/m-pin-sp" >/dev/null 2>&1; echo $? )"
+  [[ "$rc" == 0 ]] && echo survived || echo killed
+}
+DOTDOT_TB="$WORK/dotdot.tar.gz"
+python3 - "$DOTDOT_TB" <<'PY'
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], "w:gz") as tf:
+    ti = tarfile.TarInfo("../dotdot-escape"); d = b"x"; ti.size = len(d); tf.addfile(ti, io.BytesIO(d))
+PY
+probe_dotdot() { # survived = a ../ member in files mode (the memories path) still does not escape
+  local fl; fl="$(fns_of "$1" of_safe_extract)"
+  local d="$WORK/dd/dest"; rm -rf "$WORK/dd"; mkdir -p "$d"
+  ( source "$fl"; of_safe_extract "$DOTDOT_TB" "$d" of-test files >/dev/null 2>&1 )
+  [[ -e "$WORK/dd/dotdot-escape" ]] && echo killed || echo survived
+}
 probe_lock() { [[ "$(lock_fence "$1")" == ok ]] && echo survived || echo killed; }
 # Each probe must say "survived" on the SHIPPED entrypoint -- a probe that reports
 # "killed" for everything kills every mutant and proves nothing (the first draft of these
 # probes had their polarity inverted, and every mutant "survived" for that reason).
-for pr in probe_pin_mismatch probe_pin_unset probe_restore_evil probe_restore_link probe_forget probe_partial probe_mem412 probe_tailjunk; do
+for pr in probe_pin_mismatch probe_pin_unset probe_restore_evil probe_restore_link probe_forget probe_partial probe_mem412 probe_tailjunk probe_memfail probe_cleanup probe_skills_pin probe_pin_upper probe_pin_space probe_dotdot; do
   check "$pr holds on the shipped entrypoint" "survived" "$($pr "$ENTRYPOINT")"
 done
 check "probe_lock holds on the shipped entrypoint" "survived" "$(probe_lock "$ENTRYPOINT")"
+m373 "a failed state restore no longer forgets the memories generation" '/^  \[\[ -z "\${of_state_restore_failed:-}" \]\] || of_memories_forget_generation$/d' probe_memfail
+m373 "a partial extraction keeps what it wrote" 's/^            os.unlink(path)$/            pass/' probe_cleanup
+m373 "of_skills_fetch no longer calls the pin check" 's/sha="\$(of_verify_sha256 "\$tarball" "\${HERMES_SKILLS_SHA256:-}" of-skills HERMES_SKILLS_SHA256)"/sha=skipped/' probe_skills_pin
+m373 "upper-case hex no longer folded" '/^  want="\${want,,}"$/d' probe_pin_upper
+m373 "surrounding whitespace no longer trimmed" '/^  want="\${want#"\${want%%\[!\[:space:\]\]\*}"}"; want=/d' probe_pin_space
+m373 "the .. check removed" 's/ok = (not m.name.startswith("\/") and ".." not in parts$/ok = (not m.name.startswith("\/")/' probe_dotdot
 m373 "the hooks/profiles lock removed (ENG-362)" '/^    for of_d in hooks profiles; do$/,/^    done$/d' probe_lock
 m373_file() { # <label> <mutated file> <probe> -- for mutations sed cannot express
   local label="$1" m="$2" probe="$3"
@@ -2712,6 +2792,13 @@ r = s.index("\n    of_state_restore\n") + len("\n    of_state_restore\n")
 open(sys.argv[2], "w").write(s[:r] + block + s[r:])
 PY
 m373_file "the lock moved below of_state_restore (ENG-362)" "$WORK/m-lock-moved.sh" probe_lock
+# Two defenses since the second diff-mode review: the extractor takes back what it wrote,
+# and a failed restore never reads the epoch back. Either alone holds probe_partial, so the
+# epoch guard is proven with the cleanup ALSO removed (the single cleanup mutant, above,
+# survives probe_partial by design and is killed by probe_cleanup instead).
+sed -e 's/^  \[\[ -n "\${of_state_restore_failed:-}" \]\] || of_state_epoch=/  of_state_epoch=/' \
+    -e 's/^            os.unlink(path)$/            pass/' "$ENTRYPOINT" > "$WORK/m-epoch-and-cleanup.sh"
+m373_file "a failed restore reads the epoch back from what it half-extracted (cleanup also off)" "$WORK/m-epoch-and-cleanup.sh" probe_partial
 
 echo
 echo "passed: $pass   failed: $fail"
