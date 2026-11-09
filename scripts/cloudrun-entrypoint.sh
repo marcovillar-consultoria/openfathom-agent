@@ -372,9 +372,15 @@ try:
             src = tf.extractfile(m)
             with src, open(target, "wb") as out:
                 shutil.copyfileobj(src, out)
-            os.chmod(target, (m.mode & 0o777) | 0o600)
+            os.chmod(target, (m.mode & 0o755) | 0o600)
             extracted += 1
-except Exception as exc:  # truncated gzip, not a tar, unreadable member
+        # tarfile stops silently at a bad header after the first member, and the gzip CRC
+        # is only checked at the end of the stream: read what follows the last member and
+        # require the zero padding of a real end of archive, which also reaches the CRC.
+        tf.fileobj.seek(tf.offset)
+        if tf.fileobj.read().strip(b"\0"):
+            raise ValueError("data after the last readable member")
+except Exception as exc:  # truncated gzip, not a tar, unreadable member, trailing garbage
     print(f"[{tag}] ERROR: archive unreadable after {extracted} member(s) "
           f"({type(exc).__name__}: {exc})", file=sys.stderr)
     sys.exit(2)
@@ -429,19 +435,26 @@ of_plugins_fetch() {
 # Restore is best-effort BY DESIGN: a gateway that boots empty is degraded, but a
 # gateway that refuses to boot is down (Dogma 2). HTTP 404 is the first-boot case
 # and is not an error.
-# openfathom-meta ENG-373, decided by the Tech Lead on 2026-11-09 ("Geração 0, cai no
-# merge"). A restore that FAILED after the generation was read used to leave that
+# openfathom-meta ENG-373, decided by the Tech Lead on 2026-11-09 ("Estacionar, com ERROR e
+# alerta", 11:11 -03:00, replacing an earlier "Geração 0, cai no merge" given on a wrong
+# premise of mine). A restore that FAILED after the generation was read used to leave that
 # generation in place: the first periodic upload then matched it and replaced the live
 # snapshot with this boot's near-empty state -- no superset check runs on that path, only
-# on the 412 one. Forgetting the generation sends the first upload with
-# ifGenerationMatch=0, which GCS refuses with 412 while the live object exists, and the
-# 412 path downloads the live snapshot and merges into it (or parks this state as a
-# conflict when it cannot). Nothing on either side is lost. Blocking the uploads instead
-# would have kept the live object and silently dropped every message of a boot that
-# lasts days.
-of_state_forget_generation() {
+# on the 412 one. Now the generation AND the epoch are forced to 0: the first upload goes
+# with ifGenerationMatch=0, GCS answers 412 while the live object exists, and the 412 path
+# sees a live epoch newer than ours and PARKS this boot's state as a conflict object
+# instead of merging or replacing (a partial extraction may have landed .state_epoch, and
+# merging then would upload this boot's incomplete plans/, pairing/ and cron/ over the
+# live ones -- hence the epoch is forced too, not read). The live snapshot is never
+# touched; this boot's state survives only in the parked objects (expired after 90 days,
+# recovered by hand), and this boot's memories are lost at the next restart. Hence ERROR,
+# which the gateway_monitoring alert in openfathom-infra pages on: the remedy is to
+# restart the VM, which retries the restore.
+of_state_restore_failed() {
   of_state_generation=0
-  echo "[of-state] restore failed -- generation forgotten, the first upload merges into the live snapshot instead of replacing it (ENG-373)" >&2
+  of_state_epoch=0
+  of_state_restore_failed=1
+  echo "[of-state] ERROR: restore failed -- generation and epoch forced to 0, so this boot's uploads park as conflicts and never touch the live snapshot; restart the VM to retry the restore (ENG-373)" >&2
 }
 
 of_state_restore() {
@@ -468,7 +481,7 @@ except Exception: print(0)' 2>/dev/null || echo 0)"
     200) ;;
     404) echo "[of-state] no snapshot yet (first boot) -- starting with empty state"; rm -f "$tarball"; return 0 ;;
     *)   echo "[of-state] WARN: restore failed (HTTP ${code}); starting with empty state" >&2
-         of_state_forget_generation
+         of_state_restore_failed
          rm -f "$tarball"; return 0 ;;
   esac
   # ENG-373: member by member, state paths only (of_safe_extract says why). A refusal is
@@ -479,7 +492,7 @@ except Exception: print(0)' 2>/dev/null || echo 0)"
     echo "[of-state] restore: ${counts}"
   else
     echo "[of-state] WARN: snapshot present but did not extract; starting with empty state" >&2
-    of_state_forget_generation
+    of_state_restore_failed
   fi
   rm -f "$tarball"
 
@@ -491,7 +504,7 @@ except Exception: print(0)' 2>/dev/null || echo 0)"
   #
   # Absent or unreadable -> 0. Everything written before this ADR has no .state_epoch, so
   # 0 is what they all get, comparisons are `>=`, and nothing needs migrating.
-  of_state_epoch="$(of_state_read_local_epoch)"
+  [[ -n "${of_state_restore_failed:-}" ]] || of_state_epoch="$(of_state_read_local_epoch)"
   echo "[of-state] state epoch ${of_state_epoch}"
 }
 
@@ -1185,11 +1198,14 @@ PY
 #
 # Best-effort by design, same as of_state_restore (Dogma 2): a gateway that boots with
 # fewer memories than it should is degraded, not down.
-# openfathom-meta ENG-373: the same reason and the same remedy as
-# of_state_forget_generation, for the memories object and its own compare-and-swap.
+# openfathom-meta ENG-373: the same reason as of_state_restore_failed, for the memories
+# object and its own compare-and-swap. With the generation forgotten the first upload gets
+# a 412 and the merge path unions with the live memories -- or, when of_state_restore_failed
+# also forced our epoch to 0, gives up each cycle without writing. Either way the live
+# memories are never replaced by this boot's.
 of_memories_forget_generation() {
   of_memories_generation=0
-  echo "[of-memories] restore failed -- generation forgotten, the first upload merges into the live memories instead of replacing them (ENG-373)" >&2
+  echo "[of-memories] restore failed -- generation forgotten, the live memories are never replaced by this boot's (ENG-373)" >&2
 }
 
 of_memories_restore() {
@@ -1297,7 +1313,8 @@ of_memories_write_with_merge_retry() {
     fi
 
     local live_extract; live_extract="$(mktemp -d)"
-    if ! tar xzf "$live" -C "$live_extract" 2>/dev/null; then
+    # ENG-373: the live object is whatever the bucket holds -- same extraction as the restore.
+    if ! of_safe_extract "$live" "$live_extract" of-memories files >/dev/null; then
       echo "[of-memories] WARN: live memories tarball did not extract -- giving up this cycle" >&2
       rm -f "$live"; rm -rf "$live_extract"; return 0
     fi
