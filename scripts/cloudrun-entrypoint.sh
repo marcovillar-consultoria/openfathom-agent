@@ -35,6 +35,10 @@
 #                   $HERMES_HOME/plugins/ and enabled via plugins.enabled. Same out-of-band
 #                   contract as the skills tarball. Unset -> the block is skipped and the
 #                   gateway has no delegation tool.
+#   HERMES_SKILLS_SHA256 / HERMES_PLUGINS_SHA256  openfathom-meta ENG-373. The sha256 of
+#                   the tarball each *_OBJECT names, pinned beside it in openfathom-infra.
+#                   With the object set, an unset, malformed or mismatched pin refuses the
+#                   tarball (an ERROR line, and the boot goes on without that bundle).
 #   HERMES_JOB_OUTPUT  where to write the job's stdout (default $HERMES_HOME/job-output.txt)
 #   HERMES_INFERENCE_PROVIDER / HERMES_INFERENCE_MODEL  honored in BOTH modes, but
 #                   through two different mechanisms, because the two modes resolve the
@@ -215,6 +219,11 @@ of_skills_fetch() {
     echo "[of-skills] WARN: fetch of gs://${HERMES_STATE_BUCKET}/${HERMES_SKILLS_OBJECT} failed (HTTP ${code})" >&2
     rm -f "$tarball"; return 1
   fi
+  # ENG-373: refuse before touching $dest, so a refused tarball changes nothing on disk.
+  local sha
+  if ! sha="$(of_verify_sha256 "$tarball" "${HERMES_SKILLS_SHA256:-}" of-skills HERMES_SKILLS_SHA256)"; then
+    rm -f "$tarball"; return 1
+  fi
 
   # Replace wholesale: a stale skill left behind by a previous boot would keep being
   # advertised to the model after it was deleted upstream. u+w first: a container
@@ -233,7 +242,7 @@ of_skills_fetch() {
     echo "[of-skills] WARN: extracted tarball contains no SKILL.md -- refusing to point external_dirs at an empty tree" >&2
     return 1
   fi
-  echo "[of-skills] loaded ${n} skill(s) from gs://${HERMES_STATE_BUCKET}/${HERMES_SKILLS_OBJECT}$(of_make_read_only "$dest" of-skills)"
+  echo "[of-skills] loaded ${n} skill(s) from gs://${HERMES_STATE_BUCKET}/${HERMES_SKILLS_OBJECT} (sha256 ${sha})$(of_make_read_only "$dest" of-skills)"
   return 0
 }
 
@@ -259,6 +268,155 @@ of_make_read_only() {
   fi
 }
 
+# openfathom-meta ENG-373. The skills and plugins tarballs are fetched BY NAME from a
+# bucket the CI identity can write (GCS grants projectEditor roles/storage.legacyBucketOwner,
+# which carries storage.objects.create), and Data Access logs are off -- so before this, a
+# write to the bucket alone swapped code the gateway loads at boot, with no trace. The
+# expected digest is pinned next to the object name in openfathom-infra
+# environments/prod/main.tf. What this does NOT close: the pin itself lives in the VM's
+# user-data, which roles/editor can rewrite (compute.instances.setMetadata) -- that path
+# is openfathom-meta ENG-372, and it shows up as Terraform drift and in Admin Activity.
+#
+# Prints the verified digest on stdout and returns 0, or says why on stderr and returns 1.
+# Unset, malformed and mismatched all refuse: an unpinned object is exactly what this
+# exists to stop, so "no pin" is never read as "no check". Surrounding whitespace and
+# upper-case hex are forgiven (a tfvars value or a copy-paste can carry them); anything
+# else that is not 64 hex characters is refused rather than guessed at.
+of_verify_sha256() { # <file> <pinned> <log-tag> <env-var-name>
+  local file="$1" want="$2" tag="$3" var="$4" got
+  want="${want#"${want%%[![:space:]]*}"}"; want="${want%"${want##*[![:space:]]}"}"
+  want="${want,,}"
+  if [[ -z "$want" ]]; then
+    echo "[${tag}] ERROR: ${var} is unset -- refusing to load an unpinned tarball (ENG-373)" >&2
+    return 1
+  fi
+  if [[ ! "$want" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "[${tag}] ERROR: ${var} is not a sha256 (64 hex characters) -- refusing to load (ENG-373)" >&2
+    return 1
+  fi
+  got="$(sha256sum "$file" 2>/dev/null | cut -d' ' -f1)"
+  if [[ "$got" != "$want" ]]; then
+    echo "[${tag}] ERROR: sha256 mismatch: got ${got:-none}, ${var} pins ${want} -- refusing to load (ENG-373)" >&2
+    return 1
+  fi
+  printf '%s' "$got"
+}
+
+# openfathom-meta ENG-373. Extract a tarball member by member instead of `tar xzf`, so a
+# tarball the bucket's other writers produced cannot land what the boot already decided.
+# Measured on origin/cloudrun 87fefe6a: the state restore ran AFTER the boot had written
+# config.yaml (toolsets off, approvals.mode=manual, skills.external_dirs) and extracted
+# the whole snapshot into $HERMES_HOME -- so a snapshot carrying config.yaml, .env (which
+# hermes_cli/env_loader.py lets override the process environment), skills/, plugins/ or
+# hooks/ undid all of it.
+#
+# Only regular files and directories are written; links, devices, absolute paths, `..`,
+# and a path that would pass through a link already on disk are refused and counted.
+# Mode `state` also refuses anything of_state_snapshot does not write (*.db at the top,
+# plans/, pairing/, cron/, .state_epoch, and memories/ from snapshots older than ENG-103).
+# Mode `files` keeps every regular file and directory (the memories tarball, extracted
+# into a scratch directory and then unioned entry by entry).
+#
+# Prints "N extracted, M refused" and exits 0 when the archive was read to the end --
+# refusals are not a failure, they are the point. Exits 2 when the archive cannot be read
+# (truncated, not gzip, not tar), after removing every file and new directory it had
+# already written -- a partial extraction never stays on disk: the caller treats that as a
+# failed restore.
+of_safe_extract() { # <tarball> <dest> <log-tag> <state|files>
+  python3 - "$1" "$2" "$3" "$4" <<'PYEOF'
+import os, shutil, sys, tarfile
+
+tarball, dest, tag, mode = sys.argv[1:5]
+STATE_DIRS = {"plans", "pairing", "cron", "memories"}
+STATE_FILES = {".state_epoch"}
+
+
+def allowed(parts, is_dir):
+    if mode != "state":
+        return True
+    top = parts[0]
+    if len(parts) > 1:
+        return top in STATE_DIRS
+    if is_dir:
+        return top in STATE_DIRS
+    return top in STATE_FILES or top.endswith(".db")
+
+
+def through_link(parts):
+    probe = dest
+    for p in parts:
+        probe = os.path.join(probe, p)
+        if os.path.islink(probe):
+            return True
+    return False
+
+
+extracted, refused = 0, []
+written, made = [], []   # this run's files and new directories, removed if the archive breaks
+
+
+def mkdirs(path):
+    missing = []
+    while not os.path.isdir(path):
+        missing.append(path)
+        path = os.path.dirname(path)
+    for d in reversed(missing):
+        os.mkdir(d)
+        made.append(d)
+
+
+os.makedirs(dest, exist_ok=True)
+try:
+    with tarfile.open(tarball, "r:gz") as tf:
+        for m in tf:
+            parts = [p for p in m.name.split("/") if p not in ("", ".")]
+            if not parts:
+                continue
+            ok = (not m.name.startswith("/") and ".." not in parts
+                  and (m.isfile() or m.isdir()) and allowed(parts, m.isdir())
+                  and not through_link(parts))
+            if not ok:
+                refused.append(m.name)
+                continue
+            target = os.path.join(dest, *parts)
+            if m.isdir():
+                mkdirs(target)
+                continue
+            mkdirs(os.path.dirname(target))
+            src = tf.extractfile(m)
+            written.append(target)
+            with src, open(target, "wb") as out:
+                shutil.copyfileobj(src, out)
+            os.chmod(target, (m.mode & 0o755) | 0o600)
+            extracted += 1
+        # tarfile stops silently at a bad header after the first member, and the gzip CRC
+        # is only checked at the end of the stream: read what follows the last member and
+        # require the zero padding of a real end of archive, which also reaches the CRC.
+        tf.fileobj.seek(tf.offset)
+        if tf.fileobj.read().strip(b"\0"):
+            raise ValueError("data after the last readable member")
+except Exception as exc:  # truncated gzip, not a tar, unreadable member, trailing garbage
+    # A half-written state.db is worse than none: take back everything this run wrote, so
+    # a failed restore really leaves the state it says it leaves (empty, not partial).
+    for path in written:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    for d in reversed(made):
+        try:
+            os.rmdir(d)
+        except OSError:
+            pass
+    print(f"[{tag}] ERROR: archive unreadable after {extracted} member(s), "
+          f"{len(written)} written file(s) removed ({type(exc).__name__}: {exc})", file=sys.stderr)
+    sys.exit(2)
+for name in refused[:20]:
+    print(f"[{tag}] WARN: refused archive member {name!r} (ENG-373)", file=sys.stderr)
+print(f"{extracted} extracted, {len(refused)} refused")
+PYEOF
+}
+
 # ADR-052. Fetch the OpenFathom plugin tarball and extract it into $1 -- a
 # $HERMES_HOME/plugins/ directory Hermes scans for user plugins. Returns non-zero (and
 # says why) unless the directory ends up with at least one plugin.yaml; the caller uses
@@ -273,6 +431,11 @@ of_plugins_fetch() {
     "https://storage.googleapis.com/storage/v1/b/${HERMES_STATE_BUCKET}/o/${HERMES_PLUGINS_OBJECT}?alt=media" || echo 000)"
   if [[ "$code" != "200" ]]; then
     echo "[of-plugins] WARN: fetch of gs://${HERMES_STATE_BUCKET}/${HERMES_PLUGINS_OBJECT} failed (HTTP ${code})" >&2
+    rm -f "$tarball"; return 1
+  fi
+  # ENG-373: refuse before touching $dest, so a refused tarball changes nothing on disk.
+  local sha
+  if ! sha="$(of_verify_sha256 "$tarball" "${HERMES_PLUGINS_SHA256:-}" of-plugins HERMES_PLUGINS_SHA256)"; then
     rm -f "$tarball"; return 1
   fi
 
@@ -292,16 +455,39 @@ of_plugins_fetch() {
     echo "[of-plugins] WARN: extracted tarball contains no plugin.yaml -- refusing to enable an empty plugins dir" >&2
     return 1
   fi
-  echo "[of-plugins] loaded ${n} plugin(s) from gs://${HERMES_STATE_BUCKET}/${HERMES_PLUGINS_OBJECT}$(of_make_read_only "$dest" of-plugins)"
+  echo "[of-plugins] loaded ${n} plugin(s) from gs://${HERMES_STATE_BUCKET}/${HERMES_PLUGINS_OBJECT} (sha256 ${sha})$(of_make_read_only "$dest" of-plugins)"
   return 0
 }
 
 # Restore is best-effort BY DESIGN: a gateway that boots empty is degraded, but a
 # gateway that refuses to boot is down (Dogma 2). HTTP 404 is the first-boot case
 # and is not an error.
+# openfathom-meta ENG-373, decided by the Tech Lead on 2026-11-09 ("Estacionar, com ERROR e
+# alerta", 11:11 -03:00, replacing an earlier "Geração 0, cai no merge" given on a wrong
+# premise of mine). A restore that FAILED after the generation was read used to leave that
+# generation in place: the first periodic upload then matched it and replaced the live
+# snapshot with this boot's near-empty state -- no superset check runs on that path, only
+# on the 412 one. Now the generation AND the epoch are forced to 0: the first upload goes
+# with ifGenerationMatch=0, GCS answers 412 while the live object exists, and the 412 path
+# sees a live epoch newer than ours and PARKS this boot's state as a conflict object
+# instead of merging or replacing (a partial extraction may have landed .state_epoch, and
+# merging then would upload this boot's incomplete plans/, pairing/ and cron/ over the
+# live ones -- hence the epoch is forced too, not read). The live snapshot is never
+# touched; this boot's state survives only in the parked objects (expired after 90 days,
+# recovered by hand), and this boot's memories never reach the live memories object
+# (of_memories_restore forgets its generation too, so its uploads give up). Hence ERROR,
+# which the gateway_monitoring alert in openfathom-infra pages on: the remedy is to
+# restart the VM, which retries the restore.
+of_state_restore_failed() {
+  of_state_generation=0
+  of_state_epoch=0
+  of_state_restore_failed=1
+  echo "[of-state] ERROR: restore failed -- generation and epoch forced to 0, so this boot's uploads park as conflicts and never touch the live snapshot; restart the VM to retry the restore (ENG-373)" >&2
+}
+
 of_state_restore() {
   local tok code tarball="${TMPDIR:-/tmp}/of-state-restore.tar.gz"
-  tok="$(of_metadata_token)" || { echo "[of-state] WARN: no metadata token; starting with empty state" >&2; return 0; }
+  tok="$(of_metadata_token)" || { echo "[of-state] WARN: no metadata token" >&2; of_state_restore_failed; return 0; }
 
   # Record the generation we are about to read, for the compare-and-swap in
   # of_state_snapshot(). A metadata GET (no alt=media) is the documented way to
@@ -322,12 +508,19 @@ except Exception: print(0)' 2>/dev/null || echo 0)"
   case "$code" in
     200) ;;
     404) echo "[of-state] no snapshot yet (first boot) -- starting with empty state"; rm -f "$tarball"; return 0 ;;
-    *)   echo "[of-state] WARN: restore failed (HTTP ${code}); starting with empty state" >&2; rm -f "$tarball"; return 0 ;;
+    *)   echo "[of-state] WARN: restore failed (HTTP ${code}); starting with empty state" >&2
+         of_state_restore_failed
+         rm -f "$tarball"; return 0 ;;
   esac
-  if tar xzf "$tarball" -C "${HERMES_HOME:-/opt/data}" 2>/dev/null; then
+  # ENG-373: member by member, state paths only (of_safe_extract says why). A refusal is
+  # counted and the boot goes on; an archive that cannot be read is a failed restore.
+  local counts
+  if counts="$(of_safe_extract "$tarball" "${HERMES_HOME:-/opt/data}" of-state state)"; then
     echo "[of-state] restored snapshot from gs://${HERMES_STATE_BUCKET}/${HERMES_STATE_OBJECT}"
+    echo "[of-state] restore: ${counts}"
   else
     echo "[of-state] WARN: snapshot present but did not extract; starting with empty state" >&2
+    of_state_restore_failed
   fi
   rm -f "$tarball"
 
@@ -339,7 +532,7 @@ except Exception: print(0)' 2>/dev/null || echo 0)"
   #
   # Absent or unreadable -> 0. Everything written before this ADR has no .state_epoch, so
   # 0 is what they all get, comparisons are `>=`, and nothing needs migrating.
-  of_state_epoch="$(of_state_read_local_epoch)"
+  [[ -n "${of_state_restore_failed:-}" ]] || of_state_epoch="$(of_state_read_local_epoch)"
   echo "[of-state] state epoch ${of_state_epoch}"
 }
 
@@ -1033,12 +1226,28 @@ PY
 #
 # Best-effort by design, same as of_state_restore (Dogma 2): a gateway that boots with
 # fewer memories than it should is degraded, not down.
+# openfathom-meta ENG-373: the same reason as of_state_restore_failed, for the memories
+# object and its own compare-and-swap. Called when the memories download fails AND when the
+# state restore failed: a failed state restore forces our epoch to 0, and a memories upload
+# that still held the matched generation would stamp the live object with epoch 0 -- which
+# the next healthy boot (epoch 2) reads as "predates a reset" and replaces with the curated
+# memories only, losing every agent-written one (second diff-mode review, 2026-11-09). With
+# the generation forgotten the first upload gets a 412 and the merge path unions with the
+# live memories -- or, with our epoch forced to 0, gives up each cycle without writing.
+of_memories_forget_generation() {
+  of_memories_generation=0
+  echo "[of-memories] generation forgotten -- the live memories are never replaced by this boot's (ENG-373)" >&2
+}
+
 of_memories_restore() {
   local tok code tarball="${TMPDIR:-/tmp}/of-memories-restore.tar.gz"
   local mem_dir="${HERMES_HOME:-/opt/data}/memories"
   tok="$(of_metadata_token)" || { echo "[of-memories] WARN: no metadata token; starting with restored state only" >&2; return 0; }
 
   of_memories_generation="$(of_gcs_read_generation "$HERMES_STATE_BUCKET" "$HERMES_MEMORIES_OBJECT" "$tok")"
+  # ENG-373: of_state_restore ran first. If it failed, our epoch is 0 and must never stamp
+  # the live memories object -- see of_memories_forget_generation.
+  [[ -z "${of_state_restore_failed:-}" ]] || of_memories_forget_generation
 
   code="$(curl -sS -o "$tarball" -w '%{http_code}' --max-time 30 \
     -H "Authorization: Bearer ${tok}" \
@@ -1046,7 +1255,9 @@ of_memories_restore() {
   case "$code" in
     200) ;;
     404) echo "[of-memories] no memories snapshot yet (first boot)"; rm -f "$tarball"; return 0 ;;
-    *)   echo "[of-memories] WARN: memories restore failed (HTTP ${code}); starting with restored state only" >&2; rm -f "$tarball"; return 0 ;;
+    *)   echo "[of-memories] WARN: memories restore failed (HTTP ${code}); starting with restored state only" >&2
+         of_memories_forget_generation
+         rm -f "$tarball"; return 0 ;;
   esac
 
   # openfathom-meta ENG-104. of_state_restore already ran, so of_state_epoch holds the epoch
@@ -1059,12 +1270,15 @@ of_memories_restore() {
     return 0
   fi
 
-  local extract_dir; extract_dir="$(mktemp -d)"
-  if tar xzf "$tarball" -C "$extract_dir" 2>/dev/null; then
+  # ENG-373: regular files and directories only -- a link in this tarball would make
+  # of_memory_union read whatever it points at into the curated memories.
+  local extract_dir counts; extract_dir="$(mktemp -d)"
+  if counts="$(of_safe_extract "$tarball" "$extract_dir" of-memories files)"; then
     of_memory_union "$mem_dir" "$extract_dir"
-    echo "[of-memories] merged memories from gs://${HERMES_STATE_BUCKET}/${HERMES_MEMORIES_OBJECT}"
+    echo "[of-memories] merged memories from gs://${HERMES_STATE_BUCKET}/${HERMES_MEMORIES_OBJECT} (${counts})"
   else
     echo "[of-memories] WARN: memories snapshot present but did not extract" >&2
+    of_memories_forget_generation
   fi
   rm -rf "$extract_dir" "$tarball"
 }
@@ -1133,7 +1347,8 @@ of_memories_write_with_merge_retry() {
     fi
 
     local live_extract; live_extract="$(mktemp -d)"
-    if ! tar xzf "$live" -C "$live_extract" 2>/dev/null; then
+    # ENG-373: the live object is whatever the bucket holds -- same extraction as the restore.
+    if ! of_safe_extract "$live" "$live_extract" of-memories files >/dev/null; then
       echo "[of-memories] WARN: live memories tarball did not extract -- giving up this cycle" >&2
       rm -f "$live"; rm -rf "$live_extract"; return 0
     fi
@@ -2288,11 +2503,13 @@ PYEOF
     fi
 
     # ADR-052 (+ its follow-up). The Sonda's tools ship as user plugins delivered here, the
-    # same out-of-band contract as the skills tarball (the CI does not write the object). Two
-    # config writes, both deliberate: plugins.enabled opts EVERY delivered plugin in --
-    # enumerating the delivered dir rather than a hardcoded name means adding a plugin needs
-    # only a re-published tarball, no fork change, and the tarball is Tech-Lead-published so
-    # its contents are vouched-for. And approvals.mode is pinned to `manual` so an
+    # same out-of-band contract as the skills tarball. The CI CAN write the object
+    # (openfathom-meta ENG-373: projectEditor holds roles/storage.legacyBucketOwner), so the
+    # tarball is loaded only when its sha256 matches HERMES_PLUGINS_SHA256, pinned in the
+    # same infra change that names it. Two config writes, both deliberate: plugins.enabled
+    # opts EVERY delivered plugin in -- enumerating the delivered dir rather than a hardcoded
+    # name means adding a plugin needs only a re-published tarball and its pin, no fork
+    # change, and what the pin vouches for is the bytes the Tech Lead published. And approvals.mode is pinned to `manual` so an
     # approval-gated tool's request_tool_approval actually prompts -- the gate bypasses under
     # `off`, and trusting the default to stay `manual` is the kind of silent assumption this
     # repo pays for. Neither reopens exec on the gateway (ADR-043 holds): a delivered tool
@@ -2341,6 +2558,22 @@ PYEOF
     # both gateway starts below, and outside the optional skills/plugins blocks.
     mkdir -p "${HERMES_HOME:-/opt/data}/scripts" 2>/dev/null || true
     echo "[of-scripts] ${HERMES_HOME:-/opt/data}/scripts$(of_make_read_only "${HERMES_HOME:-/opt/data}/scripts" of-scripts ENG-361)"
+
+    # openfathom-meta ENG-362. The same lock, for the two other directories whose files the
+    # gateway imports: gateway/hooks.py loads every hooks/*/handler.py into its own process
+    # at start (import_user_code -> exec_module), and a profile created under profiles/ at
+    # run time is served live, with its own hooks/ (measured 2026-11-07 on the production
+    # image, of-13 section 65). Locked HERE, above of_state_restore, so nothing a snapshot
+    # carries can land in them first; of_safe_extract refuses both paths as well. Operator
+    # hooks and named profiles now ship in the image or not at all. A non-empty directory
+    # (a container restart over a surviving $HERMES_HOME) is named, because its contents
+    # are loaded read-only rather than discarded.
+    for of_d in hooks profiles; do
+      mkdir -p "${HERMES_HOME:-/opt/data}/${of_d}" 2>/dev/null || true
+      of_n="$(find "${HERMES_HOME:-/opt/data}/${of_d}" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)"
+      [[ "$of_n" -eq 0 ]] || echo "[of-${of_d}] WARN: ${HERMES_HOME:-/opt/data}/${of_d} already holds ${of_n} entr(y/ies) -- locked as they are (ENG-362)" >&2
+      echo "[of-${of_d}] ${HERMES_HOME:-/opt/data}/${of_d}$(of_make_read_only "${HERMES_HOME:-/opt/data}/${of_d}" "of-${of_d}" ENG-362)"
+    done
 
     # ENG-45. Without a bucket configured this whole block is skipped and the old
     # `exec hermes gateway run` semantics are kept exactly -- that is the contract

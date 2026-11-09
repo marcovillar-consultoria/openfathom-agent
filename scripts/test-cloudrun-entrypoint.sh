@@ -39,7 +39,7 @@ extract_fns() { # extract_fns <dest> [sed-mutation]
   local dest="$1" mutation="${2:-}"
   : > "$dest"
   local fn
-  for fn in of_state_read_local_epoch of_state_tarball_epoch of_state_messages_superset of_state_try_promote of_state_merge_messages of_state_snapshot_upload of_state_snapshot of_state_sync_loop of_gcs_read_generation of_memory_union of_memories_tarball_epoch of_memories_restore of_memories_snapshot of_memories_write_with_merge_retry of_memories_sync_loop; do
+  for fn in of_state_read_local_epoch of_state_tarball_epoch of_state_messages_superset of_state_try_promote of_state_merge_messages of_state_snapshot_upload of_state_snapshot of_state_sync_loop of_gcs_read_generation of_memory_union of_memories_tarball_epoch of_memories_restore of_memories_snapshot of_memories_write_with_merge_retry of_memories_sync_loop of_safe_extract of_state_restore_failed of_memories_forget_generation of_state_restore; do
     awk -v f="$fn" '$0 ~ "^"f"\\(\\) \\{" {p=1} p {print} p && /^\}$/ {exit}' "$ENTRYPOINT" >> "$dest"
     echo >> "$dest"
   done
@@ -143,6 +143,8 @@ curl() {
   if [[ "$url" == *"?alt=media"* ]]; then
     local served="$LIVE"
     [[ -n "$CAS_ENFORCED" ]] && served="$CAS_LIVE"
+    # ENG-373: LIVE="HTTP<code>" serves that code (a 5xx after the generation was read).
+    if [[ "$served" == HTTP* ]]; then echo "${served#HTTP}"; return 0; fi
     if [[ -n "$served" && -f "$served" ]]; then
       [[ -n "$out" ]] && cp -f "$served" "$out"; echo "200"
     else
@@ -1080,6 +1082,9 @@ PLUG_FN="$WORK/plug.sh"
 awk '/^of_plugins_fetch\(\) \{/{p=1} p{print} p&&/^\}$/{exit}' "$ENTRYPOINT" > "$PLUG_FN"
 # of_plugins_fetch's "loaded" line calls of_make_read_only (ENG-338); define it too.
 awk '/^of_make_read_only\(\) \{/{p=1} p{print} p&&/^\}$/{exit}' "$ENTRYPOINT" >> "$PLUG_FN"
+# ... and the pin check (ENG-373).
+awk '/^of_verify_sha256\(\) \{/{p=1} p{print} p&&/^\}$/{exit}' "$ENTRYPOINT" >> "$PLUG_FN"
+grep -q "of_verify_sha256() {" "$PLUG_FN" || { echo "FATAL: of_verify_sha256 extraction failed" >&2; exit 1; }
 grep -q "of_make_read_only() {" "$PLUG_FN" || { echo "FATAL: of_make_read_only extraction failed" >&2; exit 1; }
 grep -q "of_plugins_fetch() {" "$PLUG_FN" || { echo "FATAL: of_plugins_fetch extraction failed" >&2; exit 1; }
 # shellcheck disable=SC1090
@@ -1101,15 +1106,20 @@ mk_no_manifest_tarball() { # <out> -- non-empty, but no plugin.yaml anywhere
 PLUG_OK="$WORK/plug-ok.tar.gz"; mk_plugin_tarball "$PLUG_OK"
 PLUG_NO="$WORK/plug-no.tar.gz"; mk_no_manifest_tarball "$PLUG_NO"
 PDIR="$WORK/plugdest"
+sha_of() { sha256sum "$1" | cut -d' ' -f1; }
+# ENG-373: a fetch now loads only the tarball its pin names, so each case pins the one it serves.
+export HERMES_PLUGINS_SHA256="$(sha_of "$PLUG_OK")"
 
 reset_stub; LIVE="$PLUG_OK"
 of_plugins_fetch "$PDIR" >/dev/null 2>&1; rc=$?
 check "valid plugin tarball -> fetch ok"       "0"   "$rc"
 check "plugin.yaml landed in dest"             "yes" "$([[ -f "$PDIR/delegation-tasks/plugin.yaml" ]] && echo yes || echo no)"
 
-reset_stub; LIVE="$PLUG_NO"
-of_plugins_fetch "$PDIR" >/dev/null 2>&1; rc=$?
+reset_stub; LIVE="$PLUG_NO"; HERMES_PLUGINS_SHA256="$(sha_of "$PLUG_NO")"
+of_plugins_fetch "$PDIR" 2>"$WORK/plug-no.err" >/dev/null; rc=$?
 check "tarball with no plugin.yaml -> refuses" "1"   "$rc"
+check "... for the manifest, not the pin"      "1"   "$(grep -c 'no plugin.yaml' "$WORK/plug-no.err")"
+HERMES_PLUGINS_SHA256="$(sha_of "$PLUG_OK")"
 
 reset_stub; LIVE=""   # HTTP 404 from the stub
 of_plugins_fetch "$PDIR" >/dev/null 2>&1; rc=$?
@@ -1143,6 +1153,7 @@ mk_skill_tarball() { # <out> -- a tarball of_skills_fetch accepts: one SKILL.md
   tar czf "$out" -C "$d" .
 }
 SKILL_OK="$WORK/skill-ok.tar.gz"; mk_skill_tarball "$SKILL_OK"
+export HERMES_SKILLS_SHA256="$(sha_of "$SKILL_OK")"
 
 if [[ "$(id -u)" -eq 0 ]]; then
   bad "ENG-338 cases run as root, which ignores file modes -- they cannot prove read-only here"
@@ -1280,7 +1291,8 @@ if grep -q "if false; then" "$WORK/plug-mut.sh"; then
   reset_stub; LIVE="$PLUG_NO"
   # Guarded version refused PLUG_NO with rc 1 above; with the guard gone it accepts the
   # manifest-less tarball (rc 0) -- the fail-open the guard exists to stop.
-  mrc="$( source "$WORK/plug-mut.sh"; of_plugins_fetch "$WORK/pm" >/dev/null 2>&1; echo "$?" )"
+  # ENG-373: pinned to the tarball it serves, so the pin is not what refuses it.
+  mrc="$( source "$WORK/plug-mut.sh"; HERMES_PLUGINS_SHA256="$(sha_of "$PLUG_NO")"; of_plugins_fetch "$WORK/pm" >/dev/null 2>&1; echo "$?" )"
   check "guard removed -> empty tarball accepted (rc 0); the guard is load-bearing" "0" "$mrc"
 else
   bad "plugin mutant did not apply -- a mutant that does not mutate proves nothing"
@@ -2326,6 +2338,467 @@ check "the effort is written as the string medium" \
   "1" "$(grep -c '_set_nested(cfg, "agent.reasoning_effort", "medium")' "$ENTRYPOINT")"
 check "the Gemini fallback is not pinned off (its native adapter separates reasoning)" \
   "0" "$(grep -c 'gemini-3.6-flash"\] = "none"' "$ENTRYPOINT")"
+
+# ---------------------------------------------------------------------------
+# openfathom-meta ENG-373 and ENG-362. Three properties, each with its input domain and
+# its mutants (the plan's item-30 list, one case or refusal per line):
+#   1. the pin -- a skills/plugins tarball loads only when its sha256 is the pinned one;
+#   2. the restore -- a snapshot lands only the paths of_state_snapshot writes, as regular
+#      files and directories, and a restore that fails forgets the generation it read, so
+#      the first upload merges into the live snapshot instead of replacing it;
+#   3. the lock -- hooks/ and profiles/ are read-only before of_state_restore runs.
+# ---------------------------------------------------------------------------
+echo "== case: ENG-373 -- the pin =="
+PIN_DEST="$WORK/pin-dest"
+pin_fetch() { # <pin> <served> -> "rc|stderr"; dest holds a marker the refusal must not touch
+  chmod -R u+w "$PIN_DEST" 2>/dev/null; rm -rf "$PIN_DEST"; mkdir -p "$PIN_DEST"; : > "$PIN_DEST/marker"
+  reset_stub; LIVE="$2"
+  local out rc; out="$( (HERMES_PLUGINS_SHA256="$1"; of_plugins_fetch "$PIN_DEST" 2>&1 >/dev/null) )"; rc=$?
+  printf '%s|%s' "$rc" "$out"
+}
+OK_SHA="$(sha_of "$PLUG_OK")"
+PLUG_TRUNC="$WORK/plug-trunc.tar.gz"; head -c 40 "$PLUG_OK" > "$PLUG_TRUNC"
+r="$(pin_fetch "" "$PLUG_OK")"
+check "pin unset -> refused"                       "1"   "${r%%|*}"
+check "... says unset, names the variable"         "1"   "$(grep -c 'HERMES_PLUGINS_SHA256 is unset' <<< "${r#*|}")"
+check "... and touched nothing in dest"            "yes" "$([[ -f "$PIN_DEST/marker" ]] && echo yes || echo no)"
+r="$(pin_fetch "abc123" "$PLUG_OK")"
+check "pin malformed -> refused"                   "1"   "${r%%|*}"
+check "... as not a sha256"                        "1"   "$(grep -c 'is not a sha256' <<< "${r#*|}")"
+r="$(pin_fetch "${OK_SHA:0:32} ${OK_SHA:32}" "$PLUG_OK")"
+check "pin with an inner space -> refused"         "1"   "${r%%|*}"
+r="$(pin_fetch "$(sha_of "$PLUG_NO")" "$PLUG_OK")"
+check "the right hash of ANOTHER tarball -> refused" "1" "${r%%|*}"
+check "... as a mismatch"                          "1"   "$(grep -c 'sha256 mismatch' <<< "${r#*|}")"
+r="$(pin_fetch "$OK_SHA" "$PLUG_TRUNC")"
+check "a truncated tarball under the full pin -> refused" "1" "${r%%|*}"
+r="$(pin_fetch "$OK_SHA" "")"
+check "download fails (404) -> refused, as before" "1"   "${r%%|*}"
+r="$(pin_fetch "$(printf '  %s\n' "${OK_SHA^^}")" "$PLUG_OK")"
+check "surrounding whitespace, a newline and upper-case hex -> loads" "0" "${r%%|*}"
+reset_stub; LIVE="$PLUG_OK"
+pin_line="$( (HERMES_PLUGINS_SHA256="$OK_SHA"; of_plugins_fetch "$PIN_DEST" 2>/dev/null) )"
+check "the loaded line prints the verified digest" "yes" "$([[ "$pin_line" == *"(sha256 ${OK_SHA})"* ]] && echo yes || echo no)"
+reset_stub; LIVE="$SKILL_OK"
+out="$( (HERMES_SKILLS_SHA256="$(sha_of "$PLUG_OK")"; of_skills_fetch "$WORK/pin-skills" 2>&1 >/dev/null) )"; rc=$?
+check "of_skills_fetch: a mismatched pin -> refused" "1" "$rc"
+check "... with its own tag and variable"          "1"   "$(grep -c '\[of-skills\] ERROR: sha256 mismatch' <<< "$out")"
+
+echo "== case: ENG-373 -- the restore lands only state =="
+# The honest snapshot, as of_state_snapshot writes it, plus every member the domain list
+# names. Built in Python because tar(1) will not write an absolute name or a hardlink to
+# order, and the point is to hand the extractor what an attacker would.
+mk_restore_tarball() { # <out> <honest|evil>
+  python3 - "$1" "$2" <<'PY'
+import io, sys, tarfile, time
+out, kind = sys.argv[1], sys.argv[2]
+def add(tf, name, data=b"x", **kw):
+    ti = tarfile.TarInfo(name); ti.mtime = int(time.time())
+    for k, v in kw.items(): setattr(ti, k, v)
+    if ti.type in (tarfile.REGTYPE, tarfile.AREGTYPE):
+        ti.size = len(data); tf.addfile(ti, io.BytesIO(data))
+    else:
+        tf.addfile(ti)
+with tarfile.open(out, "w:gz") as tf:
+    add(tf, "./.state_epoch", b"3\n")
+    add(tf, "./state.db", b"honest-db")
+    add(tf, "./plans", type=tarfile.DIRTYPE, mode=0o755)
+    add(tf, "./plans/p.md", b"plan")
+    add(tf, "./pairing/telegram.json", b"{}")
+    add(tf, "./cron/jobs.json", b"[]")
+    if kind == "evil":
+        add(tf, "./config.yaml", b"agent: {disabled_toolsets: []}\n")
+        add(tf, "./.env", b"TELEGRAM_ALLOWED_USERS=*\n")
+        add(tf, "./skills/x/SKILL.md", b"evil")
+        add(tf, "skills/y/SKILL.md", b"evil")
+        add(tf, "./openfathom-skills/x/SKILL.md", b"evil")
+        add(tf, "./hooks/h/handler.py", b"raise SystemExit")
+        add(tf, "./profiles/p/SOUL.md", b"evil")
+        add(tf, "./scripts/p.sh", b"id")
+        add(tf, "./plans/l", type=tarfile.SYMTYPE, linkname="/etc/passwd")
+        add(tf, "./pairing/h", type=tarfile.LNKTYPE, linkname="./state.db")
+        add(tf, "./foo", type=tarfile.SYMTYPE, linkname="plugins")
+        add(tf, "./foo/x", b"evil")
+        add(tf, "../x", b"evil")
+        add(tf, "/etc/x", b"evil")
+PY
+}
+RS_HONEST="$WORK/rs-honest.tar.gz"; mk_restore_tarball "$RS_HONEST" honest
+RS_EVIL="$WORK/rs-evil.tar.gz";     mk_restore_tarball "$RS_EVIL" evil
+rs_home() { # fresh $HERMES_HOME holding the config the boot already wrote
+  RS_HOME="$WORK/rs-home-$1"; chmod -R u+w "$RS_HOME" 2>/dev/null; rm -rf "$RS_HOME"; mkdir -p "$RS_HOME"
+  printf 'SAFE\n' > "$RS_HOME/config.yaml"; export HERMES_HOME="$RS_HOME"
+}
+rs_home honest; reset_stub; LIVE="$RS_HONEST"; LIVE_GEN="42"; of_state_generation=""
+of_state_restore > "$WORK/rs-honest.out" 2>&1; out="$(cat "$WORK/rs-honest.out")"   # not $(...): the generation must reach this shell
+check "honest snapshot: every member extracted, none refused" "1" "$(grep -c 'restore: 5 extracted, 0 refused' <<< "$out")"
+check "honest snapshot: state.db, plans, pairing and cron landed" "4" \
+  "$(for f in state.db plans/p.md pairing/telegram.json cron/jobs.json; do [[ -f "$RS_HOME/$f" ]] && echo y; done | wc -l)"
+check "honest snapshot: the generation read is kept"  "42"  "$of_state_generation"
+check "honest snapshot: the epoch is read"            "3"   "$of_state_epoch"
+rs_home evil; reset_stub; LIVE="$RS_EVIL"; LIVE_GEN="42"
+out="$(of_state_restore 2>&1)"
+check "evil snapshot: the 5 state members land, all 14 others are refused" "1" "$(grep -c 'restore: 5 extracted, 14 refused' <<< "$out")"
+check "evil snapshot: config.yaml the boot wrote is untouched" "SAFE" "$(cat "$RS_HOME/config.yaml")"
+for f in .env skills openfathom-skills hooks profiles scripts foo plans/l pairing/h; do
+  check "evil snapshot: $f is not on disk" "no" "$([[ -e "$RS_HOME/$f" || -L "$RS_HOME/$f" ]] && echo yes || echo no)"
+done
+check "evil snapshot: nothing escaped the home (../x)" "no" "$([[ -e "$(dirname "$RS_HOME")/x" ]] && echo yes || echo no)"
+check "evil snapshot: each refusal is named"     "14"  "$(grep -c 'refused archive member' <<< "$out")"
+# A link already on disk is not a door either: cron -> outside, and a member under cron/.
+rs_home link; mkdir -p "$WORK/rs-outside"; ln -s "$WORK/rs-outside" "$RS_HOME/cron"
+reset_stub; LIVE="$RS_HONEST"
+out="$(of_state_restore 2>&1)"
+check "a member through a link on disk is refused" "1" "$(grep -c "refused archive member './cron/jobs.json'" <<< "$out")"
+check "... and nothing was written outside"       "no" "$([[ -e "$WORK/rs-outside/jobs.json" ]] && echo yes || echo no)"
+
+echo "== case: ENG-373 -- a failed restore forgets the generation =="
+RS_GARBAGE="$WORK/rs-garbage.tar.gz"; printf 'not a tarball\n' > "$RS_GARBAGE"
+RS_TRUNC="$WORK/rs-trunc.tar.gz"; head -c 60 "$RS_EVIL" > "$RS_TRUNC"
+for spec in "garbage|$RS_GARBAGE" "truncated|$RS_TRUNC" "HTTP 500 after the generation|HTTP500"; do
+  IFS='|' read -r label served <<< "$spec"
+  rs_home fail; reset_stub; LIVE="$served"; LIVE_GEN="42"; of_state_generation=""
+  of_state_restore > "$WORK/rs-fail.out" 2>&1; out="$(cat "$WORK/rs-fail.out")"
+  check "$label: generation forced to 0 (not 42)"  "0" "$of_state_generation"
+  check "$label: epoch forced to 0"               "0" "$of_state_epoch"
+  check "$label: says why, at ERROR"              "1" "$(grep -c '\[of-state\] ERROR: restore failed' <<< "$out")"
+done
+# What a failed restore must do with the first upload, in production's shape: the live
+# object at epoch 2 (read from the bucket on 2026-11-09), real compare-and-swap. The live
+# snapshot must come out byte for byte the same, and this boot's turn must survive in the
+# parked conflict object. Two failures: an archive that does not open at all, and one that
+# breaks AFTER landing .state_epoch -- where reading the epoch back would make the 412 path
+# merge and upload this boot's incomplete plans/, pairing/ and cron/ over the live ones.
+RS_PARTIAL="$WORK/rs-partial.tar.gz"
+python3 - "$RS_PARTIAL" <<'PY'
+import io, os, sys, tarfile
+full = sys.argv[1] + ".full"
+with tarfile.open(full, "w:gz") as tf:
+    for name, data in ((".state_epoch", b"2\n"), ("state.db", os.urandom(200_000))):
+        ti = tarfile.TarInfo("./" + name); ti.size = len(data); tf.addfile(ti, io.BytesIO(data))
+raw = open(full, "rb").read()
+open(sys.argv[1], "wb").write(raw[: len(raw) // 2])
+PY
+rs_park_case() { # <fns-file or ""> <served restore tarball> -> "<live unchanged>,<turn parked>"
+  RSC_HOME="$WORK/rsc-home"; chmod -R u+w "$RSC_HOME" 2>/dev/null; rm -rf "$RSC_HOME"; mkdir -p "$RSC_HOME"
+  export HERMES_HOME="$RSC_HOME"
+  RSC_LIVE="$WORK/rsc-live.tar.gz"; RSC_ORIG="$WORK/rsc-live-orig.tar.gz"
+  mk_full_state "$RSC_LIVE" 2 "s0" "7:s0:user:50:history-in-the-object"; cp -f "$RSC_LIVE" "$RSC_ORIG"
+  ( [[ -n "$1" ]] && source "$1"
+    reset_stub; LIVE="$2"; LIVE_GEN="42"; of_state_generation=""; of_state_epoch=""; of_state_restore_failed=""
+    of_state_restore >/dev/null 2>&1
+    rm -f "$RSC_HOME/state.db"; mk_full_db "$RSC_HOME/state.db" "s1" "1:s1:user:100:said-this-boot"
+    cas_enable 42 "$RSC_LIVE"
+    of_state_snapshot >/dev/null 2>&1 )
+  local parked=0 d; d="$(mktemp -d -p "$WORK")"
+  if [[ -f "$UPLOADED" ]] && grep -q 'conflict-' "$CALLS"; then
+    tar xzf "$UPLOADED" -C "$d" 2>/dev/null
+    parked="$(python3 -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("select count(*) from messages where content=?",("said-this-boot",)).fetchone()[0])' "$d/state.db" 2>/dev/null || echo 0)"
+  fi
+  printf '%s,%s' "$(cmp -s "$CAS_LIVE" "$RSC_ORIG" && echo same || echo changed)" "$parked"
+}
+check "unreadable snapshot + one upload: the live object is untouched, this boot's turn is parked" "same,1" "$(rs_park_case "" "$RS_GARBAGE")"
+check "partial snapshot that landed .state_epoch: still parked, never merged" "same,1" "$(rs_park_case "" "$RS_PARTIAL")"
+echo "== case: ENG-373 -- the memories restore follows the same rule =="
+export HERMES_MEMORIES_OBJECT="memories.tar.gz"
+rs_home mem; reset_stub; LIVE="$RS_GARBAGE"; LIVE_GEN="42"; of_memories_generation=""
+of_memories_restore >/dev/null 2>&1
+check "memories: an unreadable tarball forgets the generation" "0" "$of_memories_generation"
+MEM_LINK="$WORK/mem-link.tar.gz"
+python3 - "$MEM_LINK" <<'PY'
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], "w:gz") as tf:
+    ti = tarfile.TarInfo("./MEMORY.md"); ti.type = tarfile.SYMTYPE; ti.linkname = "/etc/hostname"; tf.addfile(ti)
+    ti = tarfile.TarInfo("./USER.md"); data = b"likes tea"; ti.size = len(data); tf.addfile(ti, io.BytesIO(data))
+PY
+rs_home memlink; reset_stub; LIVE="$MEM_LINK"; LIVE_GEN="42"; of_state_epoch=0
+out="$(of_memories_restore 2>&1)"
+check "memories: a link member is refused, the regular file is merged" "1" "$(grep -c '(1 extracted, 1 refused)' <<< "$out")"
+check "memories: the link target was not read into MEMORY.md" "no" "$([[ -s "$RS_HOME/memories/MEMORY.md" ]] && echo yes || echo no)"
+
+echo "== case: ENG-373 -- the memories MERGE path extracts like the restore =="
+# A planted memories.tar.gz moves the object's generation, so the next memories tick gets a
+# 412 and downloads it: that download must not follow a link either, or of_memory_union
+# reads whatever it points at (the review named /proc/self/environ) into the memories.
+printf 'SECRET-FROM-OUTSIDE\n' > "$WORK/outside-secret.txt"
+MEM_412="$WORK/mem-412.tar.gz"
+python3 - "$MEM_412" "$WORK/outside-secret.txt" <<'PY'
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], "w:gz") as tf:
+    ti = tarfile.TarInfo("./MEMORY.md"); ti.type = tarfile.SYMTYPE; ti.linkname = sys.argv[2]; tf.addfile(ti)
+PY
+mem412_case() { # <fns-file or ""> -> "leaked" if the outside file reached the memories
+  local h="$WORK/mem412-home"; chmod -R u+w "$h" 2>/dev/null; rm -rf "$h"; mkdir -p "$h/memories"
+  printf 'likes tea' > "$h/memories/USER.md"
+  ( [[ -n "$1" ]] && source "$1"
+    export HERMES_HOME="$h"; reset_stub; cas_enable 77 "$MEM_412"
+    of_memories_generation=42; of_state_epoch=0
+    of_memories_snapshot >/dev/null 2>&1 )
+  # The 412 path unions into the tarball it re-uploads, not into memories/ on disk: the
+  # leak, if any, is in the object the next boot restores.
+  local d; d="$(mktemp -d -p "$WORK")"; tar xzf "$CAS_LIVE" -C "$d" 2>/dev/null
+  grep -rqs 'SECRET-FROM-OUTSIDE' "$h/memories" "$d" && echo leaked || echo clean
+}
+check "a link planted in the live memories is not followed on the 412 merge" "clean" "$(mem412_case "")"
+probe_mem412() { # survived = the merge path still does not follow the link
+  local fl; fl="$(fns_of "$1" of_safe_extract of_memory_union of_memories_tarball_epoch of_memories_snapshot of_memories_write_with_merge_retry of_gcs_read_generation)"
+  [[ "$(mem412_case "$fl")" == clean ]] && echo survived || echo killed
+}
+rs_home memhttp; reset_stub; LIVE="HTTP500"; LIVE_GEN="42"; of_memories_generation=""
+of_memories_restore >/dev/null 2>&1
+check "memories: an HTTP 500 after the generation forgets it" "0" "$of_memories_generation"
+
+echo "== case: ENG-373 -- a failed STATE restore never stamps the live memories with epoch 0 =="
+# Second diff-mode review, 2026-11-09: the state restore fails (epoch forced to 0), the
+# memories restore succeeds and keeps the matched generation, and the first memories tick
+# would upload with .memories_epoch 0 -- which the next healthy boot (epoch 2) reads as
+# "predates a reset", keeping only the curated memories and overwriting the live object.
+MEM_LIVE_E2="$WORK/mem-live-e2.tar.gz"; mk_memories_tarball "$MEM_LIVE_E2" 2 "MEMORY.md" "agent-written entry"
+memfail_case() { # <fns-file or ""> -> "same" if one memories tick left the live object byte for byte
+  local h="$WORK/memfail-home"; chmod -R u+w "$h" 2>/dev/null; rm -rf "$h"; mkdir -p "$h/memories"
+  mk_mem_file "$h/memories" "USER.md" "curated entry"
+  ( [[ -n "$1" ]] && source "$1"
+    export HERMES_HOME="$h"
+    reset_stub; LIVE="HTTP500"; LIVE_GEN="42"; of_state_generation=""; of_state_epoch=""; of_state_restore_failed=""
+    of_state_restore >/dev/null 2>&1
+    reset_stub; cas_enable 55 "$MEM_LIVE_E2"; of_memories_generation=""
+    of_memories_restore >/dev/null 2>&1
+    of_memories_snapshot >/dev/null 2>&1 )
+  cmp -s "$CAS_LIVE" "$MEM_LIVE_E2" && echo same || echo changed
+}
+check "state restore failed, memories restored: a memories tick leaves the live object untouched" "same" "$(memfail_case "")"
+probe_memfail() { # survived = the live memories survive a failed state restore
+  local fl; fl="$(fns_of "$1" of_state_read_local_epoch of_gcs_read_generation of_safe_extract of_state_restore_failed of_state_restore of_memories_forget_generation of_memories_tarball_epoch of_memory_union of_memories_restore of_memories_write_with_merge_retry of_memories_snapshot)"
+  [[ "$(memfail_case "$fl")" == same ]] && echo survived || echo killed
+}
+
+echo "== case: ENG-373 -- a partial restore takes back what it wrote =="
+# Same review: of_safe_extract wrote members in place and exited 2, leaving a half-written
+# state.db for the gateway to boot on, while the log, the alert and the comments said
+# "empty state". (rs_park_case deletes state.db on purpose, so it could not see this.)
+rs_home partial; reset_stub; LIVE="$RS_PARTIAL"; LIVE_GEN="42"
+of_state_restore > "$WORK/rs-partial.out" 2>&1
+check "partial restore: no half-written state.db left"      "no" "$([[ -e "$RS_HOME/state.db" ]] && echo yes || echo no)"
+check "... nor the .state_epoch it had landed first"         "no" "$([[ -e "$RS_HOME/.state_epoch" ]] && echo yes || echo no)"
+check "... the boot's config.yaml is untouched"              "SAFE" "$(cat "$RS_HOME/config.yaml")"
+check "... and it says what it removed"                      "1" "$(grep -c 'written file(s) removed' "$WORK/rs-partial.out")"
+probe_cleanup() { # survived = a partial restore still leaves nothing behind
+  local fl; fl="$(fns_of "$1" of_safe_extract of_state_restore_failed of_state_restore of_state_read_local_epoch)"
+  rs_home mutpartial
+  ( source "$fl"; reset_stub; LIVE="$RS_PARTIAL"; LIVE_GEN="42"; of_state_restore >/dev/null 2>&1 )
+  [[ ! -e "$RS_HOME/state.db" && ! -e "$RS_HOME/.state_epoch" ]] && echo survived || echo killed
+}
+
+echo "== case: ENG-373 -- no metadata token is a failed restore too =="
+rs_home notok; reset_stub
+( of_metadata_token() { return 1; }; of_state_generation=""; of_state_restore_failed=""
+  of_state_restore > "$WORK/rs-notok.out" 2>&1; printf '%s|%s' "$of_state_generation" "$of_state_restore_failed" > "$WORK/rs-notok.res" )
+check "no token: generation 0 and the failure flagged"   "0|1" "$(cat "$WORK/rs-notok.res")"
+check "... at ERROR, so the alert sees it"               "1"   "$(grep -c '\[of-state\] ERROR: restore failed' "$WORK/rs-notok.out")"
+
+echo "== case: ENG-373 -- a real snapshot round-trips through the allow-list =="
+# Not a hand-picked member list: what of_state_snapshot itself writes from a populated
+# home, restored with the allow-list. Anything it writes that the list refuses is lost
+# state at every boot.
+RT_HOME="$WORK/rt-home"; rm -rf "$RT_HOME"; mkdir -p "$RT_HOME"/{plans,pairing,cron}
+mk_full_db "$RT_HOME/state.db" "s1" "1:s1:user:100:round-trip"
+printf 'plan\n' > "$RT_HOME/plans/p.md"; printf '{}\n' > "$RT_HOME/pairing/telegram.json"; printf '[]\n' > "$RT_HOME/cron/jobs.json"
+printf 'soul\n' > "$RT_HOME/SOUL.md"   # not state: of_state_snapshot leaves it out by design
+export HERMES_HOME="$RT_HOME"; reset_stub; of_state_generation=0; of_state_epoch=2
+of_state_snapshot >/dev/null 2>&1
+RT_TARBALL="$WORK/rt-uploaded.tar.gz"; cp -f "$UPLOADED" "$RT_TARBALL"   # reset_stub deletes $UPLOADED
+rs_home roundtrip; reset_stub; LIVE="$RT_TARBALL"; LIVE_GEN="42"; of_state_restore_failed=""
+of_state_restore > "$WORK/rt.out" 2>&1
+check "round trip: everything the snapshot wrote is restored, nothing refused" "1" "$(grep -c 'restore: 5 extracted, 0 refused' "$WORK/rt.out")"
+check "round trip: the turn is back"  "1" "$(python3 -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("select count(*) from messages where content=?",("round-trip",)).fetchone()[0])' "$RS_HOME/state.db" 2>/dev/null)"
+check "round trip: the epoch is back" "2" "$of_state_epoch"
+
+echo "== case: ENG-373 -- a bad header after the first member is a failed restore =="
+RS_TAILJUNK="$WORK/rs-tailjunk.tar.gz"
+python3 - "$RS_TAILJUNK" <<'PY'
+import gzip, io, os, sys, tarfile
+buf = io.BytesIO()
+with tarfile.open(fileobj=buf, mode="w") as tf:
+    for name, data in ((".state_epoch", b"2\n"), ("state.db", b"db")):
+        ti = tarfile.TarInfo("./" + name); ti.size = len(data); tf.addfile(ti, io.BytesIO(data))
+raw = buf.getvalue()
+first = 512 + 512          # header + one padded data block of the first member
+bad = raw[:first] + os.urandom(512) + raw[first:]
+open(sys.argv[1], "wb").write(gzip.compress(bad))
+PY
+rs_home tailjunk; reset_stub; LIVE="$RS_TAILJUNK"; LIVE_GEN="42"; of_state_restore_failed=""
+of_state_restore >/dev/null 2>&1
+check "garbage after the first member: the restore fails instead of passing as partial" "0" "$of_state_generation"
+probe_tailjunk() { # survived = the junk still fails the restore
+  local fl; fl="$(fns_of "$1" of_safe_extract of_state_restore_failed of_state_restore of_state_read_local_epoch)"
+  local g; g="$( source "$fl"; rs_home mtj; reset_stub; LIVE="$RS_TAILJUNK"; LIVE_GEN="42"; of_state_restore_failed=""; of_state_restore >/dev/null 2>&1; echo "$of_state_generation" )"
+  [[ "$g" == 0 ]] && echo survived || echo killed
+}
+
+echo "== case: ENG-362 -- hooks/ and profiles/ are locked before the restore =="
+lock_fence() { # <entrypoint> -> ok when the hooks/profiles lock is top-level in service), above of_state_restore
+  local f="$1" svc line rs depth
+  svc="$(grep -n '^  service)$' "$f" | head -1 | cut -d: -f1)"
+  line="$(grep -n '^    for of_d in hooks profiles; do$' "$f" | head -1 | cut -d: -f1)"
+  rs="$(grep -n '^    of_state_restore$' "$f" | head -1 | cut -d: -f1)"
+  depth="$(awk -v a="$svc" -v b="$line" -v q="'" '
+    NR<=a || NR>=b { next }
+    hd != "" { if ($0 == hd) hd = ""; next }
+    { if ($0 ~ /^[[:space:]]*if[[:space:]]/) d++; if ($0 ~ /^[[:space:]]*fi([[:space:];]|$)/) d-- }
+    match($0, "<<-?" q "?[A-Z_]+" q "?") { w = substr($0, RSTART, RLENGTH); gsub("[<" q "-]", "", w); hd = w }
+    END { print d+0 }' "$f")"
+  [[ -n "$svc" && -n "$line" && -n "$rs" && "$line" -gt "$svc" && "$line" -lt "$rs" && "$depth" == 0 ]] && echo ok || echo "no (service=$svc lock=$line restore=$rs depth=$depth)"
+}
+check "hooks/profiles lock inside service), above of_state_restore" "ok" "$(lock_fence "$ENTRYPOINT")"
+lock_block() { awk '/^    for of_d in hooks profiles; do$/{p=1} p{print} p&&/^    done$/{exit}' "$1"; }
+if [[ "$(id -u)" -ne 0 ]]; then
+  LK_HOME="$WORK/lock-home"; mkdir -p "$LK_HOME"
+  lk_out="$( ( HERMES_HOME="$LK_HOME"; eval "$(awk '/^of_make_read_only\(\) \{/{p=1} p{print} p&&/^\}$/{exit}' "$ENTRYPOINT")"; eval "$(lock_block "$ENTRYPOINT")" ) 2>&1)"
+  for d in hooks profiles; do
+    check "$d: the line says (read-only)"         "yes" "$([[ "$lk_out" == *"/$d (read-only)"* ]] && echo yes || echo no)"
+    check "$d: is empty"                          "0"   "$(find "$LK_HOME/$d" -mindepth 1 | wc -l)"
+    check "$d: a file cannot be written"          "no"  "$( (printf x > "$LK_HOME/$d/handler.py") 2>/dev/null && echo yes || echo no)"
+    check "$d: a subdirectory cannot be created"  "no"  "$(mkdir "$LK_HOME/$d/x" 2>/dev/null && echo yes || echo no)"
+  done
+  LK2="$WORK/lock-home2"; mkdir -p "$LK2/hooks/left"
+  lk_out="$( ( HERMES_HOME="$LK2"; eval "$(awk '/^of_make_read_only\(\) \{/{p=1} p{print} p&&/^\}$/{exit}' "$ENTRYPOINT")"; eval "$(lock_block "$ENTRYPOINT")" ) 2>&1)"
+  check "a non-empty hooks/ is named, not silently locked" "1" "$(grep -c 'already holds 1 entr' <<< "$lk_out")"
+fi
+
+echo "== mutants: ENG-373/362 =="
+m373() { # <label> <sed-expr> <probe-fn> -- probe gets the mutated entrypoint; "survived" fails the run
+  local label="$1" expr="$2" probe="$3" m="$WORK/m373.sh"
+  sed -e "$expr" "$ENTRYPOINT" > "$m"
+  if cmp -s "$m" "$ENTRYPOINT"; then bad "$label: the mutation did not apply -- a mutant that does not mutate proves nothing"; return; fi
+  if [[ "$($probe "$m")" == "survived" ]]; then bad "$label -- SURVIVED"; else ok "$label -- killed"; fi
+}
+fns_of() { # <entrypoint> <fn>... -> a file with those functions, as extract_fns does
+  local f="$1" o; o="$(mktemp -p "$WORK")"; shift
+  for fn in "$@"; do awk -v f="$fn" '$0 ~ "^"f"\\(\\) \\{" {p=1} p {print} p && /^\}$/ {exit}' "$f" >> "$o"; echo >> "$o"; done
+  echo "$o"
+}
+probe_pin_mismatch() { # survived = a mismatched pin still loads
+  local fl; fl="$(fns_of "$1" of_verify_sha256 of_plugins_fetch of_make_read_only)"
+  local rc; rc="$( source "$fl"; reset_stub; LIVE="$PLUG_OK"; HERMES_PLUGINS_SHA256="$(sha_of "$PLUG_NO")"; of_plugins_fetch "$WORK/m-pin" >/dev/null 2>&1; echo $? )"
+  [[ "$rc" == 1 ]] && echo survived || echo killed
+}
+probe_pin_unset() { # survived = an unset pin still loads
+  local fl; fl="$(fns_of "$1" of_verify_sha256 of_plugins_fetch of_make_read_only)"
+  local rc; rc="$( source "$fl"; reset_stub; LIVE="$PLUG_OK"; HERMES_PLUGINS_SHA256=""; of_plugins_fetch "$WORK/m-pin2" >/dev/null 2>&1; echo $? )"
+  [[ "$rc" == 1 ]] && echo survived || echo killed
+}
+m373 "the mismatch comparison removed" 's/^  if \[\[ "\$got" != "\$want" \]\]; then$/  if false; then/' probe_pin_mismatch
+m373 "of_plugins_fetch no longer calls the pin check" 's/sha="\$(of_verify_sha256 "\$tarball" "\${HERMES_PLUGINS_SHA256:-}" of-plugins HERMES_PLUGINS_SHA256)"/sha=skipped/' probe_pin_mismatch
+m373 "an unset pin read as no check" '/is unset -- refusing to load an unpinned tarball/{n;s/return 1/return 0/}' probe_pin_unset
+probe_restore_evil() { # survived = config.yaml from the snapshot replaced the boot's
+  local fl; fl="$(fns_of "$1" of_safe_extract of_state_restore_failed of_state_restore of_state_read_local_epoch)"
+  rs_home mut
+  ( source "$fl"; reset_stub; LIVE="$RS_EVIL"; of_state_restore >/dev/null 2>&1 )
+  [[ "$(cat "$RS_HOME/config.yaml")" == SAFE && ! -e "$RS_HOME/skills" && ! -e "$RS_HOME/.env" ]] && echo survived || echo killed
+}
+probe_restore_link() { # survived = a member was written through a link on disk
+  local fl; fl="$(fns_of "$1" of_safe_extract of_state_restore_failed of_state_restore of_state_read_local_epoch)"
+  rs_home mutlink; rm -rf "$WORK/rs-out2"; mkdir -p "$WORK/rs-out2"; ln -s "$WORK/rs-out2" "$RS_HOME/cron"
+  ( source "$fl"; reset_stub; LIVE="$RS_HONEST"; of_state_restore >/dev/null 2>&1 )
+  [[ -e "$WORK/rs-out2/jobs.json" ]] && echo killed || echo survived
+}
+m373 "the state allow-list off" 's/^    if mode != "state":$/    if True:/' probe_restore_evil
+# Links that resolve INSIDE the archive: with the type check gone they would land as copies
+# (a link that points outside the archive only crashes the extractor, which proves nothing).
+RS_LINKS="$WORK/rs-links.tar.gz"
+python3 - "$RS_LINKS" <<'PY'
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], "w:gz") as tf:
+    ti = tarfile.TarInfo("./state.db"); d = b"db"; ti.size = len(d); tf.addfile(ti, io.BytesIO(d))
+    ti = tarfile.TarInfo("./pairing/h"); ti.type = tarfile.LNKTYPE; ti.linkname = "./state.db"; tf.addfile(ti)
+    ti = tarfile.TarInfo("./plans/s"); ti.type = tarfile.SYMTYPE; ti.linkname = "../state.db"; tf.addfile(ti)
+PY
+probe_restore_links() { # survived = neither link member landed
+  local fl; fl="$(fns_of "$1" of_safe_extract of_state_restore_failed of_state_restore of_state_read_local_epoch)"
+  rs_home mutlinks
+  ( source "$fl"; reset_stub; LIVE="$RS_LINKS"; of_state_restore >/dev/null 2>&1 )
+  [[ ! -e "$RS_HOME/pairing/h" && ! -e "$RS_HOME/plans/s" ]] && echo survived || echo killed
+}
+rs_home links; reset_stub; LIVE="$RS_LINKS"
+check "in-archive hardlink and symlink are refused" "1" "$(of_state_restore 2>&1 | grep -c 'restore: 1 extracted, 2 refused')"
+check "probe_restore_links holds on the shipped entrypoint" "survived" "$(probe_restore_links "$ENTRYPOINT")"
+m373 "links and hardlinks accepted" 's/and (m.isfile() or m.isdir()) and allowed/and allowed/' probe_restore_links
+m373 "writing through a link on disk allowed" 's/                  and not through_link(parts))$/                  )/' probe_restore_link
+m373 "the restore back to tar xzf" 's/^  if counts="\$(of_safe_extract "\$tarball" "\${HERMES_HOME:-\/opt\/data}" of-state state)"; then$/  if counts="$(tar xzf "$tarball" -C "${HERMES_HOME:-\/opt\/data}" 2>\/dev\/null \&\& echo 0)"; then/' probe_restore_evil
+probe_forget() { # survived = the live snapshot survives a failed restore (unreadable archive)
+  local fl; fl="$(fns_of "$1" of_state_read_local_epoch of_state_tarball_epoch of_state_messages_superset of_state_try_promote of_state_merge_messages of_state_snapshot_upload of_state_snapshot of_gcs_read_generation of_safe_extract of_state_restore_failed of_state_restore)"
+  [[ "$(rs_park_case "$fl" "$RS_GARBAGE")" == "same,1" ]] && echo survived || echo killed
+}
+probe_partial() { # survived = the live snapshot survives a partial restore that landed .state_epoch
+  local fl; fl="$(fns_of "$1" of_state_read_local_epoch of_state_tarball_epoch of_state_messages_superset of_state_try_promote of_state_merge_messages of_state_snapshot_upload of_state_snapshot of_gcs_read_generation of_safe_extract of_state_restore_failed of_state_restore)"
+  [[ "$(rs_park_case "$fl" "$RS_PARTIAL")" == "same,1" ]] && echo survived || echo killed
+}
+m373 "the memories merge path back to tar xzf" 's/^    if ! of_safe_extract "\$live" "\$live_extract" of-memories files >\/dev\/null; then$/    if ! tar xzf "$live" -C "$live_extract" 2>\/dev\/null; then/' probe_mem412
+m373 "the end-of-archive check removed" 's/^        if tf.fileobj.read().strip(b"\\0"):$/        if False:/' probe_tailjunk
+m373 "an unreadable snapshot keeps the generation (the old line 330)" '/^    echo "\[of-state\] WARN: snapshot present but did not extract; starting with empty state" >&2$/{n;/of_state_restore_failed/d}' probe_forget
+probe_skills_pin() { # survived = a mismatched pin still refuses the skills tarball
+  local fl; fl="$(fns_of "$1" of_verify_sha256 of_skills_fetch of_make_read_only)"
+  local rc; rc="$( source "$fl"; reset_stub; LIVE="$SKILL_OK"; HERMES_SKILLS_SHA256="$(sha_of "$PLUG_OK")"; of_skills_fetch "$WORK/m-skills-pin" >/dev/null 2>&1; echo $? )"
+  [[ "$rc" == 1 ]] && echo survived || echo killed
+}
+probe_pin_upper() { # survived = an upper-case pin still loads
+  local fl; fl="$(fns_of "$1" of_verify_sha256 of_plugins_fetch of_make_read_only)"
+  local rc; rc="$( source "$fl"; reset_stub; LIVE="$PLUG_OK"; HERMES_PLUGINS_SHA256="$(sha_of "$PLUG_OK" | tr a-f A-F)"; of_plugins_fetch "$WORK/m-pin-up" >/dev/null 2>&1; echo $? )"
+  [[ "$rc" == 0 ]] && echo survived || echo killed
+}
+probe_pin_space() { # survived = a pin with surrounding whitespace and a newline still loads
+  local fl; fl="$(fns_of "$1" of_verify_sha256 of_plugins_fetch of_make_read_only)"
+  local rc; rc="$( source "$fl"; reset_stub; LIVE="$PLUG_OK"; HERMES_PLUGINS_SHA256="$(printf '  %s\n' "$(sha_of "$PLUG_OK")")"; of_plugins_fetch "$WORK/m-pin-sp" >/dev/null 2>&1; echo $? )"
+  [[ "$rc" == 0 ]] && echo survived || echo killed
+}
+DOTDOT_TB="$WORK/dotdot.tar.gz"
+python3 - "$DOTDOT_TB" <<'PY'
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], "w:gz") as tf:
+    ti = tarfile.TarInfo("../dotdot-escape"); d = b"x"; ti.size = len(d); tf.addfile(ti, io.BytesIO(d))
+PY
+probe_dotdot() { # survived = a ../ member in files mode (the memories path) still does not escape
+  local fl; fl="$(fns_of "$1" of_safe_extract)"
+  local d="$WORK/dd/dest"; rm -rf "$WORK/dd"; mkdir -p "$d"
+  ( source "$fl"; of_safe_extract "$DOTDOT_TB" "$d" of-test files >/dev/null 2>&1 )
+  [[ -e "$WORK/dd/dotdot-escape" ]] && echo killed || echo survived
+}
+probe_lock() { [[ "$(lock_fence "$1")" == ok ]] && echo survived || echo killed; }
+# Each probe must say "survived" on the SHIPPED entrypoint -- a probe that reports
+# "killed" for everything kills every mutant and proves nothing (the first draft of these
+# probes had their polarity inverted, and every mutant "survived" for that reason).
+for pr in probe_pin_mismatch probe_pin_unset probe_restore_evil probe_restore_link probe_forget probe_partial probe_mem412 probe_tailjunk probe_memfail probe_cleanup probe_skills_pin probe_pin_upper probe_pin_space probe_dotdot; do
+  check "$pr holds on the shipped entrypoint" "survived" "$($pr "$ENTRYPOINT")"
+done
+check "probe_lock holds on the shipped entrypoint" "survived" "$(probe_lock "$ENTRYPOINT")"
+m373 "a failed state restore no longer forgets the memories generation" '/^  \[\[ -z "\${of_state_restore_failed:-}" \]\] || of_memories_forget_generation$/d' probe_memfail
+m373 "a partial extraction keeps what it wrote" 's/^            os.unlink(path)$/            pass/' probe_cleanup
+m373 "of_skills_fetch no longer calls the pin check" 's/sha="\$(of_verify_sha256 "\$tarball" "\${HERMES_SKILLS_SHA256:-}" of-skills HERMES_SKILLS_SHA256)"/sha=skipped/' probe_skills_pin
+m373 "upper-case hex no longer folded" '/^  want="\${want,,}"$/d' probe_pin_upper
+m373 "surrounding whitespace no longer trimmed" '/^  want="\${want#"\${want%%\[!\[:space:\]\]\*}"}"; want=/d' probe_pin_space
+m373 "the .. check removed" 's/ok = (not m.name.startswith("\/") and ".." not in parts$/ok = (not m.name.startswith("\/")/' probe_dotdot
+m373 "the hooks/profiles lock removed (ENG-362)" '/^    for of_d in hooks profiles; do$/,/^    done$/d' probe_lock
+m373_file() { # <label> <mutated file> <probe> -- for mutations sed cannot express
+  local label="$1" m="$2" probe="$3"
+  if cmp -s "$m" "$ENTRYPOINT"; then bad "$label: the mutation did not apply -- a mutant that does not mutate proves nothing"; return; fi
+  if [[ "$($probe "$m")" == "survived" ]]; then bad "$label -- SURVIVED"; else ok "$label -- killed"; fi
+}
+python3 - "$ENTRYPOINT" "$WORK/m-lock-moved.sh" <<'PY'
+import sys
+s = open(sys.argv[1]).read()
+a = s.index("    for of_d in hooks profiles; do\n"); b = s.index("    done\n", a) + len("    done\n")
+block, s = s[a:b], s[:a] + s[b:]
+r = s.index("\n    of_state_restore\n") + len("\n    of_state_restore\n")
+open(sys.argv[2], "w").write(s[:r] + block + s[r:])
+PY
+m373_file "the lock moved below of_state_restore (ENG-362)" "$WORK/m-lock-moved.sh" probe_lock
+# Two defenses since the second diff-mode review: the extractor takes back what it wrote,
+# and a failed restore never reads the epoch back. Either alone holds probe_partial, so the
+# epoch guard is proven with the cleanup ALSO removed (the single cleanup mutant, above,
+# survives probe_partial by design and is killed by probe_cleanup instead).
+sed -e 's/^  \[\[ -n "\${of_state_restore_failed:-}" \]\] || of_state_epoch=/  of_state_epoch=/' \
+    -e 's/^            os.unlink(path)$/            pass/' "$ENTRYPOINT" > "$WORK/m-epoch-and-cleanup.sh"
+m373_file "a failed restore reads the epoch back from what it half-extracted (cleanup also off)" "$WORK/m-epoch-and-cleanup.sh" probe_partial
 
 echo
 echo "passed: $pass   failed: $fail"
