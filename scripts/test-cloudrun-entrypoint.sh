@@ -2340,12 +2340,13 @@ check "the Gemini fallback is not pinned off (its native adapter separates reaso
   "0" "$(grep -c 'gemini-3.6-flash"\] = "none"' "$ENTRYPOINT")"
 
 # ---------------------------------------------------------------------------
-# openfathom-meta ENG-373. Two properties, each with its input domain and
+# openfathom-meta ENG-373 and ENG-362. Three properties, each with its input domain and
 # its mutants (the plan's item-30 list, one case or refusal per line):
 #   1. the pin -- a skills/plugins tarball loads only when its sha256 is the pinned one;
 #   2. the restore -- a snapshot lands only the paths of_state_snapshot writes, as regular
 #      files and directories, and a restore that fails forgets the generation it read, so
 #      the first upload merges into the live snapshot instead of replacing it;
+#   3. the lock -- hooks/ and profiles/ are read-only before of_state_restore runs.
 # ---------------------------------------------------------------------------
 echo "== case: ENG-373 -- the pin =="
 PIN_DEST="$WORK/pin-dest"
@@ -2495,7 +2496,37 @@ out="$(of_memories_restore 2>&1)"
 check "memories: a link member is refused, the regular file is merged" "1" "$(grep -c '(1 extracted, 1 refused)' <<< "$out")"
 check "memories: the link target was not read into MEMORY.md" "no" "$([[ -s "$RS_HOME/memories/MEMORY.md" ]] && echo yes || echo no)"
 
-echo "== mutants: ENG-373 =="
+echo "== case: ENG-362 -- hooks/ and profiles/ are locked before the restore =="
+lock_fence() { # <entrypoint> -> ok when the hooks/profiles lock is top-level in service), above of_state_restore
+  local f="$1" svc line rs depth
+  svc="$(grep -n '^  service)$' "$f" | head -1 | cut -d: -f1)"
+  line="$(grep -n '^    for of_d in hooks profiles; do$' "$f" | head -1 | cut -d: -f1)"
+  rs="$(grep -n '^    of_state_restore$' "$f" | head -1 | cut -d: -f1)"
+  depth="$(awk -v a="$svc" -v b="$line" -v q="'" '
+    NR<=a || NR>=b { next }
+    hd != "" { if ($0 == hd) hd = ""; next }
+    { if ($0 ~ /^[[:space:]]*if[[:space:]]/) d++; if ($0 ~ /^[[:space:]]*fi([[:space:];]|$)/) d-- }
+    match($0, "<<-?" q "?[A-Z_]+" q "?") { w = substr($0, RSTART, RLENGTH); gsub("[<" q "-]", "", w); hd = w }
+    END { print d+0 }' "$f")"
+  [[ -n "$svc" && -n "$line" && -n "$rs" && "$line" -gt "$svc" && "$line" -lt "$rs" && "$depth" == 0 ]] && echo ok || echo "no (service=$svc lock=$line restore=$rs depth=$depth)"
+}
+check "hooks/profiles lock inside service), above of_state_restore" "ok" "$(lock_fence "$ENTRYPOINT")"
+lock_block() { awk '/^    for of_d in hooks profiles; do$/{p=1} p{print} p&&/^    done$/{exit}' "$1"; }
+if [[ "$(id -u)" -ne 0 ]]; then
+  LK_HOME="$WORK/lock-home"; mkdir -p "$LK_HOME"
+  lk_out="$( ( HERMES_HOME="$LK_HOME"; eval "$(awk '/^of_make_read_only\(\) \{/{p=1} p{print} p&&/^\}$/{exit}' "$ENTRYPOINT")"; eval "$(lock_block "$ENTRYPOINT")" ) 2>&1)"
+  for d in hooks profiles; do
+    check "$d: the line says (read-only)"         "yes" "$([[ "$lk_out" == *"/$d (read-only)"* ]] && echo yes || echo no)"
+    check "$d: is empty"                          "0"   "$(find "$LK_HOME/$d" -mindepth 1 | wc -l)"
+    check "$d: a file cannot be written"          "no"  "$( (printf x > "$LK_HOME/$d/handler.py") 2>/dev/null && echo yes || echo no)"
+    check "$d: a subdirectory cannot be created"  "no"  "$(mkdir "$LK_HOME/$d/x" 2>/dev/null && echo yes || echo no)"
+  done
+  LK2="$WORK/lock-home2"; mkdir -p "$LK2/hooks/left"
+  lk_out="$( ( HERMES_HOME="$LK2"; eval "$(awk '/^of_make_read_only\(\) \{/{p=1} p{print} p&&/^\}$/{exit}' "$ENTRYPOINT")"; eval "$(lock_block "$ENTRYPOINT")" ) 2>&1)"
+  check "a non-empty hooks/ is named, not silently locked" "1" "$(grep -c 'already holds 1 entr' <<< "$lk_out")"
+fi
+
+echo "== mutants: ENG-373/362 =="
 m373() { # <label> <sed-expr> <probe-fn> -- probe gets the mutated entrypoint; "survived" fails the run
   local label="$1" expr="$2" probe="$3" m="$WORK/m373.sh"
   sed -e "$expr" "$ENTRYPOINT" > "$m"
@@ -2560,12 +2591,16 @@ probe_forget() { # survived = the first upload after a failed restore replaced t
   [[ "$(rs_cas_case "$fl")" == "1,1" ]] && echo survived || echo killed
 }
 m373 "an unreadable snapshot keeps the generation (the old line 330)" '/^    echo "\[of-state\] WARN: snapshot present but did not extract; starting with empty state" >&2$/{n;/of_state_forget_generation/d}' probe_forget
+probe_lock() { [[ "$(lock_fence "$1")" == ok ]] && echo survived || echo killed; }
 # Each probe must say "survived" on the SHIPPED entrypoint -- a probe that reports
 # "killed" for everything kills every mutant and proves nothing (the first draft of these
 # probes had their polarity inverted, and every mutant "survived" for that reason).
 for pr in probe_pin_mismatch probe_pin_unset probe_restore_evil probe_restore_link probe_forget; do
   check "$pr holds on the shipped entrypoint" "survived" "$($pr "$ENTRYPOINT")"
 done
+check "probe_lock holds on the shipped entrypoint" "survived" "$(probe_lock "$ENTRYPOINT")"
+m373 "the hooks/profiles lock removed (ENG-362)" '/^    for of_d in hooks profiles; do$/,/^    done$/d' probe_lock
+m373 "the lock moved below of_state_restore (ENG-362)" '/^    for of_d in hooks profiles; do$/s/^    for/    of_state_restore\n    for/' probe_lock
 
 echo
 echo "passed: $pass   failed: $fail"

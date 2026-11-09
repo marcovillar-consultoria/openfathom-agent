@@ -2508,6 +2508,22 @@ PYEOF
     mkdir -p "${HERMES_HOME:-/opt/data}/scripts" 2>/dev/null || true
     echo "[of-scripts] ${HERMES_HOME:-/opt/data}/scripts$(of_make_read_only "${HERMES_HOME:-/opt/data}/scripts" of-scripts ENG-361)"
 
+    # openfathom-meta ENG-362. The same lock, for the two other directories whose files the
+    # gateway imports: gateway/hooks.py loads every hooks/*/handler.py into its own process
+    # at start (import_user_code -> exec_module), and a profile created under profiles/ at
+    # run time is served live, with its own hooks/ (measured 2026-11-07 on the production
+    # image, of-13 section 65). Locked HERE, above of_state_restore, so nothing a snapshot
+    # carries can land in them first; of_safe_extract refuses both paths as well. Operator
+    # hooks and named profiles now ship in the image or not at all. A non-empty directory
+    # (a container restart over a surviving $HERMES_HOME) is named, because its contents
+    # are loaded read-only rather than discarded.
+    for of_d in hooks profiles; do
+      mkdir -p "${HERMES_HOME:-/opt/data}/${of_d}" 2>/dev/null || true
+      of_n="$(find "${HERMES_HOME:-/opt/data}/${of_d}" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)"
+      [[ "$of_n" -eq 0 ]] || echo "[of-${of_d}] WARN: ${HERMES_HOME:-/opt/data}/${of_d} already holds ${of_n} entr(y/ies) -- locked as they are (ENG-362)" >&2
+      echo "[of-${of_d}] ${HERMES_HOME:-/opt/data}/${of_d}$(of_make_read_only "${HERMES_HOME:-/opt/data}/${of_d}" "of-${of_d}" ENG-362)"
+    done
+
     # ENG-45. Without a bucket configured this whole block is skipped and the old
     # `exec hermes gateway run` semantics are kept exactly -- that is the contract
     # the OF-05/OF-09 placeholder stages relied on, and it stays valid.
