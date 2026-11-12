@@ -1999,6 +1999,20 @@ of_configure_compression() {
   hermes config set compression.threshold_tokens 150000
 }
 
+# openfathom-meta ENG-261 (2026-11-12): raise the memory tool's character cap from the
+# upstream default of 2,200. Writes were refused in three conversations (2026-10-31 to
+# 2026-11-09, Cloud Logging) with memory at ~2,012/2,200. The Tech Lead's number (11,000,
+# 5x), not a measured optimum: the memory is <1% of the ~100K-token context the Sonda
+# already carries, so the cost is ~US$1/month at worst and does not bound the number; the
+# measured demand (refused sizes stayed pinned near 2,200) is capped by the old limit itself.
+# What it costs: a larger cap lets stale or duplicated entries -- the ADR-057 side-by-side
+# wordings of an edited entry -- ride in every system prompt longer before a human prunes,
+# and pruning stays the Tech Lead's call. Its own function so the build-check step runs it
+# inside the image; the test suite checks the call site.
+of_configure_memory_limit() {
+  hermes config set memory.memory_char_limit 11000
+}
+
 # openfathom-meta ENG-171 (2026-10-17): the primary route -- GLM-5.3 through OpenRouter, a
 # trial on 2026-10-17 and the primary since openfathom-meta ADR-077 -- and OpenRouter by
 # default falls back to ANY host serving the model -- Chinese hosts included -- while the
@@ -2318,6 +2332,9 @@ PYEOF
 
     # openfathom-meta ENG-349: the absolute compression cap (see of_configure_compression).
     of_configure_compression
+
+    # openfathom-meta ENG-261: the memory tool's character cap (see of_configure_memory_limit).
+    of_configure_memory_limit
 
     # openfathom-meta ENG-171: a no-op unless HERMES_INFERENCE_PROVIDER=openrouter (see
     # of_configure_openrouter_route). After the global `medium` above, which its per-model
