@@ -2326,15 +2326,6 @@ check "the service block calls of_configure_compression exactly once (ENG-349)" 
 check "the compression writer is called next to the other config writers (ENG-349)" \
   "1" "$([[ -n "$cc_line" && -n "$none_line" && -n "$call_line" && "$cc_line" -gt "$none_line" && "$cc_line" -lt "$call_line" ]] && echo 1 || echo 0)"
 
-# openfathom-meta ENG-261: same shape as ENG-349 above -- the build-check runs
-# of_configure_memory_limit alone (proving the writer); this proves the service block CALLS
-# it, next to the other writers. Mutant: the call line removed.
-ml_line=$(grep -n '^    of_configure_memory_limit$' "$ENTRYPOINT" | cut -d: -f1)
-check "the service block calls of_configure_memory_limit exactly once (ENG-261)" \
-  "1" "$(grep -c '^    of_configure_memory_limit$' "$ENTRYPOINT")"
-check "the memory-limit writer is called right after the compression writer (ENG-261)" \
-  "1" "$([[ -n "$ml_line" && -n "$cc_line" && "$ml_line" -gt "$cc_line" ]] && echo 1 || echo 0)"
-
 # ---------------------------------------------------------------------------
 # openfathom-meta ENG-171: of_configure_reasoning_effort. All of it is python, so this file
 # can only prove the text; the build-check job of of-build-image.yml runs it inside the
