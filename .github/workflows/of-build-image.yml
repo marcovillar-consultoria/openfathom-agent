@@ -196,7 +196,7 @@ jobs:
       # agent.reasoning_effort none` passed that grep for two months after upstream
       # 138e482ed0 turned it into YAML null. This runs the writers inside the built image,
       # after its own config seeding, and asserts what hermes' resolver reads.
-      - name: Config writers run in the image (reasoning effort, OpenRouter route, compression cap)
+      - name: Config writers run in the image (reasoning effort, OpenRouter route, compression cap, memory cap)
         run: |
           cat > /tmp/of-config-check.sh <<'SH'
           set -euo pipefail
